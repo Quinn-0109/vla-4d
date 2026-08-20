@@ -18,8 +18,33 @@ set -uo pipefail
 DATA_DIR="${DATA_DIR:-/root/autodl-tmp}"
 LIBERO_DIR="${LIBERO_DIR:-$DATA_DIR/vla-work/LIBERO}"
 
-python -c "import sys; assert 'openvla' in sys.prefix" 2>/dev/null || {
-  echo "⚠️  当前似乎不在 openvla 环境里。先 conda activate openvla"; }
+# ⚠️ 必须硬失败：之前有过在 base 环境里跑本脚本、把包装错地方的事故。
+PREFIX=$(python -c "import sys; print(sys.prefix)" 2>/dev/null || echo "")
+case "$PREFIX" in
+  *openvla*) echo "==> 环境: $PREFIX" ;;
+  *) cat <<EOM
+❌ 当前不在 openvla 环境里（sys.prefix = ${PREFIX:-未知}），拒绝继续，
+   否则会把包装进 base 把镜像环境搞坏。
+
+   正确顺序（注意 source 要在 activate 之前，
+   因为 source ~/.bashrc 会重跑 conda init 把你踢回 base）:
+
+     source ~/.bashrc
+     conda activate openvla
+     bash setup/fix_env.sh
+EOM
+     exit 1 ;;
+esac
+
+# 环境必须在数据盘上。系统盘通常只有 30GB，放不下 ~18GB 的环境。
+case "$PREFIX" in
+  /root/miniconda3/*|/usr/*|/opt/*)
+    echo "⚠️  环境位于系统盘: $PREFIX"
+    df -h / | tail -1
+    echo "    系统盘一旦占满会导致各种诡异失败。建议删掉重建到数据盘:"
+    echo "      conda deactivate && conda env remove -n openvla -y"
+    echo "      bash setup/setup_server.sh" ;;
+esac
 
 export TMPDIR="${TMPDIR:-$DATA_DIR/tmp}"
 export PIP_CACHE_DIR="${PIP_CACHE_DIR:-$DATA_DIR/pip-cache}"

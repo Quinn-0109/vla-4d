@@ -115,6 +115,24 @@ conda env list | grep -qE "(^|/)${ENV_NAME}\s" || conda create -y -n "$ENV_NAME"
 conda activate "$ENV_NAME"
 PYV=$(python -c "import sys;print('%d.%d'%sys.version_info[:2])")
 [ "$PYV" = "3.10" ] || { echo "❌ 当前 Python $PYV，应为 3.10。环境激活有误，请检查。"; exit 1; }
+
+# 核实环境真的建在数据盘上。若 conda 早先已在系统盘建过同名环境，
+# envs_dirs 不会把它挪走，必须删掉重建，否则 ~18GB 会把 30GB 系统盘撑爆。
+ENV_PREFIX=$(python -c "import sys;print(sys.prefix)")
+case "$ENV_PREFIX" in
+  "$CONDA_ENVS"/*) echo "==> 环境位置正确: $ENV_PREFIX" ;;
+  *) cat <<EOM
+❌ 环境建在了系统盘: $ENV_PREFIX
+   （期望在 $CONDA_ENVS 下）
+
+   这多半是之前已在系统盘建过同名环境。请删掉后重跑本脚本:
+     conda deactivate
+     conda env remove -n $ENV_NAME -y
+     conda clean -a -y && pip cache purge
+     bash setup/setup_server.sh
+EOM
+     exit 1 ;;
+esac
 echo "==> Python: $(python --version)  (镜像自带版本已隔离，不影响)"
 
 # ---------------------------------------------------------- 5. PyTorch
