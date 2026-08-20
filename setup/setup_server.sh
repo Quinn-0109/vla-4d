@@ -169,22 +169,38 @@ pip install -e .
 pip install transformers==4.40.1     # 必须锁定：-e . 可能装上更高版本，是最常见的报错源
 
 # Flash Attention 2 —— ⚠️ 评测也必需，不是可选项（openvla_utils.py:45 写死）
+#
+# flash-attn 的 setup.py 会先去 GitHub Releases 下预编译 wheel，国内服务器
+# 常常连不上，下载一失败整个构建就崩（"Remote end closed connection"）。
+# FLASH_ATTENTION_FORCE_BUILD=TRUE 直接跳过那次下载，走本地源码编译。
 pip install packaging ninja
 if ! python -c "import flash_attn" 2>/dev/null; then
-  pip install "flash-attn==2.5.5" --no-build-isolation || {
-    echo "==> 首次失败，清缓存重试"
+  RAM_GB=$(free -g | awk '/^Mem:/{print $2}')
+  JOBS=$(( RAM_GB / 8 )); [ "$JOBS" -lt 1 ] && JOBS=1
+  [ "$JOBS" -gt 8 ] && JOBS=8
+  echo "==> 编译 flash-attn (内存 ${RAM_GB}GB, MAX_JOBS=$JOBS, 约 20-30 分钟)"
+
+  if [ "${RAM_GB:-0}" -lt 8 ]; then
+    cat <<'EOM'
+❌ 内存不足 8GB，flash-attn 源码编译会 OOM。
+   请切到 GPU 模式（内存充足）后重跑本脚本。
+EOM
+    exit 1
+  fi
+
+  FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=$JOBS \
+    pip install "flash-attn==2.5.5" --no-build-isolation || {
+    echo "==> 首次失败，清缓存后单线程重试"
     pip cache remove flash_attn 2>/dev/null || true
-    MAX_JOBS=4 pip install "flash-attn==2.5.5" --no-build-isolation || {
+    FLASH_ATTENTION_FORCE_BUILD=TRUE MAX_JOBS=2 \
+      pip install "flash-attn==2.5.5" --no-build-isolation || {
       cat <<'EOM'
-❌ flash-attn 安装失败，而它是评测的硬性依赖。
+❌ flash-attn 编译失败，而它是评测的硬性依赖。
 
-   排查:
-   1. 编译 OOM/超时 -> MAX_JOBS=2 重试，或加大交换分区
-   2. CUDA 不匹配   -> 对比 nvcc --version 与 python -c "import torch;print(torch.version.cuda)"
-   3. 绕过编译      -> 从 flash-attention GitHub Releases 下 torch2.2+cu121+cp310 预编译 wheel
-
-   实在装不上的兜底: 把 openvla_utils.py:45 的 attn_implementation 改成 "sdpa"
-   （速度略降，评测结果不受影响）
+   兜底方案: 把 openvla_utils.py:45 的 attn_implementation 改成 "sdpa"
+     sed -i 's/flash_attention_2/sdpa/' \
+       "$OPENVLA_ROOT/experiments/robot/openvla_utils.py"
+   速度略降，评测结果不受影响。
 EOM
       exit 1
     }
