@@ -100,9 +100,22 @@ if ! command -v conda >/dev/null; then
   add_env "export PATH=$DATA_DIR/miniconda3/bin:\$PATH"
 fi
 eval "$(conda shell.bash hook)"
-conda env list | grep -q "^${ENV_NAME} " || conda create -y -n "$ENV_NAME" python=3.10.13
+
+# 镜像自带的 conda 默认把环境建在系统盘(/root/miniconda3/envs)，而本环境约 18GB，
+# 30GB 系统盘装不下。强制把环境目录指到数据盘。
+CONDA_ENVS="$DATA_DIR/conda-envs"
+mkdir -p "$CONDA_ENVS"
+conda config --add envs_dirs "$CONDA_ENVS" 2>/dev/null || true
+echo "==> conda 环境目录: $CONDA_ENVS"
+
+# ⚠️ 必须用 Python 3.10.13：OpenVLA 的 classifiers 只到 3.10，且 robosuite==1.4.1 /
+#    timm==0.9.10 / tokenizers==0.19.1 在 3.11+ 上未必有 wheel。
+#    镜像自带的 Python(可能是 3.12)和 PyTorch 一律不用 —— pyproject 硬 pin torch==2.2.0。
+conda env list | grep -qE "(^|/)${ENV_NAME}\s" || conda create -y -n "$ENV_NAME" python=3.10.13
 conda activate "$ENV_NAME"
-echo "==> Python: $(python --version)"
+PYV=$(python -c "import sys;print('%d.%d'%sys.version_info[:2])")
+[ "$PYV" = "3.10" ] || { echo "❌ 当前 Python $PYV，应为 3.10。环境激活有误，请检查。"; exit 1; }
+echo "==> Python: $(python --version)  (镜像自带版本已隔离，不影响)"
 
 # ---------------------------------------------------------- 5. PyTorch
 python -c "import torch" 2>/dev/null || \
