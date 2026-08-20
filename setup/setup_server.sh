@@ -180,7 +180,12 @@ pip install "imageio[ffmpeg]" matplotlib pandas
 # ⚠️ robosuite 1.4.1 声明 numpy>=1.13.3 / mujoco>=2.3.0（上界全开），会拉来 numpy 2.x，
 #    而 torch 2.2.0 与 tensorflow 2.15.0 都要求 numpy<2 —— 不钉死会导致 import torch 直接崩。
 #    必须放在所有 pip 安装之后，把被顶上去的 numpy 压回来。
-pip install "numpy==1.26.4"
+# opencv-python 5.x 同样要求 numpy>=2，robosuite 未锁版本会把它拉上来，一起钉死。
+pip install "numpy==1.26.4" "opencv-python==4.10.0.84"
+
+# LIBERO 首次 import 会交互式问数据集路径，非交互环境下会 EOF 报错。
+# 喂 "N" 走默认路径，提前把 ~/.libero/config.yaml 生成好。
+[ -f "$HOME/.libero/config.yaml" ] || echo "N" | python -c "import libero.libero" >/dev/null 2>&1 || true
 
 # AutoDL 等镜像可能把 OMP_NUM_THREADS 设成非法值，libgomp 会持续报警
 add_env "export OMP_NUM_THREADS=8"

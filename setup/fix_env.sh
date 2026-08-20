@@ -32,8 +32,10 @@ if command -v apt-get >/dev/null; then
     || echo "⚠️  apt 安装失败，可能需要手动处理"
 fi
 
-echo "==> ② numpy 降到 1.x (torch 2.2 / tf 2.15 均要求 <2)"
-pip install -q "numpy==1.26.4"
+echo "==> ② numpy 降到 1.x，并同步降 opencv-python"
+# opencv-python 5.x 要求 numpy>=2，与 torch 2.2 / tf 2.15 的 numpy<2 直接冲突。
+# robosuite 只写了 opencv-python(无版本)，会被拉到 5.x —— 必须一起钉死。
+pip install -q "numpy==1.26.4" "opencv-python==4.10.0.84"
 
 echo "==> ③ 重装 LIBERO（compat 模式绕开 find_packages 空列表问题）"
 if [ -d "$LIBERO_DIR" ]; then
@@ -49,7 +51,16 @@ else
   echo "❌ 找不到 $LIBERO_DIR，请用 LIBERO_DIR=... 指定"
 fi
 
-echo "==> ④ 修正 OMP_NUM_THREADS（AutoDL 默认值非法，libgomp 会报警）"
+echo "==> ④ 初始化 LIBERO 配置文件"
+# LIBERO 首次 import 会交互式询问数据集路径以生成 ~/.libero/config.yaml，
+# 非交互环境下直接 EOF 报错。喂一个 "N" 用默认路径把它生成掉。
+if [ ! -f "$HOME/.libero/config.yaml" ]; then
+  echo "N" | python -c "import libero.libero" 2>&1 | tail -6
+fi
+[ -f "$HOME/.libero/config.yaml" ] && echo "    ✅ ~/.libero/config.yaml 已生成" \
+                                   || echo "    ❌ 配置文件仍未生成"
+
+echo "==> ⑤ 修正 OMP_NUM_THREADS（AutoDL 默认值非法，libgomp 会报警）"
 grep -qF "OMP_NUM_THREADS" "$HOME/.bashrc" || echo "export OMP_NUM_THREADS=8" >> "$HOME/.bashrc"
 export OMP_NUM_THREADS=8
 
@@ -59,8 +70,8 @@ export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl
 python - <<'PY'
 import importlib
 ok = True
-for m, want in [("numpy","1.26.4"), ("torch","2.2.0"), ("transformers","4.40.1"),
-                ("robosuite","1.4.1"), ("flash_attn",None), ("libero",None)]:
+for m, want in [("numpy","1.26.4"), ("cv2","4.10"), ("torch","2.2.0"),
+                ("transformers","4.40.1"), ("robosuite","1.4.1"), ("flash_attn",None)]:
     try:
         got = getattr(importlib.import_module(m), "__version__", "已安装")
         good = want is None or got.startswith(want)

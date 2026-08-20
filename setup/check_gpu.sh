@@ -2,6 +2,12 @@
 # 切回 GPU 模式后跑这个，10 秒确认这台机器能不能跑 OpenVLA。
 set -uo pipefail
 
+# 用 `bash setup/check_gpu.sh` 启动的是非交互 shell，不会读 ~/.bashrc，
+# HF_HOME / MUJOCO_GL 等会显示未设置。这里自己补上。
+if [ -z "${OPENVLA_ROOT:-}" ] && [ -f "$HOME/.bashrc" ]; then
+  set +u; source "$HOME/.bashrc" >/dev/null 2>&1 || true; set -u
+fi
+
 echo "=========================================="
 echo " OpenVLA 运行环境自检"
 echo "=========================================="
