@@ -1,0 +1,18 @@
+# 实验产物 —— 体积大，不入库；图表按需单独提交
+results/
+rollouts/
+experiments/logs/
+wandb/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# 模型权重与数据
+*.pt
+*.bin
+*.safetensors
+checkpoints/
+data/
