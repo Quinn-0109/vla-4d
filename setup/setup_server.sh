@@ -152,23 +152,47 @@ EOM
   }
 fi
 
-# ---------------------------------------------------------- 7. LIBERO
+# ---------------------------------------------------------- 7. 系统库
+# EGL/OpenGL 运行库：缺了 PyOpenGL 会返回 None，报
+# "'NoneType' object has no attribute 'eglQueryString'"。必须先 apt-get update。
+if command -v apt-get >/dev/null; then
+  apt-get update -qq || true
+  apt-get install -y -qq libegl1 libgl1 libglvnd0 libosmesa6 libglib2.0-0 \
+                        fonts-wqy-zenhei || echo "⚠️  apt 安装失败，稍后可跑 setup/fix_env.sh 补"
+fi
+
+# ---------------------------------------------------------- 8. LIBERO
 cd "$WORK_DIR"
 [ -d LIBERO ] || git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git
-cd LIBERO && pip install -e .
+# ⚠️ LIBERO/libero/ 下没有 __init__.py，其 setup.py 里
+#    packages=[p for p in find_packages() if p.startswith("libero")] 会返回空列表。
+#    新版 setuptools 按 PEP 660 严格安装 => 什么都装不上。compat 模式恢复旧行为。
+cd LIBERO && pip install -e . --config-settings editable_mode=compat
+python -c "import libero" 2>/dev/null || {
+  echo "==> compat 模式无效，改用 PYTHONPATH 兜底"
+  add_env "export PYTHONPATH=$WORK_DIR/LIBERO:\$PYTHONPATH"
+  export PYTHONPATH="$WORK_DIR/LIBERO:${PYTHONPATH:-}"
+}
+
 cd "$WORK_DIR/openvla" && pip install -r experiments/robot/libero/libero_requirements.txt
 pip install "imageio[ffmpeg]" matplotlib pandas
 
-# 中文字体（图表标签用；没有会自动回退英文，不装也能跑）
-command -v apt-get >/dev/null && apt-get install -y -qq fonts-wqy-zenhei libegl1 libgl1 2>/dev/null || true
+# ⚠️ robosuite 1.4.1 声明 numpy>=1.13.3 / mujoco>=2.3.0（上界全开），会拉来 numpy 2.x，
+#    而 torch 2.2.0 与 tensorflow 2.15.0 都要求 numpy<2 —— 不钉死会导致 import torch 直接崩。
+#    必须放在所有 pip 安装之后，把被顶上去的 numpy 压回来。
+pip install "numpy==1.26.4"
 
-# ---------------------------------------------------------- 8. 自检
+# AutoDL 等镜像可能把 OMP_NUM_THREADS 设成非法值，libgomp 会持续报警
+add_env "export OMP_NUM_THREADS=8"
+export OMP_NUM_THREADS=8
+
+# ---------------------------------------------------------- 9. 自检
 echo ""
 echo "==> 环境自检"
 python - <<'PY'
 import importlib
-for m, want in [("torch","2.2.0"), ("transformers","4.40.1"), ("robosuite","1.4.1"),
-                ("libero",None), ("flash_attn",None)]:
+for m, want in [("numpy","1.26.4"), ("torch","2.2.0"), ("transformers","4.40.1"),
+                ("robosuite","1.4.1"), ("libero",None), ("flash_attn",None)]:
     try:
         got = getattr(importlib.import_module(m), "__version__", "?")
         print(f"  {'✅' if (want is None or got == want) else f'⚠️  期望 {want}'} {m}: {got}")
