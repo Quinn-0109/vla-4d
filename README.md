@@ -61,13 +61,29 @@ python src/analysis/analyze.py --traj_dir results/trajectories
 
 ## 硬件要求
 
+### ⚠️ 架构门槛：必须 Ampere (sm80) 及以上
+
+`experiments/robot/openvla_utils.py:45` **写死了** `attn_implementation="flash_attention_2"`，
+配合 `torch_dtype=torch.bfloat16` —— 两者都要求 Ampere 及以上架构。**这不是可选项。**
+
+| | GPU | 算力 |
+|---|---|---|
+| ❌ 跑不了 | V100 / T4 / RTX 2080Ti | 7.0 / 7.5 |
+| ✅ 可用 | A100(8.0)、A10·A5000·A6000·RTX 3090(8.6)、RTX 4090·L20·L40S(8.9)、H100(9.0) | ≥8.0 |
+
+### 显存
+
 | 用途 | 显存 | 说明 |
 |---|---|---|
-| 评测（推理） | **≥16 GB** | 7B bf16 占 15 GB；RTX 4090 约 6 Hz |
+| 评测（bf16） | **≥16 GB** | 模型占 15 GB；RTX 4090 约 6 Hz |
+| 评测（4bit 量化） | **≥8 GB** | 论文实测 4bit 精度与 bf16 **持平**；⚠️ 别用 8bit，更慢且更差 |
 | LoRA 微调 | **≥27 GB** | 官方下限；batch_size=16 需 ~72 GB |
 | 全量微调 | 8× A100 | 每任务 5–15 小时 |
 
 磁盘建议 **200 GB+**（4 个 checkpoint 各约 16 GB）。
+
+> **LIBERO 是同步仿真器**：`env.step()` 会等动作算完才推进，所以推理快慢
+> **完全不影响成功率**，只影响评测要跑多久。选卡是花钱买时间，不是买正确性。
 
 **耗时预估**：按 6 Hz 估算，四个 suite 各 500 rollouts 单种子约 **25 小时**
 （LIBERO-Long 最慢，单 episode 最多 520 步）。
