@@ -108,10 +108,31 @@ mkdir -p "$CONDA_ENVS"
 conda config --add envs_dirs "$CONDA_ENVS" 2>/dev/null || true
 echo "==> conda 环境目录: $CONDA_ENVS"
 
+# 租用镜像常预置清华源，其中 anaconda/pkgs/free 已被 Anaconda 废弃、清华下线，
+# 留在 channels 里会让 conda create 直接 404 失败。逐个剔除已失效的频道。
+for dead in "https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/free" \
+            "https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/pro" \
+            "https://mirrors.tuna.tsinghua.edu.cn/anaconda/pkgs/msys2"; do
+  conda config --remove channels "$dead" 2>/dev/null || true
+done
+
 # ⚠️ 必须用 Python 3.10.13：OpenVLA 的 classifiers 只到 3.10，且 robosuite==1.4.1 /
 #    timm==0.9.10 / tokenizers==0.19.1 在 3.11+ 上未必有 wheel。
 #    镜像自带的 Python(可能是 3.12)和 PyTorch 一律不用 —— pyproject 硬 pin torch==2.2.0。
-conda env list | grep -qE "(^|/)${ENV_NAME}\s" || conda create -y -n "$ENV_NAME" python=3.10.13
+if ! conda env list | grep -qE "(^|/)${ENV_NAME}\\s"; then
+  # 先用现有频道配置；失败则绕开一切自定义频道，直连官方 defaults 重试。
+  conda create -y -n "$ENV_NAME" python=3.10.13 || {
+    echo "==> 频道配置有问题，改用 --override-channels 直连官方源重试"
+    conda create -y -n "$ENV_NAME" python=3.10.13 --override-channels -c defaults || {
+      cat <<'EOM'
+❌ conda 建环境失败。多半是镜像预置的 .condarc 里有失效频道。
+   查看: conda config --show channels
+   重置: mv ~/.condarc ~/.condarc.bak && bash setup/setup_server.sh
+EOM
+      exit 1
+    }
+  }
+fi
 conda activate "$ENV_NAME"
 PYV=$(python -c "import sys;print('%d.%d'%sys.version_info[:2])")
 [ "$PYV" = "3.10" ] || { echo "❌ 当前 Python $PYV，应为 3.10。环境激活有误，请检查。"; exit 1; }
