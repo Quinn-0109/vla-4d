@@ -8,6 +8,14 @@ if [ -z "${OPENVLA_ROOT:-}" ] && [ -f "$HOME/.bashrc" ]; then
   set +u; source "$HOME/.bashrc" >/dev/null 2>&1 || true; set -u
 fi
 
+# ⚠️ source ~/.bashrc 会执行 conda init 块，把 shell 重置到 base 环境，
+#    结果检查的是镜像自带的 torch 而不是我们装的。必须显式切回 openvla。
+ENV_NAME="${ENV_NAME:-openvla}"
+if command -v conda >/dev/null; then
+  set +u; eval "$(conda shell.bash hook)" 2>/dev/null || true
+  conda activate "$ENV_NAME" 2>/dev/null || true; set -u
+fi
+
 echo "=========================================="
 echo " OpenVLA 运行环境自检"
 echo "=========================================="
@@ -26,7 +34,12 @@ VRAM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head 
                       || echo "⚠️  显存 ${VRAM}MB < 16GB，请加 --load_in_4bit True"
 
 python - <<'PY'
-import torch, os
+import sys, torch, os
+ok_env = "openvla" in sys.prefix
+print(f"{'✅' if ok_env else '❌'} 环境: {sys.prefix}")
+if not ok_env:
+    print("   当前不在 openvla 环境！下面的版本是镜像自带的，不是我们装的。")
+    print("   请执行: source ~/.bashrc && conda activate openvla")
 print(f"✅ torch {torch.__version__} | CUDA {torch.version.cuda} | available={torch.cuda.is_available()}")
 print(f"{'✅' if torch.cuda.is_bf16_supported() else '❌'} bfloat16 支持")
 try:
