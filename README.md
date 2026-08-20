@@ -18,12 +18,26 @@ papers/   参考论文 PDF (在 main 分支根目录)
 
 ```bash
 git clone https://github.com/Quinn-0109/vla-4d.git && cd vla-4d
-bash setup/setup_server.sh
+bash setup/setup_server.sh          # 自动探测数据盘；也可 DATA_DIR=/root/autodl-tmp 指定
+source ~/.bashrc
 ```
 
-脚本会装好 conda 环境、OpenVLA、LIBERO，并锁定官方复现版本
-（Python 3.10.13 / PyTorch 2.2.0 / transformers 4.40.1 / flash-attn 2.5.5），
-最后跑自检确认 LIBERO 能启动。
+脚本会：装 conda 环境 / OpenVLA / LIBERO，锁定官方复现版本，**把 conda 和
+HuggingFace 缓存都放到数据盘**（系统盘通常只有 30 GB，不重定向必爆），
+最后自检 LIBERO 能否启动。
+
+**💡 省钱：先用「无卡模式」装环境和下模型。** 脚本检测不到 GPU 时不会退出，
+照常安装。装环境 + 下 checkpoint 要 5–8 小时，在无卡模式下做几乎不花钱，
+装完再切 GPU 模式跑评测。
+
+```bash
+# 无卡模式下：
+bash setup/setup_server.sh
+bash scripts/download_checkpoints.sh libero_spatial   # 约 15 GB
+
+# 切回 GPU 模式后先自检：
+bash setup/check_gpu.sh
+```
 
 ### 2. 先熟悉 LIBERO（不加载模型，几分钟）
 
@@ -80,7 +94,20 @@ python src/analysis/analyze.py --traj_dir results/trajectories
 | LoRA 微调 | **≥27 GB** | 官方下限；batch_size=16 需 ~72 GB |
 | 全量微调 | 8× A100 | 每任务 5–15 小时 |
 
-磁盘建议 **200 GB+**（4 个 checkpoint 各约 16 GB）。
+### 磁盘
+
+| 项目 | 大小 |
+|---|---|
+| conda + PyTorch + CUDA 库 | ~18 GB |
+| 单个 checkpoint (7B bf16) | **~15 GB** |
+| 4 个 checkpoint 全下 | **~60 GB** |
+| LIBERO + assets | ~1 GB |
+
+**只跑一个 suite 约需 35 GB，四个全跑约 80 GB。** 数据盘 50 GB 也能做——
+一次只下一个，跑完用 `download_checkpoints.sh --rm <suite>` 删掉再下下一个。
+
+⚠️ HuggingFace 默认缓存在 `~/.cache`（系统盘）。setup 脚本会自动把 `HF_HOME`
+重定向到数据盘；手动装的话务必自己设，否则 30 GB 系统盘必然爆。
 
 > **LIBERO 是同步仿真器**：`env.step()` 会等动作算完才推进，所以推理快慢
 > **完全不影响成功率**，只影响评测要跑多久。选卡是花钱买时间，不是买正确性。

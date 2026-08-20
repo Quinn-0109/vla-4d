@@ -5,158 +5,175 @@
 # 版本严格锁定为 OpenVLA 官方复现配置：
 #   Python 3.10.13 / PyTorch 2.2.0 / transformers 4.40.1 / flash-attn 2.5.5
 # 官方原话："Please stick to these package versions."
-# transformers 版本漂移是 OpenVLA issue 区最常见的报错来源。
 #
-# 用法:  bash setup/setup_server.sh [工作目录，默认 $HOME/vla-work]
+# 用法:
+#   bash setup/setup_server.sh                 # 自动探测数据盘
+#   DATA_DIR=/root/autodl-tmp bash setup/setup_server.sh   # 手动指定
+#
+# 💡 支持「无卡模式」安装：检测不到 GPU 时不会退出，照常装环境。
+#    这样可以在不计 GPU 费的模式下装环境 + 下模型，装完再切正常模式跑评测。
+#    切回 GPU 模式后先跑: bash setup/check_gpu.sh
 # ============================================================================
 set -euo pipefail
 
-WORK_DIR="${1:-$HOME/vla-work}"
+# ---------------------------------------------------------- 0. 定位数据盘
+# 系统盘通常很小(30G)，环境和模型都必须放数据盘，否则装到一半爆盘。
+if [ -z "${DATA_DIR:-}" ]; then
+  for cand in /root/autodl-tmp /root/autodl-fs /root/data /data /mnt/data "$HOME"; do
+    if [ -d "$cand" ] && [ -w "$cand" ]; then DATA_DIR="$cand"; break; fi
+  done
+fi
+DATA_DIR="${DATA_DIR:-$HOME}"
+WORK_DIR="$DATA_DIR/vla-work"
 ENV_NAME="openvla"
 
+echo "==> 数据盘: $DATA_DIR"
 echo "==> 工作目录: $WORK_DIR"
 mkdir -p "$WORK_DIR"
-cd "$WORK_DIR"
 
-# ---------------------------------------------------------------- 0. 前置检查
-command -v nvidia-smi >/dev/null || { echo "❌ 找不到 nvidia-smi，这台机器没有 GPU"; exit 1; }
-nvidia-smi --query-gpu=name,memory.total,compute_cap --format=csv
+# ---------------------------------------------------------- 1. 磁盘检查
+AVAIL_GB=$(df -BG --output=avail "$DATA_DIR" | tail -1 | tr -dc '0-9')
+echo "==> 数据盘可用: ${AVAIL_GB} GB"
+cat <<EOM
+    空间需求参考:
+      conda + PyTorch + CUDA 库     ~18 GB
+      单个 checkpoint (7B bf16)     ~15 GB
+      4 个 checkpoint 全下          ~60 GB
+      LIBERO + assets                ~1 GB
+      => 只跑一个 suite 约 35 GB；四个全跑约 80 GB
+EOM
+if [ "$AVAIL_GB" -lt 35 ]; then
+  echo "❌ 可用空间不足 35 GB，连跑一个 suite 都不够。请先扩容数据盘。"; exit 1
+elif [ "$AVAIL_GB" -lt 80 ]; then
+  echo "⚠️  空间够跑单个 suite，但存不下 4 个 checkpoint。"
+  echo "    对策: 一次只下一个，跑完删掉再下下一个（见 scripts/download_checkpoints.sh）"
+fi
 
-# OpenVLA 评测路径写死了 flash_attention_2 + bfloat16，两者都要求 Ampere(sm80) 及以上。
-# V100(sm70) / T4(sm75) / 2080Ti(sm75) 一律跑不了，必须在这里拦住。
-CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.')
-if [ -n "$CC" ] && [ "$CC" -lt 80 ]; then
-  cat <<EOM
-❌ GPU 算力等级 $(echo $CC | sed 's/./&./1') 过低，OpenVLA 跑不起来。
+# ---------------------------------------------------------- 2. GPU 检查（可跳过）
+HAS_GPU=0
+if command -v nvidia-smi >/dev/null && nvidia-smi >/dev/null 2>&1; then
+  HAS_GPU=1
+  nvidia-smi --query-gpu=name,memory.total,compute_cap --format=csv
+
+  # OpenVLA 评测路径写死了 flash_attention_2 + bfloat16，均要求 Ampere(sm80)+
+  CC=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -1 | tr -d '.')
+  if [ -n "$CC" ] && [ "$CC" -lt 80 ]; then
+    cat <<EOM
+❌ GPU 算力等级过低，OpenVLA 跑不起来。
 
    experiments/robot/openvla_utils.py:45 写死了 attn_implementation="flash_attention_2"，
-   加上 torch_dtype=torch.bfloat16 —— 两者都需要 Ampere (sm80) 及以上架构。
+   加上 torch_dtype=torch.bfloat16 —— 两者都需要 Ampere (sm80) 及以上。
 
    不可用: V100(7.0) / T4(7.5) / RTX 2080Ti(7.5)
    可  用: A100(8.0) / A10·A5000·A6000·RTX 3090(8.6) / RTX 4090·L20·L40S(8.9) / H100(9.0)
 EOM
-  exit 1
+    exit 1
+  fi
+
+  VRAM_MB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1)
+  [ "$VRAM_MB" -lt 16000 ] && \
+    echo "⚠️  显存 ${VRAM_MB}MB < 16GB。bf16 需 15GB，请改用 4bit: --load_in_4bit True"
+else
+  echo "⚠️  未检测到 GPU —— 按「无卡模式安装」继续。"
+  echo "    装完切回 GPU 模式后，先跑 bash setup/check_gpu.sh 验证再开始评测。"
 fi
 
-VRAM_MB=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits | head -1)
-if [ "$VRAM_MB" -lt 16000 ]; then
-  echo "⚠️  显存 ${VRAM_MB}MB < 16GB。bf16 需要 15GB；请改用 4bit 量化 (--load_in_4bit True)。"
-fi
+# ---------------------------------------------------------- 3. 环境变量
+# HuggingFace 默认把模型缓存到 ~/.cache（系统盘），30G 系统盘必然爆。
+HF_CACHE="$DATA_DIR/huggingface"
+mkdir -p "$HF_CACHE"
+add_env () { grep -qF "$1" "$HOME/.bashrc" 2>/dev/null || echo "$1" >> "$HOME/.bashrc"; }
+add_env "# --- OpenVLA/LIBERO ---"
+add_env "export HF_HOME=$HF_CACHE"          # 模型缓存放数据盘
+add_env "export MUJOCO_GL=egl"              # 服务器无显示器，走 EGL 离屏渲染
+add_env "export PYOPENGL_PLATFORM=egl"
+add_env "export OPENVLA_ROOT=$WORK_DIR/openvla"
+export HF_HOME="$HF_CACHE" MUJOCO_GL=egl PYOPENGL_PLATFORM=egl OPENVLA_ROOT="$WORK_DIR/openvla"
+echo "==> HF_HOME=$HF_HOME  (模型缓存已重定向到数据盘)"
 
-AVAIL_GB=$(df -BG --output=avail "$WORK_DIR" | tail -1 | tr -dc '0-9')
-if [ "$AVAIL_GB" -lt 120 ]; then
-  echo "⚠️  可用磁盘仅 ${AVAIL_GB}G。4 个 checkpoint 各约 16G，建议至少 200G。"
-fi
-
-# ---------------------------------------------------------------- 1. Conda 环境
+# ---------------------------------------------------------- 4. Conda
 if ! command -v conda >/dev/null; then
-  echo "==> 未检测到 conda，安装 Miniconda"
+  echo "==> 安装 Miniconda 到数据盘"
   wget -q https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh -O /tmp/miniconda.sh
-  bash /tmp/miniconda.sh -b -p "$HOME/miniconda3"
-  export PATH="$HOME/miniconda3/bin:$PATH"
+  bash /tmp/miniconda.sh -b -p "$DATA_DIR/miniconda3"
+  export PATH="$DATA_DIR/miniconda3/bin:$PATH"
+  add_env "export PATH=$DATA_DIR/miniconda3/bin:\$PATH"
 fi
 eval "$(conda shell.bash hook)"
-
-if ! conda env list | grep -q "^${ENV_NAME} "; then
-  conda create -y -n "$ENV_NAME" python=3.10.13
-fi
+conda env list | grep -q "^${ENV_NAME} " || conda create -y -n "$ENV_NAME" python=3.10.13
 conda activate "$ENV_NAME"
 echo "==> Python: $(python --version)"
 
-# ---------------------------------------------------------------- 2. PyTorch
-# CUDA 版本按服务器实际驱动调整；cu121 适配大多数 A100/4090 镜像
+# ---------------------------------------------------------- 5. PyTorch
 python -c "import torch" 2>/dev/null || \
   pip install torch==2.2.0 torchvision==0.17.0 torchaudio==2.2.0 \
       --index-url https://download.pytorch.org/whl/cu121
 
-python - <<'PY'
-import torch
-print(f"==> torch {torch.__version__} | CUDA available: {torch.cuda.is_available()}")
-if torch.cuda.is_available():
-    print(f"==> GPU: {torch.cuda.get_device_name(0)} "
-          f"({torch.cuda.get_device_properties(0).total_memory/1024**3:.1f} GB)")
-PY
-
-# ---------------------------------------------------------------- 3. OpenVLA
-if [ ! -d "$WORK_DIR/openvla" ]; then
-  git clone https://github.com/openvla/openvla.git
-fi
-cd "$WORK_DIR/openvla"
+# ---------------------------------------------------------- 6. OpenVLA
+cd "$WORK_DIR"
+[ -d openvla ] || git clone https://github.com/openvla/openvla.git
+cd openvla
 pip install -e .
-pip install transformers==4.40.1          # 必须锁定，-e . 可能装上更高版本
+pip install transformers==4.40.1     # 必须锁定：-e . 可能装上更高版本，是最常见的报错源
 
-# Flash Attention 2 —— ⚠️ 评测也必需，不是可选项。
-# openvla_utils.py:45 写死了 attn_implementation="flash_attention_2"，装不上就无法加载模型。
+# Flash Attention 2 —— ⚠️ 评测也必需，不是可选项（openvla_utils.py:45 写死）
 pip install packaging ninja
-ninja --version >/dev/null 2>&1 && echo "==> ninja OK"
-if ! pip install "flash-attn==2.5.5" --no-build-isolation; then
-  echo "==> flash-attn 首次安装失败，清缓存后重试"
-  pip cache remove flash_attn 2>/dev/null || true
+if ! python -c "import flash_attn" 2>/dev/null; then
   pip install "flash-attn==2.5.5" --no-build-isolation || {
-    cat <<'EOM'
-❌ flash-attn 安装失败，且这是评测的硬性依赖(openvla_utils.py:45 写死)。
+    echo "==> 首次失败，清缓存重试"
+    pip cache remove flash_attn 2>/dev/null || true
+    MAX_JOBS=4 pip install "flash-attn==2.5.5" --no-build-isolation || {
+      cat <<'EOM'
+❌ flash-attn 安装失败，而它是评测的硬性依赖。
 
-   常见原因与对策:
-   1. 编译超时/OOM  -> 加大交换分区，或设 MAX_JOBS=4 后重试
-   2. CUDA 版本不匹配 -> 确认 nvcc --version 与 torch.version.cuda 一致
-   3. 想绕过编译     -> 从 flash-attention 的 GitHub Releases 下载匹配
-                        torch2.2 + cu121 + 你的 Python 版本的预编译 wheel
+   排查:
+   1. 编译 OOM/超时 -> MAX_JOBS=2 重试，或加大交换分区
+   2. CUDA 不匹配   -> 对比 nvcc --version 与 python -c "import torch;print(torch.version.cuda)"
+   3. 绕过编译      -> 从 flash-attention GitHub Releases 下 torch2.2+cu121+cp310 预编译 wheel
 
-   若确实装不上，可以改用 SDPA: 把 openvla_utils.py:45 的
-   attn_implementation 改成 "sdpa"（速度略降，结果不受影响）。
+   实在装不上的兜底: 把 openvla_utils.py:45 的 attn_implementation 改成 "sdpa"
+   （速度略降，评测结果不受影响）
 EOM
-    exit 1
+      exit 1
+    }
   }
 fi
 
-# ---------------------------------------------------------------- 4. LIBERO
+# ---------------------------------------------------------- 7. LIBERO
 cd "$WORK_DIR"
-if [ ! -d "$WORK_DIR/LIBERO" ]; then
-  git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git
-fi
-cd "$WORK_DIR/LIBERO"
-pip install -e .
+[ -d LIBERO ] || git clone https://github.com/Lifelong-Robot-Learning/LIBERO.git
+cd LIBERO && pip install -e .
+cd "$WORK_DIR/openvla" && pip install -r experiments/robot/libero/libero_requirements.txt
+pip install "imageio[ffmpeg]" matplotlib pandas
 
-cd "$WORK_DIR/openvla"
-pip install -r experiments/robot/libero/libero_requirements.txt
+# 中文字体（图表标签用；没有会自动回退英文，不装也能跑）
+command -v apt-get >/dev/null && apt-get install -y -qq fonts-wqy-zenhei libegl1 libgl1 2>/dev/null || true
 
-# ---------------------------------------------------------------- 5. 无头渲染
-# LIBERO 基于 robosuite/MuJoCo，服务器无显示器时必须走 EGL 离屏渲染
-pip install imageio[ffmpeg] matplotlib pandas seaborn
-cat >> "$HOME/.bashrc" <<'ENVEOF'
-# --- OpenVLA/LIBERO 无头渲染 ---
-export MUJOCO_GL=egl
-export PYOPENGL_PLATFORM=egl
-ENVEOF
-export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl
-
-# ---------------------------------------------------------------- 6. 自检
+# ---------------------------------------------------------- 8. 自检
+echo ""
 echo "==> 环境自检"
 python - <<'PY'
-import importlib, sys
-ok = True
-for m, want in [("torch","2.2.0"), ("transformers","4.40.1"), ("libero",None), ("robosuite","1.4.1")]:
+import importlib
+for m, want in [("torch","2.2.0"), ("transformers","4.40.1"), ("robosuite","1.4.1"),
+                ("libero",None), ("flash_attn",None)]:
     try:
-        mod = importlib.import_module(m)
-        got = getattr(mod, "__version__", "?")
-        flag = "✅" if (want is None or got == want) else f"⚠️  期望 {want}"
-        print(f"  {flag} {m}: {got}")
-        if want and got != want: ok = False
+        got = getattr(importlib.import_module(m), "__version__", "?")
+        print(f"  {'✅' if (want is None or got == want) else f'⚠️  期望 {want}'} {m}: {got}")
     except Exception as e:
-        print(f"  ❌ {m}: {e}"); ok = False
-sys.exit(0 if ok else 0)
+        print(f"  ❌ {m}: {type(e).__name__}: {e}")
 PY
 
-# LIBERO 环境能否真正启动（这一步能提前暴露 EGL/MuJoCo 问题）
+# LIBERO 能否真正启动 —— 这一步提前暴露 EGL/MuJoCo 问题
 python - <<'PY'
+import os; os.environ.setdefault("MUJOCO_GL", "egl")
 try:
     from libero.libero import benchmark
-    d = benchmark.get_benchmark_dict()
-    ts = d["libero_spatial"]()
-    print(f"  ✅ LIBERO 可用 | libero_spatial 任务数: {ts.n_tasks}")
+    ts = benchmark.get_benchmark_dict()["libero_spatial"]()
+    print(f"  ✅ LIBERO 可用 | libero_spatial: {ts.n_tasks} 个任务")
+    print(f"     示例指令: {ts.get_task(0).language}")
 except Exception as e:
     print(f"  ❌ LIBERO 启动失败: {e}")
-    print("     常见原因: MUJOCO_GL 未设为 egl，或缺 libegl1 (apt install -y libegl1 libgl1)")
+    print("     多半是 MUJOCO_GL 未设为 egl，或缺 libegl1 (apt install -y libegl1 libgl1)")
 PY
 
 cat <<EOM
@@ -164,13 +181,17 @@ cat <<EOM
 ============================================================
 ✅ 安装完成
 
+  source ~/.bashrc
   conda activate $ENV_NAME
-  export MUJOCO_GL=egl
 
-下一步（先跑冒烟测试，5 分钟内出结果）：
-  bash scripts/run_eval.sh smoke
+下一步:
+  1) 下载 checkpoint（无卡模式下做最省钱）
+       bash scripts/download_checkpoints.sh libero_spatial
+  2) 熟悉 LIBERO（不加载模型）
+       python scripts/explore_libero.py inspect
+  3) 冒烟测试
+       bash scripts/run_eval.sh smoke
 
-确认无误后跑完整评测：
-  bash scripts/run_eval.sh full
+  数据盘: $DATA_DIR   HF_HOME: $HF_CACHE
 ============================================================
 EOM
