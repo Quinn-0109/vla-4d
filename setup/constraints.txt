@@ -24,3 +24,12 @@ opencv-python==4.10.0.84
 # runtime_version 模块 -> ImportError: cannot import name 'runtime_version'
 protobuf==3.20.3
 tensorflow-metadata==1.14.0
+
+# robosuite 1.4.1(2024-02 发布)只声明 mujoco>=2.3.0，上界又是开的，
+# 会拉来 mujoco 3.x。3.0 是大版本变更，robosuite 的 binding_utils.py
+# 读关节类型的方式已不兼容，建环境时抛:
+#   File robosuite/utils/binding_utils.py, in get_joint_qpos_addr
+#   assert joint_type in (mujoco.mjtJoint.mjJNT_HINGE, mujoco.mjtJoint.mjJNT_SLIDE)
+#   AssertionError
+# 钉回与 robosuite 1.4.1 同期的 2.3.x。
+mujoco==2.3.2
