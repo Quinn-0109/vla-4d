@@ -182,15 +182,20 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
                     action_raw = get_action(cfg, model, observation, task_description, processor=processor)
 
+                    # ⚠️ normalize_gripper_action / invert_gripper_action 都是原地修改并返回同一对象
+                    #    (见 experiments/robot/robot_utils.py:87)。不先复制的话 action_raw 会被
+                    #    一并改掉，两个字段记录的就是同一个值，模型输出与执行动作的区分就丢了。
+                    raw_snapshot = np.asarray(action_raw, dtype=np.float64).copy()
+
                     # 夹爪动作 [0,1] -> [-1,+1]，环境期望后者
-                    action = normalize_gripper_action(action_raw, binarize=True)
+                    action = normalize_gripper_action(np.asarray(action_raw).copy(), binarize=True)
                     # OpenVLA 的 dataloader 翻转过夹爪符号，执行前翻回来
                     if cfg.model_family == "openvla":
                         action = invert_gripper_action(action)
 
                     steps.append({
                         "t": t,
-                        "action_raw": np.asarray(action_raw, dtype=np.float64).tolist(),
+                        "action_raw": raw_snapshot.tolist(),
                         "action_env": np.asarray(action, dtype=np.float64).tolist(),
                         "eef_pos": eef_pos.tolist(),
                         "eef_quat": eef_quat.tolist(),
