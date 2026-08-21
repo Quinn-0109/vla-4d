@@ -115,13 +115,17 @@ python src/analysis/analyze.py --traj_dir results/trajectories
 **耗时预估**：按 6 Hz 估算，四个 suite 各 500 rollouts 单种子约 **25 小时**
 （LIBERO-Long 最慢，单 episode 最多 520 步）。
 
-## 对标基线
+## 复现进度
 
-OpenVLA 论文 Appendix E Table 12：
+| Suite | 本次复现 | 论文 | 差异 |
+|---|---|---|---|
+| **Spatial** | **84.2%** (n=500) | 84.7 ± 0.9 | **−0.5**（z=0.27, p=0.79，不显著） |
+| Object | 待跑 | 88.4 ± 0.8 | |
+| Goal | 待跑 | 79.2 ± 1.0 | |
+| Long | 待跑 | 53.7 ± 1.3 | |
+| 平均 | | 76.5 ± 0.6 | |
 
-| Spatial | Object | Goal | Long | 平均 |
-|---|---|---|---|---|
-| 84.7 ± 0.9 | 88.4 ± 0.8 | 79.2 ± 1.0 | 53.7 ± 1.3 | 76.5 ± 0.6 |
+详见 `docs/05-实验记录.md`。
 
 ## 我们额外记录的东西
 
@@ -142,6 +146,7 @@ OpenVLA 论文 Appendix E Table 12：
 | `docs/02-vla-4d-精读笔记.md` | 4D 视觉/动作表征、两阶段训练、全部消融、复现风险 |
 | `docs/03-LIBERO使用指南.md` | 任务套件、API、观测/动作空间、三个必踩的坑 |
 | `docs/04-研究思路-4D自适应token池化.md` | 改进方向的设计草案与 novelty 分析 |
+| `docs/05-实验记录.md` | **实验记录**：复现结果、统计检验、轨迹质量分析、工程发现 |
 
 ## 技术路线
 
