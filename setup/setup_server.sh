@@ -170,8 +170,8 @@ pip install transformers==4.40.1     # 必须锁定：-e . 可能装上更高版
 
 # Flash Attention 2 —— ⚠️ 评测也必需，不是可选项（openvla_utils.py:45 写死）
 #
-# flash-attn 的 setup.py 会先去 GitHub Releases 下预编译 wheel，国内服务器
-# 常常连不上，下载一失败整个构建就崩（"Remote end closed connection"）。
+# flash-attn 的 setup.py 会先去 GitHub Releases 下预编译 wheel，链路不稳时
+# 这次下载一失败整个构建就崩（"Remote end closed connection"），且不会回退到源码编译。
 # FLASH_ATTENTION_FORCE_BUILD=TRUE 直接跳过那次下载，走本地源码编译。
 pip install packaging ninja
 

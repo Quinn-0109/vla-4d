@@ -23,7 +23,8 @@ declare -A REPO=(
 
 python -c "import huggingface_hub" 2>/dev/null || pip install -q huggingface_hub
 
-# 国内服务器走镜像会快很多；已设过就不覆盖
+# 默认走镜像；真正管用的是下面 snapshot_download 的断点续传。
+# 若直连更快可覆盖: HF_ENDPOINT=https://huggingface.co bash scripts/download_checkpoints.sh ...
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 echo "==> HF_ENDPOINT=$HF_ENDPOINT   (若下载慢可改回 https://huggingface.co)"
 echo "==> HF_HOME=$HF_HOME"
@@ -63,7 +64,7 @@ try:
     print(f"    -> {path}")
 except Exception as e:
     print(f"❌ 下载失败: {type(e).__name__}: {e}")
-    print("   网络不稳可重跑本脚本续传；或改 HF_ENDPOINT 换源")
+    print("   链路不稳属常见情况，重跑本脚本即可续传；也可改 HF_ENDPOINT 换源")
     sys.exit(1)
 HFDL
 done
