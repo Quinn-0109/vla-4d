@@ -242,11 +242,18 @@ python -c "import libero" 2>/dev/null || {
 cd "$WORK_DIR/openvla" && pip install -r experiments/robot/libero/libero_requirements.txt
 pip install "imageio[ffmpeg]" matplotlib pandas
 
-# ⚠️ robosuite 1.4.1 声明 numpy>=1.13.3 / mujoco>=2.3.0（上界全开），会拉来 numpy 2.x，
-#    而 torch 2.2.0 与 tensorflow 2.15.0 都要求 numpy<2 —— 不钉死会导致 import torch 直接崩。
-#    必须放在所有 pip 安装之后，把被顶上去的 numpy 压回来。
-# opencv-python 5.x 同样要求 numpy>=2，robosuite 未锁版本会把它拉上来，一起钉死。
-pip install "numpy==1.26.4" "opencv-python==4.10.0.84"
+# ⚠️ 关键一步：OpenVLA 锁死了直接依赖，但那些包对传递依赖大多没设上界，
+#    pip 会拉来 2026 年的 numpy / opencv / tensorflow-metadata，导致运行时崩溃。
+#    setup/constraints.txt 里按"实际能跑通的交集"逐个钉死，必须放在所有 pip 安装之后。
+CONSTRAINTS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/setup/constraints.txt"
+if [ -f "$CONSTRAINTS" ]; then
+  echo "==> 应用传递依赖约束: $CONSTRAINTS"
+  pip install -r "$CONSTRAINTS"
+else
+  echo "⚠️  找不到 constraints.txt，退回逐个钉死"
+  pip install "numpy==1.26.4" "opencv-python==4.10.0.84" \
+              "protobuf==3.20.3" "tensorflow-metadata==1.14.0"
+fi
 
 # LIBERO 首次 import 会交互式问数据集路径，非交互环境下会 EOF 报错。
 # 喂 "N" 走默认路径，提前把 ~/.libero/config.yaml 生成好。

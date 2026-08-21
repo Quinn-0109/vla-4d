@@ -1,0 +1,26 @@
+# ============================================================================
+# 传递依赖约束文件
+#
+# OpenVLA 的 pyproject 锁死了直接依赖(torch==2.2.0 / tensorflow==2.15.0 等)，
+# 但这些 2023-2024 年的包对自己的传递依赖大多没有设上界，pip 会拉来 2026 年的
+# 版本，导致运行时崩溃。此处按"实际能跑通的交集"逐个钉死。
+#
+# 用法:  pip install -c setup/constraints.txt <包名>
+# ============================================================================
+
+# torch 2.2.0 与 tensorflow 2.15.0 都要求 numpy<2；
+# 而 robosuite 1.4.1 只写 numpy>=1.13.3，会拉来 2.x 使 import torch 直接崩。
+numpy==1.26.4
+
+# opencv-python 5.x 要求 numpy>=2，与上面的 numpy<2 冲突。
+# robosuite 只写了 opencv-python，无版本约束。
+opencv-python==4.10.0.84
+
+# 三方约束的唯一交集:
+#   tensorflow 2.15.0        -> protobuf >=3.20.3,<5.0.0dev
+#   tensorflow-metadata 1.14 -> protobuf >=3.20.3,<4.21   (Python<3.11)
+# tensorflow_datasets 4.9.3 依赖 tensorflow-metadata 却未锁版本，
+# 会拉来新版，其 _pb2.py 用新 protoc 生成，需要 protobuf>=5.27 的
+# runtime_version 模块 -> ImportError: cannot import name 'runtime_version'
+protobuf==3.20.3
+tensorflow-metadata==1.14.0

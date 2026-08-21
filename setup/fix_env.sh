@@ -57,10 +57,14 @@ if command -v apt-get >/dev/null; then
     || echo "⚠️  apt 安装失败，可能需要手动处理"
 fi
 
-echo "==> ② numpy 降到 1.x，并同步降 opencv-python"
-# opencv-python 5.x 要求 numpy>=2，与 torch 2.2 / tf 2.15 的 numpy<2 直接冲突。
-# robosuite 只写了 opencv-python(无版本)，会被拉到 5.x —— 必须一起钉死。
-pip install -q "numpy==1.26.4" "opencv-python==4.10.0.84"
+echo "==> ② 应用传递依赖约束(numpy / opencv / protobuf / tensorflow-metadata)"
+CONSTRAINTS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/setup/constraints.txt"
+if [ -f "$CONSTRAINTS" ]; then
+  pip install -q -r "$CONSTRAINTS"
+else
+  pip install -q "numpy==1.26.4" "opencv-python==4.10.0.84" \
+                 "protobuf==3.20.3" "tensorflow-metadata==1.14.0"
+fi
 
 echo "==> ③ 重装 LIBERO（compat 模式绕开 find_packages 空列表问题）"
 if [ -d "$LIBERO_DIR" ]; then
@@ -95,8 +99,8 @@ export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl
 python - <<'PY'
 import importlib
 ok = True
-for m, want in [("numpy","1.26.4"), ("cv2","4.10"), ("torch","2.2.0"),
-                ("transformers","4.40.1"), ("robosuite","1.4.1"), ("flash_attn",None)]:
+for m, want in [("numpy","1.26.4"), ("cv2","4.10"), ("google.protobuf","3.20"),
+                ("torch","2.2.0"), ("transformers","4.40.1"), ("robosuite","1.4.1")]:
     try:
         got = getattr(importlib.import_module(m), "__version__", "已安装")
         good = want is None or got.startswith(want)
