@@ -174,7 +174,17 @@ pip install transformers==4.40.1     # 必须锁定：-e . 可能装上更高版
 # 常常连不上，下载一失败整个构建就崩（"Remote end closed connection"）。
 # FLASH_ATTENTION_FORCE_BUILD=TRUE 直接跳过那次下载，走本地源码编译。
 pip install packaging ninja
-if ! python -c "import flash_attn" 2>/dev/null; then
+
+# 逃生阀: SKIP_FLASH_ATTN=1 跳过编译，改用 PyTorch 内置的 sdpa。
+# modeling_prismatic.py 明确声明 _supports_sdpa 并透传 attn_implementation，
+# 二者是同一注意力的不同 kernel，数值近乎一致，评测结果不受影响，仅慢 10-30%。
+# LIBERO 是同步仿真器，慢只影响墙上时间，不影响成功率。
+if [ "${SKIP_FLASH_ATTN:-0}" = "1" ]; then
+  echo "==> SKIP_FLASH_ATTN=1，跳过 flash-attn，改用 sdpa"
+  sed -i 's/flash_attention_2/sdpa/' \
+    "$WORK_DIR/openvla/experiments/robot/openvla_utils.py"
+  grep -n 'attn_implementation' "$WORK_DIR/openvla/experiments/robot/openvla_utils.py" | head -1
+elif ! python -c "import flash_attn" 2>/dev/null; then
   RAM_GB=$(free -g | awk '/^Mem:/{print $2}')
   JOBS=$(( RAM_GB / 8 )); [ "$JOBS" -lt 1 ] && JOBS=1
   [ "$JOBS" -gt 8 ] && JOBS=8
