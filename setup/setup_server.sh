@@ -265,7 +265,7 @@ for m, want in [("numpy","1.26.4"), ("torch","2.2.0"), ("transformers","4.40.1")
                 ("robosuite","1.4.1"), ("libero",None), ("flash_attn",None)]:
     try:
         got = getattr(importlib.import_module(m), "__version__", "?")
-        print(f"  {'✅' if (want is None or got == want) else f'⚠️  期望 {want}'} {m}: {got}")
+        print(f"  {'✅' if (want is None or got.startswith(want)) else f'⚠️  期望 {want}'} {m}: {got}")
     except Exception as e:
         print(f"  ❌ {m}: {type(e).__name__}: {e}")
 PY
