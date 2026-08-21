@@ -223,7 +223,7 @@ fi
 if command -v apt-get >/dev/null; then
   apt-get update -qq || true
   apt-get install -y -qq libegl1 libgl1 libglvnd0 libosmesa6 libglib2.0-0 \
-                        fonts-wqy-zenhei || echo "⚠️  apt 安装失败，稍后可跑 setup/fix_env.sh 补"
+                        fonts-wqy-zenhei tmux || echo "⚠️  apt 安装失败，稍后可跑 setup/fix_env.sh 补"
 fi
 
 # ---------------------------------------------------------- 8. LIBERO

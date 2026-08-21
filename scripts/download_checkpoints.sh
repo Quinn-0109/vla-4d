@@ -21,7 +21,7 @@ declare -A REPO=(
   [libero_10]="openvla/openvla-7b-finetuned-libero-10"
 )
 
-python -c "import huggingface_hub" 2>/dev/null || pip install -q "huggingface_hub[cli]"
+python -c "import huggingface_hub" 2>/dev/null || pip install -q huggingface_hub
 
 # 国内服务器走镜像会快很多；已设过就不覆盖
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
@@ -48,12 +48,24 @@ case "${1:-}" in
   *)       SUITES=("$1") ;;
 esac
 
+# 用 Python API 而不是命令行: huggingface-hub 1.x 把 huggingface-cli 改名成 hf
+# 并废弃了旧命令，而 0.x 只有 huggingface-cli。snapshot_download 可跨版本通用。
 for s in "${SUITES[@]}"; do
   [ -n "${REPO[$s]:-}" ] || { echo "❌ 未知 suite: $s"; exit 1; }
   echo ""
   echo "==> 下载 $s  (${REPO[$s]}, 约 15 GB)"
-  # 断点续传由 hf CLI 内部处理，中断后重跑即可
-  huggingface-cli download "${REPO[$s]}" --resume-download
+  REPO_ID="${REPO[$s]}" python - <<'HFDL'
+import os, sys
+from huggingface_hub import snapshot_download
+try:
+    # 断点续传是默认行为，中断后重跑本脚本即可接着下
+    path = snapshot_download(repo_id=os.environ["REPO_ID"], max_workers=4)
+    print(f"    -> {path}")
+except Exception as e:
+    print(f"❌ 下载失败: {type(e).__name__}: {e}")
+    print("   网络不稳可重跑本脚本续传；或改 HF_ENDPOINT 换源")
+    sys.exit(1)
+HFDL
 done
 
 echo ""
