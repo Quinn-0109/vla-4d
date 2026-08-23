@@ -41,6 +41,7 @@ if _OPENVLA_ROOT is None:
         "  export OPENVLA_ROOT=$HOME/vla-work/openvla"
     )
 sys.path.insert(0, str(Path(_OPENVLA_ROOT).expanduser().resolve()))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from libero.libero import benchmark  # noqa: E402
 
@@ -94,6 +95,11 @@ class GenerateConfig:
     traj_dir: str = "./results/trajectories"   # 逐步轨迹落盘目录
     save_video: bool = True                    # 满量评测时建议关掉(500个MP4很占盘)
 
+    # --- 冻结模型下的视觉 token 预算消融 ---
+    # token_keep=0 表示不压缩(默认，与官方评测完全一致)
+    token_keep: int = 0
+    token_method: str = "tome"                 # random | uniform | norm | avgpool | tome
+
     use_wandb: bool = False
     wandb_project: str = "vla-4d"
     wandb_entity: str = ""
@@ -114,6 +120,10 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
     model = get_model(cfg)
 
+    if cfg.token_keep > 0:
+        from pooling.token_select import patch_vision_backbone
+        patch_vision_backbone(model, cfg.token_keep, cfg.token_method)
+
     # 数据集若带 _no_noops 后缀，反归一化的 key 需要跟着改
     if cfg.model_family == "openvla":
         if cfg.unnorm_key not in model.norm_stats and f"{cfg.unnorm_key}_no_noops" in model.norm_stats:
@@ -123,6 +133,8 @@ def eval_libero(cfg: GenerateConfig) -> None:
     processor = get_processor(cfg) if cfg.model_family == "openvla" else None
 
     run_id = f"EVAL-{cfg.task_suite_name}-{cfg.model_family}-seed{cfg.seed}-{DATE_TIME}"
+    if cfg.token_keep > 0:
+        run_id += f"--tok{cfg.token_keep}-{cfg.token_method}"
     if cfg.run_id_note:
         run_id += f"--{cfg.run_id_note}"
 
@@ -260,6 +272,8 @@ def eval_libero(cfg: GenerateConfig) -> None:
         "checkpoint": str(cfg.pretrained_checkpoint),
         "seed": cfg.seed,
         "num_trials_per_task": cfg.num_trials_per_task,
+        "token_keep": cfg.token_keep,
+        "token_method": cfg.token_method if cfg.token_keep > 0 else None,
         "total_episodes": total_episodes,
         "total_successes": total_successes,
         "overall_success_rate": overall,
