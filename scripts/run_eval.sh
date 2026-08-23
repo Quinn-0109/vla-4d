@@ -6,6 +6,7 @@
 #   bash scripts/run_eval.sh full               # 完整: 4 suite × 50 trials/task, seed 7
 #   bash scripts/run_eval.sh full 3             # 完整 + 3 个种子(对齐论文协议)
 #   bash scripts/run_eval.sh single libero_goal # 单个 suite
+#   bash scripts/run_eval.sh single libero_10 2 7 True   # 末位 True = 保存 MP4
 # ============================================================================
 set -euo pipefail
 
@@ -58,8 +59,10 @@ case "$MODE" in
     done
     ;;
   single)
-    SUITE="${2:?用法: run_eval.sh single <suite>}"
-    run_suite "$SUITE" "${3:-50}" "${4:-7}" False
+    # 用法: single <suite> [trials=50] [seed=7] [save_video=False]
+    # 满量评测默认不存视频(每 suite 500 个 MP4 太占盘)；要做演示时末位传 True
+    SUITE="${2:?用法: run_eval.sh single <suite> [trials] [seed] [save_video]}"
+    run_suite "$SUITE" "${3:-50}" "${4:-7}" "${5:-False}"
     ;;
   *)
     echo "未知模式: $MODE (可选 smoke | full | single)"; exit 1
