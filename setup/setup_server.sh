@@ -85,6 +85,9 @@ mkdir -p "$HF_CACHE"
 add_env () { grep -qF "$1" "$HOME/.bashrc" 2>/dev/null || echo "$1" >> "$HOME/.bashrc"; }
 add_env "# --- OpenVLA/LIBERO ---"
 add_env "export HF_HOME=$HF_CACHE"          # 模型缓存放数据盘
+# 直连 huggingface.co 常超时(下 checkpoint、timm 权重都会卡)，默认走镜像。
+# 若直连更快可在命令前覆盖: HF_ENDPOINT=https://huggingface.co ...
+add_env "export HF_ENDPOINT=https://hf-mirror.com"
 add_env "export MUJOCO_GL=egl"              # 服务器无显示器，走 EGL 离屏渲染
 add_env "export PYOPENGL_PLATFORM=egl"
 add_env "export OPENVLA_ROOT=$WORK_DIR/openvla"

@@ -15,6 +15,7 @@ measure_redundancy.py —— 测量 LIBERO 观测中 patch 级的时空冗余
 
 用法:
     export OPENVLA_ROOT=... MUJOCO_GL=egl
+    export HF_ENDPOINT=https://hf-mirror.com   # feature 模式要下 timm 权重，直连常超时
     python scripts/measure_redundancy.py --mode pixel   --max_episodes 100
     python scripts/measure_redundancy.py --mode feature --max_episodes 100
 """
@@ -74,7 +75,17 @@ class FeatureExtractor:
             "dino": "vit_large_patch14_reg4_dinov2.lvd142m",
             "siglip": "vit_so400m_patch14_siglip_224",
         }[which]
-        self.model = timm.create_model(name, pretrained=True, num_classes=0, img_size=IMG_SIZE)
+        try:
+            self.model = timm.create_model(name, pretrained=True, num_classes=0, img_size=IMG_SIZE)
+        except Exception as e:
+            if "hf-mirror" not in os.environ.get("HF_ENDPOINT", ""):
+                raise SystemExit(
+                    f"下载 {name} 失败: {type(e).__name__}\n"
+                    f"直连 huggingface.co 常超时，请先设镜像后重试:\n"
+                    f"  export HF_ENDPOINT=https://hf-mirror.com\n"
+                    f"(权重约 1.2 GB，下完即缓存到 $HF_HOME)"
+                ) from e
+            raise
         self.model.eval().to(device)
         cfg = timm.data.resolve_model_data_config(self.model)
         cfg["input_size"] = (3, IMG_SIZE, IMG_SIZE)
