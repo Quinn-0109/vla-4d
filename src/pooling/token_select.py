@@ -52,7 +52,8 @@ def avg_pool_grid(x: torch.Tensor, k: int, grid: int = 16) -> torch.Tensor:
     return pooled.reshape(b, d, side * side).transpose(1, 2)
 
 
-def tome_merge(x: torch.Tensor, k: int, return_pos: bool = False):
+def tome_merge(x: torch.Tensor, k: int, return_pos: bool = False,
+               return_assign: bool = False):
     """
     ToMe 式二部图软匹配合并，迭代直到 token 数降到 k。
 
@@ -74,6 +75,8 @@ def tome_merge(x: torch.Tensor, k: int, return_pos: bool = False):
        故输出前按质心位置重排。
 
     return_pos=True 时额外返回质心位置 (B, k) —— 4D RoPE 阶段要用。
+    return_assign=True 时额外返回 (B, N) 的归属表，第 p 个原始 patch 落到哪个
+    合并后 token —— 供 expand_to_full 做"只降信息、不降长度"的对照实验。
     """
     b, n, d = x.shape
     device = x.device
@@ -81,6 +84,8 @@ def tome_merge(x: torch.Tensor, k: int, return_pos: bool = False):
     feat = x.float()
     size = torch.ones(b, n, 1, device=device)
     pos = torch.arange(n, device=device, dtype=torch.float32).expand(b, n).unsqueeze(-1).clone()
+    # 原始 patch -> 当前 token 的归属，每轮跟着重新编号
+    assign = torch.arange(n, device=device).expand(b, n).clone() if return_assign else None
 
     while feat.shape[1] > k:
         n_cur = feat.shape[1]
@@ -114,12 +119,63 @@ def tome_merge(x: torch.Tensor, k: int, return_pos: bool = False):
         size = torch.cat([take(sa, keep_src), new_s], dim=1)
         pos = torch.cat([take(pa, keep_src), new_p], dim=1)
 
+        if assign is not None:
+            # 新顺序是 [保留的A(按 keep_src 次序), 全部B(按原次序)]，据此改写归属
+            n_keep = keep_src.shape[1]
+            nb = fb.shape[1]
+            newidx = torch.empty(b, n_cur, dtype=torch.long, device=device)
+            newidx[:, 1::2] = n_keep + torch.arange(nb, device=device)
+            ar = torch.arange(n_keep, device=device).expand(b, -1)
+            newidx.scatter_(1, keep_src * 2, ar)             # a[j] 位于 cur 的 2j
+            newidx.scatter_(1, merge_src * 2, n_keep + dst)
+            assign = torch.gather(newidx, 1, assign)
+
     # 按质心位置还原空间顺序，否则送进 Llama 的是训练时没见过的排列
     order = pos.squeeze(-1).argsort(dim=1)
     feat = torch.gather(feat, 1, order.unsqueeze(-1).expand(-1, -1, d))
+    out = [feat]
     if return_pos:
-        return feat, torch.gather(pos.squeeze(-1), 1, order)
-    return feat
+        out.append(torch.gather(pos.squeeze(-1), 1, order))
+    if return_assign:
+        inv = torch.empty_like(order)                        # order 的逆置换
+        inv.scatter_(1, order, torch.arange(order.shape[1], device=device).expand(b, -1))
+        out.append(torch.gather(inv, 1, assign))
+    return out[0] if len(out) == 1 else tuple(out)
+
+
+def expand_to_full(x: torch.Tensor, k: int) -> torch.Tensor:
+    """
+    **对照实验用**: 只降信息量，不降序列长度。
+
+    先用 tome 把 256 个 token 合成 k 个，再把每个合并 token 的值广播回它
+    所有成分 patch 的原始位置 —— 输出仍是 (B, 256, D)，但里面只有 k 个不同的值。
+
+    为什么需要它: 压缩同时改变了两件事——信息量和序列位置。OpenVLA 训练时
+    视觉部分恒为 256 个 token，Llama 按序列下标施加 RoPE；压到 128 之后，
+    原本第 200 号 patch 坐到了第 100 号位置，这是分布外的。
+    掉的点里有多少是信息没了、有多少只是位置错位，直接压是分不开的。
+
+    这个算子把位置这一路固定住:
+      - 若成功率基本不掉 -> 信息确实冗余，问题出在长度/位置 -> 方案成立，
+        但必须让压缩层参与训练，且位置编码要能在压缩后保持意义(即 4D RoPE)
+      - 若同样崩掉       -> 模型真的需要这些细节，免训练压缩这条路走不通
+    """
+    merged, assign = tome_merge(x, k, return_assign=True)
+    d = x.shape[-1]
+    return torch.gather(merged, 1, assign.unsqueeze(-1).expand(-1, -1, d))
+
+
+def shuffle_all(x: torch.Tensor, k: int, gen: torch.Generator | None = None) -> torch.Tensor:
+    """
+    **诊断用**: 保留全部 256 个 token，只把顺序打乱。k 参数被忽略。
+
+    测的是模型对绝对位置有多敏感——这是"压缩掉点是否主要来自位置错位"
+    这一问的上界参照。若打乱顺序本身就让成功率归零，说明位置极其关键，
+    压缩引起的位置偏移足以解释大部分掉点。
+    """
+    b, n, d = x.shape
+    idx = torch.stack([torch.randperm(n, generator=gen, device=x.device) for _ in range(b)])
+    return torch.gather(x, 1, idx.unsqueeze(-1).expand(-1, -1, d))
 
 
 METHODS = {
@@ -128,7 +184,13 @@ METHODS = {
     "norm": keep_norm,
     "avgpool": avg_pool_grid,
     "tome": tome_merge,
+    # 以下两个是对照/诊断算子，不是候选方案
+    "expand": expand_to_full,
+    "shuffle": shuffle_all,
 }
+
+# 这两个算子输出仍是 256 个 token，因此不能被"keep >= N 就跳过"的短路挡掉
+FULL_LENGTH = {"expand", "shuffle"}
 
 
 # ---------------------------------------------------------------- 挂载
@@ -143,7 +205,7 @@ def patch_vision_backbone(model, keep: int, method: str = "tome") -> None:
 
     def wrapped(pixel_values, *a, **kw):
         feats = orig(pixel_values, *a, **kw)
-        if keep >= feats.shape[1]:
+        if keep >= feats.shape[1] and method not in FULL_LENGTH:
             return feats
         with torch.no_grad():
             out = fn(feats, keep).to(feats.dtype)
@@ -185,6 +247,17 @@ if __name__ == "__main__":
         _, p = tome_merge(X, k, return_pos=True)
         mono = bool((p[:, 1:] >= p[:, :-1]).all())
         print(f"k={k:4d}  质心位置单调递增: {mono}")
+
+    print("\n--- expand 对照算子 ---")
+    out = expand_to_full(X, 64)
+    uniq = len(torch.unique(out[0], dim=0))
+    print(f"输出形状 {tuple(out.shape)} (应为 (2, 256, 64))，不同值的个数 {uniq} (应为 64)")
+    # 4 簇数据: 广播回去后每个位置都应等于自己那一簇的中心
+    base = torch.randn(1, 4, 32)
+    Y = base.repeat_interleave(64, dim=1) + 0.01 * torch.randn(1, 256, 32)
+    e = expand_to_full(Y, 4)
+    ref = base.repeat_interleave(64, dim=1)
+    print(f"4 簇数据广播回 256 位置后与簇中心的最大偏差: {(e - ref).abs().max():.4f} (应 << 1)")
 
     print("\n--- size 加权检验 ---")
     # 一半 token 全同、一半互异: 全同的那半应被压成极少数几个，且值接近原值

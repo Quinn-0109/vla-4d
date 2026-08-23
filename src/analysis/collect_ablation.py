@@ -32,9 +32,14 @@ INK, MUTED, GRID_C = "#1a1a19", "#5c5b55", "#e5e4df"
 N_PATCH = 256
 
 METHOD_LABEL = {"random": "随机", "uniform": "均匀网格", "norm": "L2 范数 top-k",
-                "avgpool": "网格平均池化", "tome": "ToMe 合并"}
+                "avgpool": "网格平均池化", "tome": "ToMe 合并",
+                "expand": "ToMe 合并后广播回 256 位", "shuffle": "打乱 256 个 token 的顺序"}
 METHOD_LABEL_EN = {"random": "Random", "uniform": "Uniform grid", "norm": "L2-norm top-k",
-                   "avgpool": "Grid avg-pool", "tome": "ToMe merge"}
+                   "avgpool": "Grid avg-pool", "tome": "ToMe merge",
+                   "expand": "ToMe, broadcast back to 256", "shuffle": "Shuffled 256 tokens"}
+
+# 对照/诊断算子: 输出仍是 256 个 token，不是候选方案，不进主曲线和算子对比图
+DIAG_METHODS = {"expand", "shuffle"}
 
 
 def _setup_font() -> bool:
@@ -167,6 +172,7 @@ def plot_budget(df: pd.DataFrame, base_p: float, base_ci, out: Path, suite: str)
 
 
 def plot_methods(df: pd.DataFrame, base_p: float, out: Path, suite: str):
+    df = df[~df.method.isin(DIAG_METHODS)]
     keeps = sorted(df.groupby("keep").method.nunique().pipe(lambda s: s[s > 1]).index)
     if not keeps:
         return
@@ -277,6 +283,28 @@ def main():
                   f"不掉点的最低预算 keep={safe}"
                   + (f" (压缩 {N_PATCH/safe:.1f}x)" if safe else ""))
         print("注: 单侧解读时 n 较小，拐点位置只是区间估计；确认请在拐点两侧加量。")
+
+    # ---- 诊断: 掉点来自信息损失还是位置错位 ----
+    diag = df[df.method.isin(DIAG_METHODS)]
+    if not diag.empty:
+        print("\n【诊断】压缩同时改了信息量和序列位置，这一组把位置固定住:")
+        sh = diag[diag.method == "shuffle"]
+        if not sh.empty:
+            r = sh.iloc[0]
+            print(f"  打乱 256 个 token 的顺序(信息量不变): {r['rate']*100:.1f}% "
+                  f"({r['delta_vs_base']*100:+.1f}, p={fmt_p(r['p'])})"
+                  f"  <- 位置敏感度的上界参照")
+        ex = diag[diag.method == "expand"].sort_values("keep", ascending=False)
+        tm = df[df.method == "tome"].set_index("keep")
+        if not ex.empty:
+            print(f"  {'不同值':>6} {'expand(长度256)':>16} {'直接压(长度k)':>15} {'差值':>8}")
+            for r in ex.itertuples():
+                t = f"{tm.loc[r.keep, 'rate']*100:.1f}%" if r.keep in tm.index else "  n/a"
+                gap = (f"{(r.rate - tm.loc[r.keep, 'rate'])*100:+.1f}"
+                       if r.keep in tm.index else "   n/a")
+                print(f"  {r.keep:>6} {r.rate*100:>15.1f}% {t:>15} {gap:>8}")
+            print("  读法: expand 不掉点而直接压掉点 -> 掉的是位置，不是信息；"
+                  "两者都掉 -> 模型确实需要这些细节")
 
     print(f"\n表格 -> {csv}")
     plot_budget(df, base_p, base_ci, fig_dir / f"fig_a1_budget_curve_{args.suite}.png", args.suite)

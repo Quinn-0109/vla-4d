@@ -7,6 +7,7 @@
 #
 #   bash scripts/run_token_ablation.sh budget            # 阶段一: 找拐点(tome)
 #   bash scripts/run_token_ablation.sh method 64         # 阶段二: 拐点附近比算子
+#   bash scripts/run_token_ablation.sh diag              # 诊断: 掉点是信息没了还是位置错位
 #   bash scripts/run_token_ablation.sh cost              # 只打印耗时/费用估算
 #
 # ---------------------------------------------------------------------------
@@ -56,6 +57,8 @@ declare -A CKPT=(
 BUDGETS=(192 128 96 64 48 32 24 16)
 # 阶段二比的算子。tome 是主算子，其余是基线
 ALL_METHODS=(random uniform norm avgpool tome)
+# 诊断用的信息量档位。expand 保持 256 长度，只把不同值的个数降到该档
+DIAG_KEEPS=(128 64 32)
 
 run_one () {
   local keep=$1 method=$2
@@ -95,6 +98,8 @@ case "$MODE" in
     estimate ${#BUDGETS[@]}
     echo "阶段二(method): ${#ALL_METHODS[@]} 个算子 x 1 个预算"
     estimate ${#ALL_METHODS[@]}
+    echo "诊断(diag): ${#DIAG_KEEPS[@]} 个 expand 档位 + 1 个 shuffle"
+    estimate $(( ${#DIAG_KEEPS[@]} + 1 ))
     echo ""
     echo "基线无需重跑: 从已有 500 局轨迹里筛 episode_idx < $TRIALS 即可(评测确定性)"
     ;;
@@ -107,6 +112,19 @@ case "$MODE" in
     done
     ;;
 
+  diag)
+    # 压缩同时改了两件事: 信息量 和 序列位置。这一组把位置固定住，只降信息量。
+    #   expand  : 仍输出 256 个 token，但只有 k 个不同的值
+    #   shuffle : 保留全部 256 个 token，只打乱顺序(位置敏感度的上界参照)
+    # 若 expand 不掉点而直接压缩掉点 -> 掉的是位置，不是信息
+    echo '==> 诊断: 分离「信息损失」与「位置错位」' 
+    estimate $(( ${#DIAG_KEEPS[@]} + 1 ))
+    for keep in "${DIAG_KEEPS[@]}"; do
+      run_one "$keep" expand
+    done
+    run_one 256 shuffle
+    ;;
+
   method)
     KEEP="${2:?用法: run_token_ablation.sh method <keep>}"
     echo "==> 阶段二: 在 keep=$KEEP 处比较 ${#ALL_METHODS[@]} 个算子"
@@ -117,7 +135,7 @@ case "$MODE" in
     ;;
 
   *)
-    echo "未知模式: $MODE (可选 budget | method | cost)"; exit 1
+    echo "未知模式: $MODE (可选 budget | method | diag | cost)"; exit 1
     ;;
 esac
 

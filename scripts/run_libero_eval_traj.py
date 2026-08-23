@@ -98,7 +98,9 @@ class GenerateConfig:
     # --- 冻结模型下的视觉 token 预算消融 ---
     # token_keep=0 表示不压缩(默认，与官方评测完全一致)
     token_keep: int = 0
-    token_method: str = "tome"                 # random | uniform | norm | avgpool | tome
+    # random | uniform | norm | avgpool | tome | expand | shuffle
+    # expand/shuffle 是对照/诊断算子，输出仍是 256 个 token(见 token_select.py)
+    token_method: str = "tome"
 
     use_wandb: bool = False
     wandb_project: str = "vla-4d"
