@@ -33,10 +33,12 @@ N_PATCH = 256
 
 METHOD_LABEL = {"random": "随机", "uniform": "均匀网格", "norm": "L2 范数 top-k",
                 "avgpool": "网格平均池化", "tome": "ToMe 合并",
-                "expand": "ToMe 合并后广播回 256 位", "shuffle": "打乱 256 个 token 的顺序"}
+                "expand": "ToMe 合并后广播回 256 位", "shuffle": "打乱 256 个 token 的顺序",
+                "tome+fixpos": "ToMe 合并 + 位置修正"}
 METHOD_LABEL_EN = {"random": "Random", "uniform": "Uniform grid", "norm": "L2-norm top-k",
                    "avgpool": "Grid avg-pool", "tome": "ToMe merge",
-                   "expand": "ToMe, broadcast back to 256", "shuffle": "Shuffled 256 tokens"}
+                   "expand": "ToMe, broadcast back to 256", "shuffle": "Shuffled 256 tokens",
+                   "tome+fixpos": "ToMe + corrected positions"}
 
 # 对照/诊断算子: 输出仍是 256 个 token，不是候选方案，不进主曲线和算子对比图
 DIAG_METHODS = {"expand", "shuffle"}
@@ -140,8 +142,10 @@ def _ax(ax, xlab, ylab, title):
 
 
 def plot_budget(df: pd.DataFrame, base_p: float, base_ci, out: Path, suite: str):
-    d = df[df.method == "tome"].sort_values("keep")
-    if d.empty:
+    series = [(m, df[df.method == m].sort_values("keep"))
+              for m in ("tome", "tome+fixpos")]
+    series = [(m, d) for m, d in series if not d.empty]
+    if not series:
         return
     fig, ax = plt.subplots(figsize=(8, 5), dpi=150)
     if not math.isnan(base_p):
@@ -151,14 +155,20 @@ def plot_budget(df: pd.DataFrame, base_p: float, base_ci, out: Path, suite: str)
         ax.text(N_PATCH, base_p * 100 + 1.5,
                 f"{L('未压缩基线', 'uncompressed baseline')} {base_p*100:.0f}%",
                 ha="right", color=MUTED, fontsize=9)
-    lo = d.succ / d.n - np.array([wilson(int(k), int(n))[0] for k, n in zip(d.succ, d.n)])
-    hi = np.array([wilson(int(k), int(n))[1] for k, n in zip(d.succ, d.n)]) - d.succ / d.n
-    ax.errorbar(d.keep, d.rate * 100, yerr=[lo * 100, hi * 100], fmt="o-",
-                color=PALETTE[0], lw=2, ms=6, capsize=3, zorder=3)
+    lab = METHOD_LABEL if CJK_OK else METHOD_LABEL_EN
+    for i, (m, d) in enumerate(series):
+        lo = d.rate - np.array([wilson(int(k), int(n))[0] for k, n in zip(d.succ, d.n)])
+        hi = np.array([wilson(int(k), int(n))[1] for k, n in zip(d.succ, d.n)]) - d.rate
+        ax.errorbar(d.keep, d.rate * 100, yerr=[lo * 100, hi * 100], fmt="o-",
+                    color=PALETTE[i], lw=2, ms=6, capsize=3, zorder=3 + i)
+        r = d.iloc[-1]
+        ax.annotate(lab.get(m, m), (r.keep, r.rate * 100), xytext=(6, 4),
+                    textcoords="offset points", color=PALETTE[i], fontsize=9,
+                    fontweight="bold")
     _ax(ax, L("保留的视觉 token 数（共 256）", "Visual tokens kept (of 256)"),
         L("成功率 (%)", "Success rate (%)"),
         f"{L('冻结 OpenVLA 的 token 预算曲线', 'Frozen OpenVLA token-budget curve')}"
-        f" · {suite} · {L('ToMe 合并', 'ToMe merge')}")
+        f" · {suite}")
     ax.set_xlim(0, N_PATCH + 8)
     ax.set_ylim(-2, 100)
     sec = ax.secondary_xaxis("top", functions=(lambda x: x / N_PATCH * 100,
@@ -264,24 +274,24 @@ def main():
 
     # 拐点: 第一个显著低于基线的预算(从大到小扫)
     if bn:
-        tome = df[df.method == "tome"].sort_values("keep", ascending=False)
-        knee = None
-        for r in tome.itertuples():
-            if r.p < 0.05 and r.delta_vs_base < 0:
-                knee = r
-                break
         print()
-        if knee is None:
-            m = tome.keep.min() if len(tome) else None
-            print(f"扫过的所有预算都没有显著掉点(最低到 keep={m})——"
-                  f"冗余可利用，可以继续往下压。")
-        else:
-            ok = tome[tome.keep > knee.keep]
-            safe = ok.keep.min() if len(ok) else None
-            print(f"拐点: keep={knee.keep} ({knee.keep_pct:.0f}%) 起显著掉点 "
-                  f"({knee.delta_vs_base*100:+.1f}, p={fmt_p(knee.p)})；"
-                  f"不掉点的最低预算 keep={safe}"
-                  + (f" (压缩 {N_PATCH/safe:.1f}x)" if safe else ""))
+        for m in ("tome", "tome+fixpos"):
+            sub = df[df.method == m].sort_values("keep", ascending=False)
+            if sub.empty:
+                continue
+            knee = next((r for r in sub.itertuples()
+                         if r.p < 0.05 and r.delta_vs_base < 0), None)
+            name = METHOD_LABEL.get(m, m) if CJK_OK else METHOD_LABEL_EN.get(m, m)
+            if knee is None:
+                print(f"[{name}] 扫过的所有预算都没有显著掉点"
+                      f"(最低到 keep={sub.keep.min()})")
+            else:
+                ok = sub[sub.keep > knee.keep]
+                safe = ok.keep.min() if len(ok) else None
+                print(f"[{name}] 拐点 keep={knee.keep} ({knee.keep_pct:.0f}%) "
+                      f"({knee.delta_vs_base*100:+.1f}, p={fmt_p(knee.p)})；"
+                      f"不掉点的最低预算 keep={safe}"
+                      + (f"，压缩 {N_PATCH/safe:.1f}x" if safe else ""))
         print("注: 单侧解读时 n 较小，拐点位置只是区间估计；确认请在拐点两侧加量。")
 
     # ---- 诊断: 掉点来自信息损失还是位置错位 ----

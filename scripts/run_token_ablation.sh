@@ -8,6 +8,7 @@
 #   bash scripts/run_token_ablation.sh budget            # 阶段一: 找拐点(tome)
 #   bash scripts/run_token_ablation.sh method 64         # 阶段二: 拐点附近比算子
 #   bash scripts/run_token_ablation.sh diag              # 诊断: 掉点是信息没了还是位置错位
+#   bash scripts/run_token_ablation.sh fixpos            # 把位置补回去——真正的解法
 #   bash scripts/run_token_ablation.sh cost              # 只打印耗时/费用估算
 #
 # ---------------------------------------------------------------------------
@@ -59,9 +60,11 @@ BUDGETS=(192 128 96 64 48 32 24 16)
 ALL_METHODS=(random uniform norm avgpool tome)
 # 诊断用的信息量档位。expand 保持 256 长度，只把不同值的个数降到该档
 DIAG_KEEPS=(128 64 32)
+# 位置修正实验扫的预算。48/96 顺带把信息底线(在 64 与 32 之间)钉准
+FIXPOS_KEEPS=(128 96 64 48 32)
 
 run_one () {
-  local keep=$1 method=$2
+  local keep=$1 method=$2 fixpos=${3:-False}
   echo ""
   echo "############################################################"
   echo "# $SUITE | keep=$keep ($(python -c "print(f'{$keep/256*100:.0f}')")%) | method=$method | trials/task=$TRIALS"
@@ -76,6 +79,7 @@ run_one () {
     --save_video False \
     --token_keep "$keep" \
     --token_method "$method" \
+    --token_fix_pos "$fixpos" \
     --traj_dir "$REPO_DIR/results/trajectories" \
     --local_log_dir "$REPO_DIR/results/logs"
 }
@@ -100,6 +104,8 @@ case "$MODE" in
     estimate ${#ALL_METHODS[@]}
     echo "诊断(diag): ${#DIAG_KEEPS[@]} 个 expand 档位 + 1 个 shuffle"
     estimate $(( ${#DIAG_KEEPS[@]} + 1 ))
+    echo "位置修正(fixpos): ${#FIXPOS_KEEPS[@]} 个预算"
+    estimate ${#FIXPOS_KEEPS[@]}
     echo ""
     echo "基线无需重跑: 从已有 500 局轨迹里筛 episode_idx < $TRIALS 即可(评测确定性)"
     ;;
@@ -125,6 +131,18 @@ case "$MODE" in
     run_one 256 shuffle
     ;;
 
+  fixpos)
+    # diag 已证明掉点主要来自位置前移(k=64 时 expand 70% vs 直接压 6%)。
+    # 这一组真的把序列压短，同时显式修正 position_ids:
+    # 每个合并 token 拿回质心的原始位置，语言块仍从 257 开始。
+    # 若能恢复到 expand 的水平 -> 免训练 4x 压缩成立，且省的是真算力。
+    echo "==> 位置修正: 压短序列 + 补回绝对位置"
+    estimate ${#FIXPOS_KEEPS[@]}
+    for keep in "${FIXPOS_KEEPS[@]}"; do
+      run_one "$keep" tome True
+    done
+    ;;
+
   method)
     KEEP="${2:?用法: run_token_ablation.sh method <keep>}"
     echo "==> 阶段二: 在 keep=$KEEP 处比较 ${#ALL_METHODS[@]} 个算子"
@@ -135,7 +153,7 @@ case "$MODE" in
     ;;
 
   *)
-    echo "未知模式: $MODE (可选 budget | method | diag | cost)"; exit 1
+    echo "未知模式: $MODE (可选 budget | method | diag | fixpos | cost)"; exit 1
     ;;
 esac
 

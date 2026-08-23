@@ -101,6 +101,9 @@ class GenerateConfig:
     # random | uniform | norm | avgpool | tome | expand | shuffle
     # expand/shuffle 是对照/诊断算子，输出仍是 256 个 token(见 token_select.py)
     token_method: str = "tome"
+    # 修正 position_ids: 压缩后的 token 拿回原始绝对位置，语言块不被前移。
+    # 只支持 tome。见 docs/05 7.2——位移是掉点的主因。
+    token_fix_pos: bool = False
 
     use_wandb: bool = False
     wandb_project: str = "vla-4d"
@@ -124,7 +127,8 @@ def eval_libero(cfg: GenerateConfig) -> None:
 
     if cfg.token_keep > 0:
         from pooling.token_select import patch_vision_backbone
-        patch_vision_backbone(model, cfg.token_keep, cfg.token_method)
+        patch_vision_backbone(model, cfg.token_keep, cfg.token_method,
+                              fix_positions=cfg.token_fix_pos)
 
     # 数据集若带 _no_noops 后缀，反归一化的 key 需要跟着改
     if cfg.model_family == "openvla":
@@ -137,6 +141,8 @@ def eval_libero(cfg: GenerateConfig) -> None:
     run_id = f"EVAL-{cfg.task_suite_name}-{cfg.model_family}-seed{cfg.seed}-{DATE_TIME}"
     if cfg.token_keep > 0:
         run_id += f"--tok{cfg.token_keep}-{cfg.token_method}"
+        if cfg.token_fix_pos:
+            run_id += "-fixpos"
     if cfg.run_id_note:
         run_id += f"--{cfg.run_id_note}"
 
@@ -275,7 +281,8 @@ def eval_libero(cfg: GenerateConfig) -> None:
         "seed": cfg.seed,
         "num_trials_per_task": cfg.num_trials_per_task,
         "token_keep": cfg.token_keep,
-        "token_method": cfg.token_method if cfg.token_keep > 0 else None,
+        "token_method": (None if cfg.token_keep <= 0 else
+                         cfg.token_method + ("+fixpos" if cfg.token_fix_pos else "")),
         "total_episodes": total_episodes,
         "total_successes": total_successes,
         "overall_success_rate": overall,

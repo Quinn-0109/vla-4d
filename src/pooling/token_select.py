@@ -193,14 +193,87 @@ METHODS = {
 FULL_LENGTH = {"expand", "shuffle"}
 
 
+# ---------------------------------------------------------------- 位置修正
+# 关键发现(docs/05 7.2): OpenVLA 把视觉块夹在 BOS 和语言 token 之间
+#     multimodal = cat([emb[:, :1], visual(256), emb[:, 1:]])   # :381
+# 且 language_model(..., position_ids=None)，Llama 按 arange(seq_len) 生成位置。
+# 压到 k 个 token 后，语言指令和动作解码位置整体前移了 (256-k) 位。
+# 实测这一位移解释了几乎全部掉点: k=64 时保持长度(expand) 只掉 6 个百分点(n.s.)，
+# 真的缩短序列则掉到 6%。
+#
+# 下面把位置显式补回去: 每个合并 token 拿回自己质心的原始位置，语言块仍从 257 开始。
+# 注意 transformers 4.40 里 position_ids 驱动 RoPE、cache_position 驱动 causal mask，
+# 两者可以分开——我们只改前者，注意力的可见范围仍按真实序列走，是对的。
+
+N_ORIG = 256          # OpenVLA 的视觉 token 数
+LANG_START = N_ORIG + 1   # BOS 占 0，视觉占 1..256，语言从 257 开始
+
+
+def centroids_to_positions(pos: torch.Tensor) -> torch.Tensor:
+    """
+    质心(小数) -> 整数 position_id。+1 给 BOS 让位。
+
+    取整会让相邻质心撞到同一个位置(比如 12.4 和 12.6)，那样两个 token 拿到
+    完全相同的 RoPE 旋转，模型再也分不开它们——训练时没有这种情形。
+    pos 已按质心升序，用 cummax 技巧强制严格递增，代价是个别 token 的位置
+    偏移 1，远小于共享位置的损害。
+    """
+    p = pos.round().long() + 1
+    idx = torch.arange(p.shape[1], device=p.device)
+    p = torch.cummax(p - idx, dim=1).values + idx      # 强制严格递增
+    return p.clamp(1, N_ORIG)
+
+
+def _patch_language_positions(model, state: dict) -> None:
+    """包住 language_model.forward，在 prefill 和逐步解码时都喂正确的 position_ids。"""
+    lm = model.language_model
+    orig = lm.forward
+
+    def wrapped(*a, **kw):
+        pos = state.get("visual_pos")
+        if pos is not None and kw.get("inputs_embeds") is not None and kw.get("position_ids") is None:
+            # prefill: [BOS] + [k 个视觉] + [L 个语言]
+            emb = kw["inputs_embeds"]
+            k = pos.shape[1]
+            n_lang = emb.shape[1] - 1 - k
+            dev = emb.device
+            pid = torch.cat([
+                torch.zeros(1, 1, dtype=torch.long, device=dev),
+                pos.to(dev),
+                torch.arange(LANG_START, LANG_START + n_lang, device=dev).unsqueeze(0),
+            ], dim=1)
+            kw["position_ids"] = pid
+            # 解码步要接着语言块往下走，而不是接着(更短的)缓存长度
+            state["next_pos"] = LANG_START + n_lang
+        elif (state.get("next_pos") is not None
+              and kw.get("past_key_values") is not None
+              and kw.get("position_ids") is None
+              and kw.get("input_ids") is not None):
+            dev = kw["input_ids"].device
+            kw["position_ids"] = torch.tensor([[state["next_pos"]]], device=dev)
+            state["next_pos"] += 1
+        return orig(*a, **kw)
+
+    lm.forward = wrapped
+
+
 # ---------------------------------------------------------------- 挂载
-def patch_vision_backbone(model, keep: int, method: str = "tome") -> None:
-    """把压缩算子挂到 model.vision_backbone 的 forward 上（原地修改）。"""
+def patch_vision_backbone(model, keep: int, method: str = "tome",
+                          fix_positions: bool = False) -> None:
+    """
+    把压缩算子挂到 model.vision_backbone 的 forward 上（原地修改）。
+
+    fix_positions=True 时额外修正 position_ids，让压缩后的 token 保持原始
+    绝对位置、语言块不被前移（只支持 tome，因为只有它给得出质心位置）。
+    """
     if method not in METHODS:
         raise ValueError(f"未知方法 {method}，可选: {list(METHODS)}")
+    if fix_positions and method != "tome":
+        raise ValueError("fix_positions 只支持 tome —— 其余算子给不出合并后 token 的位置")
     fn = METHODS[method]
     orig = model.vision_backbone.forward
 
+    state: dict = {}
     reported = []
 
     def wrapped(pixel_values, *a, **kw):
@@ -208,14 +281,22 @@ def patch_vision_backbone(model, keep: int, method: str = "tome") -> None:
         if keep >= feats.shape[1] and method not in FULL_LENGTH:
             return feats
         with torch.no_grad():
-            out = fn(feats, keep).to(feats.dtype)
+            if fix_positions:
+                out, pos = tome_merge(feats, keep, return_pos=True)
+                state["visual_pos"] = centroids_to_positions(pos)
+                out = out.to(feats.dtype)
+            else:
+                out = fn(feats, keep).to(feats.dtype)
         if not reported:                       # 只在第一次前向时报一次实际 token 数
             reported.append(out.shape[1])
             print(f"[token 消融] {method}: {feats.shape[1]} -> {out.shape[1]} "
-                  f"(保留 {out.shape[1] / feats.shape[1] * 100:.1f}%)")
+                  f"(保留 {out.shape[1] / feats.shape[1] * 100:.1f}%)"
+                  + ("，已修正 position_ids" if fix_positions else ""))
         return out
 
     model.vision_backbone.forward = wrapped
+    if fix_positions:
+        _patch_language_positions(model, state)
     print(f"[token 消融] {method}: 目标保留 {keep} 个视觉 token；"
           f"实际数量首次前向时打印(avgpool 只能落在完全平方数上)")
 
@@ -258,6 +339,15 @@ if __name__ == "__main__":
     e = expand_to_full(Y, 4)
     ref = base.repeat_interleave(64, dim=1)
     print(f"4 簇数据广播回 256 位置后与簇中心的最大偏差: {(e - ref).abs().max():.4f} (应 << 1)")
+
+    print("\n--- 质心 -> position_id ---")
+    _, pc = tome_merge(X, 64, return_pos=True)
+    pid = centroids_to_positions(pc)
+    strict = bool((pid[:, 1:] > pid[:, :-1]).all())
+    print(f"严格递增(无位置碰撞): {strict}；范围 [{int(pid.min())}, {int(pid.max())}] "
+          f"(应落在 [1, 256] 内)")
+    collide = int((pc.round().long()[:, 1:] == pc.round().long()[:, :-1]).sum())
+    print(f"若不做去碰撞处理，会有 {collide} 处相邻 token 共享同一位置")
 
     print("\n--- size 加权检验 ---")
     # 一半 token 全同、一半互异: 全同的那半应被压成极少数几个，且值接近原值
