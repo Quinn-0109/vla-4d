@@ -15,6 +15,20 @@ export MUJOCO_GL=${MUJOCO_GL:-egl}
 export OPENVLA_ROOT="${OPENVLA_ROOT:-$HOME/vla-work/openvla}"
 [ -d "$OPENVLA_ROOT" ] || { echo "❌ OPENVLA_ROOT 不存在: $OPENVLA_ROOT"; exit 1; }
 
+# --- 环境前置检查 ---------------------------------------------------------
+# tmux/新终端会走 conda init 落回 base，此时 draccus/torch 都不在，
+# 直接跑会得到一个看不出根因的 ModuleNotFoundError。在这里拦住。
+python - <<'PYCHK' || { echo ""; echo "   修复: conda activate <你的 openvla 环境路径>"; echo "   例如: conda activate /root/autodl-tmp/conda-envs/openvla"; exit 1; }
+import sys
+import importlib.util as iu
+missing = [m for m in ("draccus", "torch", "libero") if iu.find_spec(m) is None]
+if missing:
+    print(f"\u274c 当前 Python 环境缺少: {', '.join(missing)}")
+    print(f"   sys.prefix = {sys.prefix}")
+    sys.exit(1)
+print(f"环境 OK: {sys.prefix}")
+PYCHK
+
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EVAL_PY="$REPO_DIR/scripts/run_libero_eval_traj.py"
 
