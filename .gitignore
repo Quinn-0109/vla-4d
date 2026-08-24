@@ -1,6 +1,17 @@
-# 实验产物 —— 体积大，不入库；图表按需单独提交
-results/
+# 实验产物
+# 轨迹 JSON 与 MP4 体积巨大（单个 suite 500 局），不入库；
+# 但结果表和图表是结论本身，体积小，应当随代码一起版本化 —— 故下面放行。
+results/*
+!results/tables/
+results/tables/*
+!results/tables/*.csv
+!results/tables/*.json
+!results/figures/
+results/figures/*
+!results/figures/*.png
+
 rollouts/
+runs/                 # 微调输出: adapter + 优化器状态 + metrics.jsonl
 experiments/logs/
 wandb/
 
