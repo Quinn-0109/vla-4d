@@ -203,8 +203,10 @@ def main():
         try:
             d = json.loads(line)
         except json.JSONDecodeError:
+            # 子进程崩了(未被捕获的 OOM 等)，也要带上 attn，否则事后无法核对
+            # 整轮用的是不是同一个实现
             d = {"K": K, "keep": keep or N_PATCH, "batch": batch, "mode": mode,
-                 "grad_ckpt": gc, "ok": False, "peak_gb": None,
+                 "attn": attn, "grad_ckpt": gc, "ok": False, "peak_gb": None,
                  "n_visual_tokens": (keep or N_PATCH) * K, "seq_len": None,
                  "error": (r.stderr or "")[-200:]}
         results.append(d)
