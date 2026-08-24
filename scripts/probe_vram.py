@@ -131,6 +131,13 @@ SWEEP = [
 
 
 def main():
+    # ⚠️ 管道输出(| tee)会让 stdout 变成块缓冲，整个 sweep 的输出填不满一个
+    #    缓冲区，于是跑 25 分钟一个字都看不到，看起来像卡死。强制行缓冲。
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except AttributeError:
+        pass
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--sweep", action="store_true", help="跑完整决策表（每个配置一个子进程）")
     ap.add_argument("--K", type=int, default=1)
@@ -139,6 +146,8 @@ def main():
     ap.add_argument("--mode", default="infer", choices=["infer", "train"])
     ap.add_argument("--grad_ckpt", action="store_true")
     ap.add_argument("--out", default="results/tables/vram_probe.json")
+    ap.add_argument("--timeout", type=int, default=900,
+                    help="单个配置的超时(秒)；卡住就当失败继续，不拖垮整轮")
     args = ap.parse_args()
 
     if not args.sweep:
@@ -147,13 +156,26 @@ def main():
 
     # 每个配置起独立子进程: OOM 之后显存碎片会污染同进程内的后续测量
     total = torch.cuda.get_device_properties(0).total_memory / 1e9
-    print(f"显卡: {torch.cuda.get_device_name(0)}  显存 {total:.1f} GB\n")
+    print(f"显卡: {torch.cuda.get_device_name(0)}  显存 {total:.1f} GB")
+    print(f"共 {len(SWEEP)} 个配置，每个都要重新加载 7B 模型（约 1 分钟），"
+          f"预计 {len(SWEEP)}~{len(SWEEP)*2} 分钟\n")
     results = []
-    for K, keep, batch, mode, gc in SWEEP:
-        cmd = [sys.executable, __file__, "--K", str(K), "--keep", str(keep),
+    for i, (K, keep, batch, mode, gc) in enumerate(SWEEP, 1):
+        cmd = [sys.executable, "-u", __file__, "--K", str(K), "--keep", str(keep),
                "--batch", str(batch), "--mode", mode] + (["--grad_ckpt"] if gc else [])
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        line = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else ""
+        # 测之前就报，否则加载模型那一分钟里用户只能盯着空屏幕猜是不是卡了
+        print(f"[{i:>2}/{len(SWEEP)}] K={K:<2} keep={keep or N_PATCH:<3} b={batch} "
+              f"{mode:<5} {'ckpt' if gc else '    '} ... ", end="", flush=True)
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout)
+            line = r.stdout.strip().splitlines()[-1] if r.stdout.strip() else ""
+        except subprocess.TimeoutExpired:
+            print(f"超时(>{args.timeout}s)")
+            results.append({"K": K, "keep": keep or N_PATCH, "batch": batch,
+                            "mode": mode, "grad_ckpt": gc, "ok": False,
+                            "peak_gb": None, "n_visual_tokens": (keep or N_PATCH) * K,
+                            "seq_len": None, "error": "timeout"})
+            continue
         try:
             d = json.loads(line)
         except json.JSONDecodeError:
@@ -162,12 +184,13 @@ def main():
                  "n_visual_tokens": (keep or N_PATCH) * K, "seq_len": None,
                  "error": (r.stderr or "")[-200:]}
         results.append(d)
-        flag = f"{d['peak_gb']:>6.1f} GB" if d.get("peak_gb") else "  OOM  "
+        flag = f"{d['peak_gb']:.1f} GB" if d.get("peak_gb") else "OOM"
         warn = ""
         if gc and d.get("ok") and not d.get("grad_ckpt_active"):
             warn = "  ⚠️ 梯度检查点未生效"
-        print(f"K={K:>2} keep={d['keep']:>3} b={batch} {d['mode']:>5} "
-              f"{'ckpt' if gc else '    '}  tok={d['n_visual_tokens']:>4}  {flag}{warn}")
+        if d.get("error"):
+            warn += f"  [{d['error'][:80]}]"
+        print(f"tok={d['n_visual_tokens']:>4}  {flag}{warn}")
 
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(json.dumps(results, indent=2))
