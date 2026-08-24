@@ -33,3 +33,10 @@ tensorflow-metadata==1.14.0
 #   AssertionError
 # 钉回与 robosuite 1.4.1 同期的 2.3.x。
 mujoco==2.3.2
+
+# --- 训练侧（阶段 B 起）---
+# openvla/pyproject.toml 的钉法，必须对齐。
+# peft 尤其关键：LoRA 实现的行为差异不会报错，只会让微调结果对不上官方水平，
+# 是最难查的那类问题。
+peft==0.11.1
+tensorflow-datasets==4.9.3
