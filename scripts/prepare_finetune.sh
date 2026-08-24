@@ -28,10 +28,16 @@ declare -A PIN=(
 )
 
 check_env () {
-  python - <<'PYCHK' || { echo "   修复: conda activate <openvla 环境>"; exit 1; }
+  # ⚠️ 不能只查 torch: base 环境里也有 torch(2.3.0)，查它等于没查。
+  #    要查 openvla 环境**独有**的包，否则在 base 里跑完整套检查，
+  #    会把 base 的情况当成 openvla 的情况报出来。
+  python - <<'PYCHK' || { echo ""; echo "   修复: conda activate /root/autodl-tmp/conda-envs/openvla"; exit 1; }
 import sys, importlib.util as iu
-if iu.find_spec("torch") is None:
-    print(f"❌ 当前环境没有 torch\n   sys.prefix = {sys.prefix}"); sys.exit(1)
+missing = [m for m in ("torch", "draccus", "libero") if iu.find_spec(m) is None]
+if missing:
+    print(f"❌ 这不是 openvla 环境（缺 {', '.join(missing)}）")
+    print(f"   sys.prefix = {sys.prefix}")
+    sys.exit(1)
 print(f"环境: {sys.prefix}")
 PYCHK
 }
@@ -39,7 +45,13 @@ PYCHK
 check_disk () {
   echo ""
   echo "--- 磁盘 ---"
-  df -h "$(dirname "$DATA_ROOT")" 2>/dev/null || df -h "$HOME"
+  # 目标目录多半还不存在，要一路上溯到第一个存在的父目录再问 df。
+  # 直接 df 一个不存在的路径会失败，若此时静默回退到 $HOME，
+  # 报出来的就是系统盘而不是数据盘——数字看着合理，结论却是错的。
+  local d="$DATA_ROOT"
+  while [ ! -d "$d" ] && [ "$d" != "/" ]; do d=$(dirname "$d"); done
+  echo "  (数据集将落在 $DATA_ROOT，下面是它所在的文件系统)"
+  df -h "$d"
 }
 
 check_deps () {
