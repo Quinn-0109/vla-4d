@@ -160,10 +160,11 @@ def plot_budget(df: pd.DataFrame, base_p: float, base_ci, out: Path, suite: str)
     for i, (m, d) in enumerate(series):
         lo = d.rate - np.array([wilson(int(k), int(n))[0] for k, n in zip(d.succ, d.n)])
         hi = np.array([wilson(int(k), int(n))[1] for k, n in zip(d.succ, d.n)]) - d.rate
-        ax.errorbar(d.keep, d.rate * 100, yerr=[lo * 100, hi * 100], fmt="o-",
+        ax.errorbar(d.keep.to_numpy(), d.rate.to_numpy() * 100,
+                    yerr=[np.asarray(lo) * 100, np.asarray(hi) * 100], fmt="o-",
                     color=PALETTE[i], lw=2, ms=6, capsize=3, zorder=3 + i)
         r = d.iloc[-1]
-        ax.annotate(lab.get(m, m), (r.keep, r.rate * 100), xytext=(6, 4),
+        ax.annotate(lab.get(m, m), (float(r.keep), float(r.rate) * 100), xytext=(6, 4),
                     textcoords="offset points", color=PALETTE[i], fontsize=9,
                     fontweight="bold")
     _ax(ax, L("保留的视觉 token 数（共 256）", "Visual tokens kept (of 256)"),
@@ -211,11 +212,76 @@ def plot_methods(df: pd.DataFrame, base_p: float, out: Path, suite: str):
     print(f"  -> {out}")
 
 
+# ------------------------------------------------------------------ 跨 suite 合并
+SUITES = ["libero_spatial", "libero_object", "libero_goal", "libero_10"]
+SUITE_SHORT = {"libero_spatial": "Spatial", "libero_object": "Object",
+               "libero_goal": "Goal", "libero_10": "Long"}
+
+
+def pool_across_suites(traj_dir: Path, default_trials: int) -> None:
+    """
+    把同一配置在各 suite 的结果合并。
+
+    单个 suite 上 n=50 只能检出 ~20 个点的差异，四个 suite 合起来才有功效
+    去判断一个 10 个点量级的效应。各 suite 的基线水平差很多
+    (Object 88% vs Long 54%)，所以合并的是**成功局数**，不是成功率的平均。
+    """
+    per: dict[tuple, list] = defaultdict(list)
+    for suite in SUITES:
+        abl, base = load_runs(traj_dir, suite)
+        if not abl:
+            continue
+        latest: dict[tuple, dict] = {}
+        for d in abl:
+            latest[(d["token_keep"], d["token_method"])] = d
+        cache: dict[int, tuple] = {}
+        for (keep, method), d in latest.items():
+            t = d.get("num_trials_per_task") or default_trials
+            if t not in cache:
+                cache[t] = baseline_subset(base, t)
+            mk, mn, _ = cache[t]
+            if not mn:
+                continue
+            per[(keep, method)].append(
+                (suite, d["total_successes"], d["total_episodes"], mk, mn))
+
+    multi = {k: v for k, v in per.items() if len(v) > 1}
+    if not multi:
+        print("没有在两个以上 suite 都跑过的配置，无法合并。")
+        return
+
+    for (keep, method), rows in sorted(multi.items(), key=lambda kv: (-kv[0][0], kv[0][1])):
+        print(f"\n=== keep={keep} ({keep/N_PATCH*100:.0f}%, {N_PATCH/keep:.1f}x) "
+              f"· {method} · 跨 {len(rows)} 个 suite ===")
+        print(f"{'suite':>9} {'压缩后':>16} {'基线':>16} {'Δ':>7} {'p':>8}")
+        tk = tn = bk = bn = 0
+        for suite, k, n, mk, mn in rows:
+            _, pv = two_prop_z(k, n, mk, mn)
+            print(f"{SUITE_SHORT.get(suite, suite):>9} "
+                  f"{k:>4}/{n:<4} {k/n*100:>5.1f}% "
+                  f"{mk:>4}/{mn:<4} {mk/mn*100:>5.1f}% "
+                  f"{(k/n - mk/mn)*100:>+6.1f} {fmt_p(pv):>8}")
+            tk += k; tn += n; bk += mk; bn += mn
+        _, pv = two_prop_z(tk, tn, bk, bn)
+        lo, hi = wilson(tk, tn)
+        blo, bhi = wilson(bk, bn)
+        print("-" * 60)
+        print(f"{'合并':>9} {tk:>4}/{tn:<4} {tk/tn*100:>5.1f}% "
+              f"{bk:>4}/{bn:<4} {bk/bn*100:>5.1f}% "
+              f"{(tk/tn - bk/bn)*100:>+6.1f} {fmt_p(pv):>8}")
+        print(f"          压缩后 95%CI [{lo*100:.1f}, {hi*100:.1f}]   "
+              f"基线 95%CI [{blo*100:.1f}, {bhi*100:.1f}]")
+        same = sum(1 for _, k, n, mk, mn in rows if k / n < mk / mn)
+        print(f"          {len(rows)} 个 suite 中有 {same} 个方向为负"
+              + ("（方向完全一致）" if same == len(rows) else ""))
+
+
 # ------------------------------------------------------------------ 主流程
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--traj_dir", default="results/trajectories")
-    ap.add_argument("--suite", default="libero_spatial")
+    ap.add_argument("--suite", default="libero_spatial",
+                    help="suite 名，或 all —— 合并四个 suite 做联合检验")
     ap.add_argument("--trials", type=int, default=5,
                     help="每 task 的试验数；基线按此值从满量轨迹里取子集")
     ap.add_argument("--out_dir", default="results/tables")
@@ -223,44 +289,68 @@ def main():
     args = ap.parse_args()
 
     traj_dir = Path(args.traj_dir)
+    if args.suite == "all":
+        pool_across_suites(traj_dir, args.trials)
+        return
+
     abl, base = load_runs(traj_dir, args.suite)
     if not abl:
         raise SystemExit(f"{traj_dir} 下没有找到 {args.suite} 的消融 run "
                          f"(带 token_keep>0 的 summary.json)")
-
-    bk, bn, bsrc = baseline_subset(base, args.trials)
-    base_p = bk / bn if bn else float("nan")
-    base_ci = wilson(bk, bn) if bn else (float("nan"),) * 2
-    if bn:
-        print(f"基线子集: {bk}/{bn} = {base_p*100:.1f}%  "
-              f"[{base_ci[0]*100:.1f}, {base_ci[1]*100:.1f}]   来源 {bsrc}")
-    else:
-        print("⚠️ 没找到未压缩的基线 run，将只报告消融各点的绝对成功率")
 
     # 同一 (keep, method) 若跑了多次，取最新的一次
     latest: dict[tuple, dict] = {}
     for d in abl:
         latest[(d["token_keep"], d["token_method"])] = d
 
+    # ⚠️ 每个配置必须跟**自己那档 trials** 的基线比。
+    # 消融跑 5 trials/task 用的是 episode_idx<5，跑 20 的用的是 episode_idx<20，
+    # 两者是不同的初始状态集；混用会得出纯粹由基线子集变化造成的假差异。
+    bases: dict[int, tuple] = {}
+    for d in list(latest.values()):
+        t = d.get("num_trials_per_task") or args.trials
+        if t not in bases:
+            bases[t] = baseline_subset(base, t)
+    if args.trials not in bases:
+        bases[args.trials] = baseline_subset(base, args.trials)
+
+    for t in sorted(bases):
+        bk, bn, bsrc = bases[t]
+        if bn:
+            lo, hi = wilson(bk, bn)
+            print(f"基线子集 ({t} trials/task): {bk}/{bn} = {bk/bn*100:.1f}%  "
+                  f"[{lo*100:.1f}, {hi*100:.1f}]   来源 {bsrc}")
+        else:
+            print(f"⚠️ 没找到 {t} trials/task 的未压缩基线")
+
+    # 画图与拐点判定用命令行指定的那档
+    bk, bn, bsrc = bases[args.trials]
+    base_p = bk / bn if bn else float("nan")
+    base_ci = wilson(bk, bn) if bn else (float("nan"),) * 2
+
     # 评测是确定性的，不同配置给出逐位相同的 per-task 结果值得警惕:
     # 要么是巧合，要么是压缩根本没生效
+    # 全失败(per-task 全零)必然彼此相同，不是可疑信号，跳过
     seen: dict[tuple, list] = defaultdict(list)
     for (keep, method), d in latest.items():
-        if d["_pertask"]:
+        if d["_pertask"] and any(d["_pertask"]):
             seen[d["_pertask"]].append(f"keep={keep} {method}")
     dupes = [v for v in seen.values() if len(v) > 1]
 
     rows = []
     for (keep, method), d in sorted(latest.items(), key=lambda kv: (-kv[0][0], kv[0][1])):
         n, k = d["total_episodes"], d["total_successes"]
+        t = d.get("num_trials_per_task") or args.trials
+        mk, mn, _ = bases.get(t, (0, 0, ""))
         ci = wilson(k, n)
-        z, p = two_prop_z(k, n, bk, bn) if bn else (float("nan"),) * 2
+        z, p = two_prop_z(k, n, mk, mn) if mn else (float("nan"),) * 2
         rows.append({
             "keep": keep, "keep_pct": keep / N_PATCH * 100,
             "compression": N_PATCH / keep, "method": method,
-            "succ": k, "n": n, "rate": k / n,
+            "succ": k, "n": n, "rate": k / n, "trials": t,
+            "base_rate": (mk / mn) if mn else float("nan"), "base_n": mn,
             "ci_lo": ci[0], "ci_hi": ci[1],
-            "delta_vs_base": (k / n - base_p) if bn else float("nan"),
+            "delta_vs_base": (k / n - mk / mn) if mn else float("nan"),
             "z": z, "p": p,
         })
     df = pd.DataFrame(rows)
@@ -271,15 +361,15 @@ def main():
     csv = out_dir / f"token_ablation_{args.suite}.csv"
     df.to_csv(csv, index=False)
 
-    print(f"\n{args.suite}  (每配置 n={df.n.iloc[0] if len(df) else 0})")
-    print(f"{'keep':>5} {'占比':>7} {'压缩':>6} {'算子':>9} {'成功率':>8} "
-          f"{'95%CI':>15} {'Δ基线':>8} {'p':>8}")
-    print("-" * 78)
+    print(f"\n{args.suite}")
+    print(f"{'keep':>5} {'占比':>7} {'压缩':>6} {'算子':>11} {'n':>4} {'成功率':>8} "
+          f"{'95%CI':>15} {'基线':>7} {'Δ':>7} {'p':>8}")
+    print("-" * 92)
     for r in df.itertuples():
         print(f"{r.keep:>5} {r.keep_pct:>6.1f}% {r.compression:>5.1f}x "
-              f"{r.method:>9} {r.rate*100:>7.1f}% "
+              f"{r.method:>11} {r.n:>4} {r.rate*100:>7.1f}% "
               f"[{r.ci_lo*100:>5.1f},{r.ci_hi*100:>5.1f}] "
-              f"{r.delta_vs_base*100:>+7.1f} {fmt_p(r.p):>8}")
+              f"{r.base_rate*100:>6.1f}% {r.delta_vs_base*100:>+6.1f} {fmt_p(r.p):>8}")
 
     # 拐点: 第一个显著低于基线的预算(从大到小扫)
     if bn:
