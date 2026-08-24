@@ -32,6 +32,24 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 CKPT = os.environ.get("PROBE_CKPT", "openvla/openvla-7b-finetuned-libero-spatial")
+# 与 download_checkpoints.sh 一致走镜像: trust_remote_code 要回源拉
+# modeling_prismatic.py，直连 huggingface.co 会超时
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+
+
+def pick_attn() -> str:
+    """
+    用**当前环境实际能用的**注意力实现，而不是硬编码 flash_attention_2。
+
+    ⚠️ 这不是可有可无的适配: flash-attn 与 sdpa 的显存差异在长序列上最大，
+       而 K=8 正是 2048 token 的长序列区间。用错实现测出来的"装不下"，
+       换个实现可能就装得下——结论会反过来。所以结果里必须带上用的是哪个。
+    """
+    import importlib.util as iu
+    forced = os.environ.get("PROBE_ATTN")
+    if forced:
+        return forced
+    return "flash_attention_2" if iu.find_spec("flash_attn") is not None else "sdpa"
 N_PATCH, LANG_LEN = 256, 40      # 视觉 token 数；提示词+动作 token 的粗略长度
 
 
@@ -62,9 +80,10 @@ def measure(K: int, keep: int, batch: int, mode: str, ckpt_grad: bool) -> dict:
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
 
+    attn = pick_attn()
     model = AutoModelForVision2Seq.from_pretrained(
         CKPT, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True,
-        trust_remote_code=True, attn_implementation="flash_attention_2",
+        trust_remote_code=True, attn_implementation=attn,
     ).to("cuda")
     patch_multiframe(model, K, keep)
 
@@ -111,7 +130,7 @@ def measure(K: int, keep: int, batch: int, mode: str, ckpt_grad: bool) -> dict:
     gc_live = any(getattr(m, "gradient_checkpointing", False) for m in model.modules())
 
     return {"K": K, "keep": keep or N_PATCH, "batch": batch, "mode": mode,
-            "grad_ckpt": ckpt_grad, "grad_ckpt_active": gc_live,
+            "attn": attn, "grad_ckpt": ckpt_grad, "grad_ckpt_active": gc_live,
             "n_visual_tokens": n_vis,
             "seq_len": 1 + n_vis + LANG_LEN,
             "weights_gb": round(weights_gb, 2),
@@ -156,7 +175,12 @@ def main():
 
     # 每个配置起独立子进程: OOM 之后显存碎片会污染同进程内的后续测量
     total = torch.cuda.get_device_properties(0).total_memory / 1e9
+    attn = pick_attn()
     print(f"显卡: {torch.cuda.get_device_name(0)}  显存 {total:.1f} GB")
+    print(f"注意力实现: {attn}")
+    if attn == "sdpa":
+        print("  ⚠️ 未装 flash-attn，测的是 sdpa 的显存。长序列上 sdpa 比 flash-attn"
+              "\n     费显存，K 大时差距明显——这组数字是**保守下界**。")
     print(f"共 {len(SWEEP)} 个配置，每个都要重新加载 7B 模型（约 1 分钟），"
           f"预计 {len(SWEEP)}~{len(SWEEP)*2} 分钟\n")
     results = []
