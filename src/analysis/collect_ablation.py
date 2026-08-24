@@ -105,6 +105,7 @@ def load_runs(traj_dir: Path, suite: str) -> tuple[list[dict], list[dict]]:
         if d.get("task_suite") != suite:
             continue
         d["_dir"] = s.parent
+        d["_pertask"] = tuple(t.get("num_successes") for t in d.get("per_task", []))
         (abl if d.get("token_keep", 0) > 0 else base).append(d)
     return abl, base
 
@@ -241,6 +242,14 @@ def main():
     for d in abl:
         latest[(d["token_keep"], d["token_method"])] = d
 
+    # 评测是确定性的，不同配置给出逐位相同的 per-task 结果值得警惕:
+    # 要么是巧合，要么是压缩根本没生效
+    seen: dict[tuple, list] = defaultdict(list)
+    for (keep, method), d in latest.items():
+        if d["_pertask"]:
+            seen[d["_pertask"]].append(f"keep={keep} {method}")
+    dupes = [v for v in seen.values() if len(v) > 1]
+
     rows = []
     for (keep, method), d in sorted(latest.items(), key=lambda kv: (-kv[0][0], kv[0][1])):
         n, k = d["total_episodes"], d["total_successes"]
@@ -315,6 +324,12 @@ def main():
                 print(f"  {r.keep:>6} {r.rate*100:>15.1f}% {t:>15} {gap:>8}")
             print("  读法: expand 不掉点而直接压掉点 -> 掉的是位置，不是信息；"
                   "两者都掉 -> 模型确实需要这些细节")
+
+    if dupes:
+        print("\n⚠️ 以下配置的 per-task 结果逐位相同（评测确定性下值得核实）:")
+        for g in dupes:
+            print(f"   {' == '.join(g)}")
+        print("   若成功率相同但 per-task 分布不同，只是巧合；逐位相同则要查压缩是否真的生效。")
 
     print(f"\n表格 -> {csv}")
     plot_budget(df, base_p, base_ci, fig_dir / f"fig_a1_budget_curve_{args.suite}.png", args.suite)

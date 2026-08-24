@@ -9,6 +9,7 @@
 #   bash scripts/run_token_ablation.sh method 64         # 阶段二: 拐点附近比算子
 #   bash scripts/run_token_ablation.sh diag              # 诊断: 掉点是信息没了还是位置错位
 #   bash scripts/run_token_ablation.sh fixpos            # 把位置补回去——真正的解法
+#   bash scripts/run_token_ablation.sh replicate         # 主结论跨 suite 复现 + 加量
 #   bash scripts/run_token_ablation.sh cost              # 只打印耗时/费用估算
 #
 # ---------------------------------------------------------------------------
@@ -143,6 +144,27 @@ case "$MODE" in
     done
     ;;
 
+  replicate)
+    # fixpos 已在 Spatial 上确立主结论: keep=96 时 74.0% vs 基线 76.0% (p=0.82)。
+    # 单个 suite 上的结论太脆，这一组做两件事:
+    #   1) 同样配置在另外三个 suite 上复现
+    #   2) Spatial 上加量到 20 trials/task (n=200)，把等价性声明的置信区间收紧
+    #      —— n=50 时 CI 是 [60.4, 84.1]，太宽，撑不起"统计上不可区分"这句话
+    KEEP="${2:-96}"
+    echo "==> 主结论复现: keep=$KEEP + 位置修正"
+    for suite in libero_object libero_goal libero_10; do
+      SUITE="$suite" run_one "$KEEP" tome True
+    done
+    echo "==> Spatial 加量至 20 trials/task"
+    TRIALS=20 run_one "$KEEP" tome True
+    echo ""
+    echo "汇总要按 suite 分别跑:"
+    for suite in libero_spatial libero_object libero_goal libero_10; do
+      echo "    python src/analysis/collect_ablation.py --suite $suite --trials 5"
+    done
+    echo "    python src/analysis/collect_ablation.py --suite libero_spatial --trials 20"
+    ;;
+
   method)
     KEEP="${2:?用法: run_token_ablation.sh method <keep>}"
     echo "==> 阶段二: 在 keep=$KEEP 处比较 ${#ALL_METHODS[@]} 个算子"
@@ -153,7 +175,7 @@ case "$MODE" in
     ;;
 
   *)
-    echo "未知模式: $MODE (可选 budget | method | diag | fixpos | cost)"; exit 1
+    echo "未知模式: $MODE (可选 budget | method | diag | fixpos | replicate | cost)"; exit 1
     ;;
 esac
 
