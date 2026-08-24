@@ -29,7 +29,10 @@
    fc1/fc2 重名，按后缀匹配会把视觉主干一并挂上，正好与意图相反。
 """
 
-from __future__ import annotations
+# ⚠️ 不要加 `from __future__ import annotations`:
+#    它会把类型注解变成字符串，draccus.wrap() 拿到的就是 "Config" 而非类本身，
+#    dataclasses.fields() 随即抛 "must be called with a dataclass type or instance"。
+#    本文件用到的 list[str] 等写法在 Python 3.10 上原生支持，不需要该导入。
 
 import json
 import os
