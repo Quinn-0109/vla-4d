@@ -85,8 +85,9 @@ class Config:
     lora_vision: bool = False                  # 视觉主干是否挂 LoRA(官方等效于 True)
     grad_checkpoint: bool = True
 
-    save_steps: int = 2000
+    save_steps: int = 2500
     log_steps: int = 10
+    resume_from: Optional[str] = None          # 指向 adapter/stepN 目录
     bench_only: bool = False                   # 只测吞吐并给出 ETA，不真的训完
     run_id_note: Optional[str] = None
     # fmt: on
@@ -159,6 +160,21 @@ def main(cfg: Config) -> None:
           + ("（已冻结，其激活不占反传显存）" if vis_trainable == 0 else ""))
 
     optimizer = AdamW([p for p in vla.parameters() if p.requires_grad], lr=cfg.learning_rate)
+
+    # 断点续训: 6.8 小时的跑在第 5 小时挂掉而没法接着跑，代价太大。
+    # RLDS 是无限打乱流，数据位置本就无从精确复原，所以只恢复权重、优化器状态和步数。
+    start_step = 0
+    if cfg.resume_from:
+        src = Path(cfg.resume_from)
+        from peft import set_peft_model_state_dict
+        from safetensors.torch import load_file
+        sd = load_file(src / "adapter_model.safetensors")
+        set_peft_model_state_dict(vla, sd)
+        ck = torch.load(src / "trainer_state.pt", map_location="cpu")
+        optimizer.load_state_dict(ck["optimizer"])
+        start_step = ck["step"]
+        print(f"从 {src} 续训，已完成 {start_step} 步")
+
     action_tokenizer = ActionTokenizer(processor.tokenizer)
 
     dataset = RLDSDataset(
@@ -184,9 +200,22 @@ def main(cfg: Config) -> None:
     t0 = time.time()
     micro_per_step = cfg.grad_accumulation_steps
 
+    def save(step: int) -> None:
+        """
+        每个 step 存到独立目录。官方是反复覆盖同一份，但我们要**评测多个步数的
+        checkpoint** 来定位成功率何时到顶——覆盖掉就只剩最后一份，没法回看。
+        adapter 只有几百 MB，存几份不心疼。
+        """
+        d = adapter_dir / f"step{step}"
+        vla.save_pretrained(d)
+        torch.save({"optimizer": optimizer.state_dict(), "step": step},
+                   d / "trainer_state.pt")
+        processor.save_pretrained(run_dir)
+        print(f"\n[step {step}] 已存 -> {d}")
+
     vla.train()
     optimizer.zero_grad()
-    with tqdm.tqdm(total=cfg.max_steps) as bar:
+    with tqdm.tqdm(total=cfg.max_steps, initial=start_step) as bar:
         for micro_idx, batch in enumerate(loader):
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 out = vla(input_ids=batch["input_ids"].to(dev),
@@ -206,12 +235,12 @@ def main(cfg: Config) -> None:
 
             optimizer.step()
             optimizer.zero_grad(set_to_none=True)
-            step = (micro_idx + 1) // micro_per_step
+            step = start_step + (micro_idx + 1) // micro_per_step
             bar.update()
 
             if step % cfg.log_steps == 0:
                 el = time.time() - t0
-                sps = step / el
+                sps = (step - start_step) / el
                 rec = {"step": step, "loss": sum(losses) / len(losses),
                        "action_accuracy": sum(accs) / len(accs),
                        "steps_per_sec": sps, "elapsed_h": el / 3600,
@@ -233,15 +262,13 @@ def main(cfg: Config) -> None:
                 print("\n先看这个数字再决定 max_steps，别直接开长跑。")
                 return
 
-            if step > 0 and step % cfg.save_steps == 0:
-                processor.save_pretrained(run_dir)
-                vla.save_pretrained(adapter_dir)      # 只存 adapter，合并交给 merge_lora.py
+            if step > start_step and step % cfg.save_steps == 0:
+                save(step)
 
             if step >= cfg.max_steps:
                 break
 
-    processor.save_pretrained(run_dir)
-    vla.save_pretrained(adapter_dir)
+    save(min(step, cfg.max_steps))
     print(f"完成 -> {adapter_dir}")
 
 
