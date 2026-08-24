@@ -148,6 +148,11 @@ SWEEP = [
     (1, 0, 4, "train", True), (4, 96, 4, "train", True),
 ]
 
+# K=1 的批量扫描: 阶段 B 第 4 步(单帧 LoRA 复现)不需要多帧，
+# 而 batch=1 跑 7B 的 GPU 利用率很低。找出不开检查点时能吃下的最大 batch，
+# 直接决定那次 20-45 小时的复现能压到多久。
+SWEEP_BATCH = [(1, 0, b, "train", gc) for b in (2, 4, 8, 16) for gc in (False, True)]
+
 
 def main():
     # ⚠️ 管道输出(| tee)会让 stdout 变成块缓冲，整个 sweep 的输出填不满一个
@@ -159,6 +164,8 @@ def main():
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--sweep", action="store_true", help="跑完整决策表（每个配置一个子进程）")
+    ap.add_argument("--sweep_batch", action="store_true",
+                    help="只扫 K=1 的批量，给单帧复现选吞吐最优的配置")
     ap.add_argument("--K", type=int, default=1)
     ap.add_argument("--keep", type=int, default=0, help="0 = 不压缩")
     ap.add_argument("--batch", type=int, default=1)
@@ -169,7 +176,7 @@ def main():
                     help="单个配置的超时(秒)；卡住就当失败继续，不拖垮整轮")
     args = ap.parse_args()
 
-    if not args.sweep:
+    if not (args.sweep or args.sweep_batch):
         print(json.dumps(measure(args.K, args.keep, args.batch, args.mode, args.grad_ckpt)))
         return
 
@@ -183,12 +190,13 @@ def main():
               "\n     费显存，K 大时差距明显——这组数字是**保守下界**。")
     print(f"共 {len(SWEEP)} 个配置，每个都要重新加载 7B 模型（约 1 分钟），"
           f"预计 {len(SWEEP)}~{len(SWEEP)*2} 分钟\n")
+    plan = SWEEP_BATCH if args.sweep_batch else SWEEP
     results = []
-    for i, (K, keep, batch, mode, gc) in enumerate(SWEEP, 1):
+    for i, (K, keep, batch, mode, gc) in enumerate(plan, 1):
         cmd = [sys.executable, "-u", __file__, "--K", str(K), "--keep", str(keep),
                "--batch", str(batch), "--mode", mode] + (["--grad_ckpt"] if gc else [])
         # 测之前就报，否则加载模型那一分钟里用户只能盯着空屏幕猜是不是卡了
-        print(f"[{i:>2}/{len(SWEEP)}] K={K:<2} keep={keep or N_PATCH:<3} b={batch} "
+        print(f"[{i:>2}/{len(plan)}] K={K:<2} keep={keep or N_PATCH:<3} b={batch:<2} "
               f"{mode:<5} {'ckpt' if gc else '    '} ... ", end="", flush=True)
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout)
@@ -218,9 +226,21 @@ def main():
             warn += f"  [{d['error'][:80]}]"
         print(f"tok={d['n_visual_tokens']:>4}  {flag}{warn}")
 
-    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-    Path(args.out).write_text(json.dumps(results, indent=2))
-    print(f"\n-> {args.out}")
+    out = args.out.replace(".json", "_batch.json") if args.sweep_batch else args.out
+    Path(out).parent.mkdir(parents=True, exist_ok=True)
+    Path(out).write_text(json.dumps(results, indent=2))
+    print(f"\n-> {out}")
+
+    if args.sweep_batch:
+        ok = [d for d in results if d.get("ok")]
+        if ok:
+            best = max(ok, key=lambda d: (d["batch"], not d["grad_ckpt"]))
+            print(f"\n=== 单帧复现建议 ===")
+            print(f"  batch={best['batch']} "
+                  f"{'+ 梯度检查点' if best['grad_ckpt'] else '(不开检查点)'}"
+                  f"  峰值 {best['peak_gb']} GB")
+            print(f"  梯度累积设为 {max(16 // best['batch'], 1)}，凑够官方的有效批 16")
+        return
 
     # 决策摘要
     def best(mode, keep, gc):
