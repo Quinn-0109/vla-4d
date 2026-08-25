@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 from pathlib import Path
 
 import torch
@@ -27,6 +28,17 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--base", default="openvla/openvla-7b")
     args = ap.parse_args()
+
+    out_pre = Path(args.out)
+    out_pre.parent.mkdir(parents=True, exist_ok=True)
+    free = shutil.disk_usage(out_pre.parent).free
+    NEED = 16e9          # 7B bf16 约 15GB，留一点余量
+    if free < NEED:
+        raise SystemExit(
+            f"❌ 空间不足: {out_pre.parent} 仅剩 {free/1e9:.1f} GB，合并需要约 16 GB。\n"
+            f"   合并后的完整权重一份 15 GB，评过的可以删掉——adapter 还在，"
+            f"随时能重新合并出来:\n"
+            f"     rm -rf <已评过的 merged_* 目录>")
 
     base = AutoModelForVision2Seq.from_pretrained(
         args.base, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True)
@@ -63,6 +75,17 @@ def main():
             continue
     else:
         AutoProcessor.from_pretrained(args.base, trust_remote_code=True).save_pretrained(out)
+
+    # 空间在写盘途中耗尽时 save_pretrained 会留下一个没有权重的半成品目录，
+    # 下游只报 "no file named pytorch_model.bin"，看不出根因。在这里查明白。
+    weights = list(out.glob("*.safetensors")) + list(out.glob("*.bin"))
+    if not weights:
+        raise SystemExit(
+            f"❌ {out} 里没有权重文件，合并没有真正完成。\n"
+            f"   常见原因是写盘途中空间耗尽。请清理后删除该目录重跑:\n"
+            f"     rm -rf {out}")
+    total = sum(f.stat().st_size for f in weights) / 1e9
+    print(f"权重: {len(weights)} 个分片，共 {total:.1f} GB")
 
     print(f"合并完成 -> {out}")
     print("\n评测（5 trials/task，约 17 分钟，可与满量 500 局的基线子集直接对比）:")
