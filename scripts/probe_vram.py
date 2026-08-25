@@ -74,7 +74,13 @@ def patch_multiframe(model, K: int, keep: int):
     model.vision_backbone.forward = wrapped
 
 
-def measure(K: int, keep: int, batch: int, mode: str, ckpt_grad: bool) -> dict:
+def measure(K: int, keep: int, batch: int, mode: str, ckpt_grad: bool,
+            freeze_vision: bool = False, cameras: int = 1) -> dict:
+    """
+    cameras=2 时每个时间步有两张图（第三人称 + 腕部），显存上等价于把帧数翻倍:
+    2K 次视觉主干前向 + 2K 份 token。所以内部按 K*cameras 帧处理，
+    但结果里 K 与 cameras 分开记录，事后才看得懂。
+    """
     from transformers import AutoModelForVision2Seq
 
     torch.cuda.empty_cache()
@@ -85,17 +91,22 @@ def measure(K: int, keep: int, batch: int, mode: str, ckpt_grad: bool) -> dict:
         CKPT, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True,
         trust_remote_code=True, attn_implementation=attn,
     ).to("cuda")
-    patch_multiframe(model, K, keep)
+    patch_multiframe(model, n_img, keep)
 
-    n_vis = (keep if keep and keep < N_PATCH else N_PATCH) * K
+    n_vis = (keep if keep and keep < N_PATCH else N_PATCH) * n_img
     weights_gb = torch.cuda.max_memory_allocated() / 1e9
 
     if mode == "train":
         from peft import LoraConfig, get_peft_model
-        # 与 vla-scripts/finetune.py:174 一致
+
+        from common.lora import lora_targets
+        # ⚠️ 必须与 finetune_single.py 用同一份目标层逻辑。
+        #    freeze_vision=True 时视觉主干不挂 LoRA，其激活不进反传图——
+        #    这才是实际训练的配置。用 all-linear 测出来的表描述的是别的东西。
         model = get_peft_model(model, LoraConfig(
             r=32, lora_alpha=16, lora_dropout=0.0,
-            target_modules="all-linear", init_lora_weights="gaussian"))
+            target_modules=lora_targets(model, include_vision=not freeze_vision),
+            init_lora_weights="gaussian"))
         if ckpt_grad:
             model.gradient_checkpointing_enable()
             if hasattr(model, "enable_input_require_grads"):
@@ -105,7 +116,7 @@ def measure(K: int, keep: int, batch: int, mode: str, ckpt_grad: bool) -> dict:
     else:
         model.eval()
 
-    px = torch.randn(batch, K * 6, 224, 224, dtype=torch.bfloat16, device="cuda")
+    px = torch.randn(batch, n_img * 6, 224, 224, dtype=torch.bfloat16, device="cuda")
     ids = torch.randint(100, 30000, (batch, LANG_LEN), device="cuda")
     att = torch.ones_like(ids)
     torch.cuda.reset_peak_memory_stats()
@@ -129,8 +140,10 @@ def measure(K: int, keep: int, batch: int, mode: str, ckpt_grad: bool) -> dict:
     # 确认梯度检查点真的挂上了——静默失效会让我们把"没省下来"读成"省不了"
     gc_live = any(getattr(m, "gradient_checkpointing", False) for m in model.modules())
 
-    return {"K": K, "keep": keep or N_PATCH, "batch": batch, "mode": mode,
-            "attn": attn, "grad_ckpt": ckpt_grad, "grad_ckpt_active": gc_live,
+    return {"K": K, "cameras": cameras, "images_encoded": n_img,
+            "keep": keep or N_PATCH, "batch": batch, "mode": mode,
+            "attn": attn, "freeze_vision": freeze_vision,
+            "grad_ckpt": ckpt_grad, "grad_ckpt_active": gc_live,
             "n_visual_tokens": n_vis,
             "seq_len": 1 + n_vis + LANG_LEN,
             "weights_gb": round(weights_gb, 2),
@@ -171,20 +184,27 @@ def main():
     ap.add_argument("--batch", type=int, default=1)
     ap.add_argument("--mode", default="infer", choices=["infer", "train"])
     ap.add_argument("--grad_ckpt", action="store_true")
+    ap.add_argument("--freeze_vision", action="store_true",
+                    help="视觉主干不挂 LoRA —— 与 finetune_single.py 的实际配置一致")
+    ap.add_argument("--cameras", type=int, default=1, choices=[1, 2],
+                    help="2 = 加腕部相机，每帧 token 翻倍（docs/06 C.0 ③）")
     ap.add_argument("--out", default="results/tables/vram_probe.json")
     ap.add_argument("--timeout", type=int, default=900,
                     help="单个配置的超时(秒)；卡住就当失败继续，不拖垮整轮")
     args = ap.parse_args()
 
     if not (args.sweep or args.sweep_batch):
-        print(json.dumps(measure(args.K, args.keep, args.batch, args.mode, args.grad_ckpt)))
+        print(json.dumps(measure(args.K, args.keep, args.batch, args.mode,
+                                 args.grad_ckpt, args.freeze_vision, args.cameras)))
         return
 
     # 每个配置起独立子进程: OOM 之后显存碎片会污染同进程内的后续测量
     total = torch.cuda.get_device_properties(0).total_memory / 1e9
     attn = pick_attn()
     print(f"显卡: {torch.cuda.get_device_name(0)}  显存 {total:.1f} GB")
-    print(f"注意力实现: {attn}")
+    print(f"注意力实现: {attn}   视觉主干: "
+          f"{'冻结（与实际训练一致）' if args.freeze_vision else '挂 LoRA（官方 all-linear）'}"
+          f"   相机数: {args.cameras}")
     if attn == "sdpa":
         print("  ⚠️ 未装 flash-attn，测的是 sdpa 的显存。长序列上 sdpa 比 flash-attn"
               "\n     费显存，K 大时差距明显——这组数字是**保守下界**。")
@@ -193,8 +213,10 @@ def main():
     plan = SWEEP_BATCH if args.sweep_batch else SWEEP
     results = []
     for i, (K, keep, batch, mode, gc) in enumerate(plan, 1):
-        cmd = [sys.executable, "-u", __file__, "--K", str(K), "--keep", str(keep),
-               "--batch", str(batch), "--mode", mode] + (["--grad_ckpt"] if gc else [])
+        cmd = ([sys.executable, "-u", __file__, "--K", str(K), "--keep", str(keep),
+                "--batch", str(batch), "--mode", mode, "--cameras", str(args.cameras)]
+               + (["--grad_ckpt"] if gc else [])
+               + (["--freeze_vision"] if args.freeze_vision else []))
         # 测之前就报，否则加载模型那一分钟里用户只能盯着空屏幕猜是不是卡了
         print(f"[{i:>2}/{len(plan)}] K={K:<2} keep={keep or N_PATCH:<3} b={batch:<2} "
               f"{mode:<5} {'ckpt' if gc else '    '} ... ", end="", flush=True)
@@ -213,10 +235,12 @@ def main():
         except json.JSONDecodeError:
             # 子进程崩了(未被捕获的 OOM 等)，也要带上 attn，否则事后无法核对
             # 整轮用的是不是同一个实现
-            d = {"K": K, "keep": keep or N_PATCH, "batch": batch, "mode": mode,
-                 "attn": attn, "grad_ckpt": gc, "ok": False, "peak_gb": None,
-                 "n_visual_tokens": (keep or N_PATCH) * K, "seq_len": None,
-                 "error": (r.stderr or "")[-200:]}
+            d = {"K": K, "cameras": args.cameras, "images_encoded": K * args.cameras,
+                 "keep": keep or N_PATCH, "batch": batch, "mode": mode,
+                 "attn": attn, "freeze_vision": args.freeze_vision,
+                 "grad_ckpt": gc, "ok": False, "peak_gb": None,
+                 "n_visual_tokens": (keep or N_PATCH) * K * args.cameras,
+                 "seq_len": None, "error": (r.stderr or "")[-200:]}
         results.append(d)
         flag = f"{d['peak_gb']:.1f} GB" if d.get("peak_gb") else "OOM"
         warn = ""
@@ -226,7 +250,10 @@ def main():
             warn += f"  [{d['error'][:80]}]"
         print(f"tok={d['n_visual_tokens']:>4}  {flag}{warn}")
 
-    out = args.out.replace(".json", "_batch.json") if args.sweep_batch else args.out
+    suffix = ("_batch" if args.sweep_batch else "")
+    suffix += ("_frozen" if args.freeze_vision else "")
+    suffix += (f"_cam{args.cameras}" if args.cameras != 1 else "")
+    out = args.out.replace(".json", f"{suffix}.json")
     Path(out).parent.mkdir(parents=True, exist_ok=True)
     Path(out).write_text(json.dumps(results, indent=2))
     print(f"\n-> {out}")

@@ -53,6 +53,7 @@ _OPENVLA_ROOT = os.environ.get("OPENVLA_ROOT")
 if _OPENVLA_ROOT is None:
     raise SystemExit("请先 export OPENVLA_ROOT=<openvla 仓库根目录>")
 sys.path.insert(0, str(Path(_OPENVLA_ROOT).expanduser().resolve()))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
 from peft import LoraConfig, get_peft_model  # noqa: E402
@@ -63,6 +64,8 @@ from prismatic.util.data_utils import PaddedCollatorForActionPrediction  # noqa:
 from prismatic.vla.action_tokenizer import ActionTokenizer  # noqa: E402
 from prismatic.vla.datasets import RLDSBatchTransform, RLDSDataset  # noqa: E402
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics  # noqa: E402
+
+from common.lora import lora_targets  # noqa: E402
 
 
 @dataclass
@@ -91,26 +94,6 @@ class Config:
     bench_only: bool = False                   # 只测吞吐并给出 ETA，不真的训完
     run_id_note: Optional[str] = None
     # fmt: on
-
-
-def lora_targets(model, include_vision: bool) -> list[str]:
-    """
-    收集要挂 LoRA 的线性层**全名**。
-
-    peft 0.11.1 的匹配规则是 `key in target_modules or key.endswith("."+t)`，
-    所以传全名是精确的；传后缀则会误伤——投影器的 fc1/fc2 和 ViT block 的
-    fc1/fc2 同名。lm_head 按 peft 的 all-linear 惯例排除(它是输出嵌入层)。
-    """
-    names = []
-    for name, mod in model.named_modules():
-        if not isinstance(mod, torch.nn.Linear):
-            continue
-        if name.endswith("lm_head"):
-            continue
-        if not include_vision and "vision_backbone" in name:
-            continue
-        names.append(name)
-    return names
 
 
 @draccus.wrap()
