@@ -98,16 +98,32 @@ class FeatureExtractor:
         """去掉 cls / register token，只留 patch token。"""
         return tok[:, -n_patch:, :] if tok.shape[1] > n_patch else tok
 
-    def encode(self, frames: list[np.ndarray]):
-        """(T,H,W,3) uint8 -> (T, N_PATCH, D) 归一化后的 patch 特征"""
+    def encode(self, frames: list[np.ndarray], chunk: int = 32):
+        """
+        (T,H,W,3) uint8 -> (T, N_PATCH, D) 归一化后的 patch 特征。
+
+        ⚠️ **必须分块**。初版一次前向整条 episode，在 libero_10 上炸了：
+        Long 平均 388 帧，DINOv2 的激活涨到 6 GB，加上同卡在跑的训练直接 OOM。
+        这不只是"并行才有的问题"——单独跑长 suite 一样会撞，只是之前跑的都是
+        短 suite（Spatial 成功 episode 约 106 帧）所以没暴露。
+
+        chunk=32 把峰值钉在与 episode 长度无关的常数上，
+        代价只是多几次 kernel 启动。显存紧张时可以再调小。
+        """
         from PIL import Image
         torch = self.torch
-        x = torch.stack([self.tf(Image.fromarray(f).convert("RGB")) for f in frames]).to(self.device)
-        with torch.no_grad():
-            out = self.model.get_intermediate_layers(x, n={self.layer_idx})
-            tok = out[0] if isinstance(out, (tuple, list)) else out
-        tok = self._drop_prefix(tok, N_PATCH)
-        return torch.nn.functional.normalize(tok.float(), dim=-1).cpu().numpy()
+        outs = []
+        for i in range(0, len(frames), chunk):
+            batch = frames[i:i + chunk]
+            x = torch.stack([self.tf(Image.fromarray(f).convert("RGB"))
+                             for f in batch]).to(self.device)
+            with torch.no_grad():
+                out = self.model.get_intermediate_layers(x, n={self.layer_idx})
+                tok = out[0] if isinstance(out, (tuple, list)) else out
+            tok = self._drop_prefix(tok, N_PATCH)
+            outs.append(torch.nn.functional.normalize(tok.float(), dim=-1).cpu().numpy())
+            del x, out, tok
+        return np.concatenate(outs, axis=0)
 
 
 def patch_change_feature(fa: np.ndarray, fb: np.ndarray) -> np.ndarray:
