@@ -162,13 +162,25 @@ def main():
     print(f"\n-> {args.out}")
 
     # 建议: 取比值落在 0.5~0.8 的区间 —— 帧间已有实质变化，但仍明显区别于随机帧
+    #
+    # ⚠️ **带内取最小，不取中位。** 初版取中位，是在发现「填充率」问题之前写的。
+    # 0.5–0.8 是「信息量够不够」的**下界约束**，落在带内的都合格；
+    # 带内选哪个，应由另一个目标决定 —— **最小化补帧**。
+    # K 帧历史需要第 (K-1)*stride 帧之后才填得满，stride 越大，
+    # episode 里「历史是补出来的」的步数越多。libero_10 实测（K=8）：
+    #     stride=16 → 41% 的步骤填不满    stride=25 → 65%
+    # 65% 已经不是「开头几步的边界情况」，而是主体状态。
     cand = [r for r in rows if 0.5 <= r["ratio_to_random"] <= 0.8]
     print("\n=== stride 建议 ===")
     if cand:
-        pick = cand[len(cand) // 2]
+        pick = cand[0]                      # 带内最小 = 补帧最少
         print(f"  比值落在 0.5–0.8 的 Δt: {[r['delta_t'] for r in cand]}")
-        print(f"  取中位: **stride = {pick['delta_t']}** "
+        print(f"  **取带内最小: stride = {pick['delta_t']}** "
               f"({pick['seconds']:.2f} 秒/帧，K=8 覆盖 {7*pick['seconds']:.1f} 秒)")
+        print(f"  理由: 判据是下界约束，带内都合格；带内取最小以少补帧。")
+        need = 7 * pick["delta_t"]
+        print(f"  K=8 需第 {need} 帧后才填满历史 —— 对照各 suite 的 episode 长度"
+              f"检查补帧占比（docs/06 §4.1 ①）")
     else:
         lo = [r for r in rows if r["ratio_to_random"] < 0.5]
         print(f"  没有 Δt 落在 0.5–0.8。扫描范围可能不够宽。")
