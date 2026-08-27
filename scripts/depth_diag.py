@@ -190,6 +190,22 @@ def main() -> None:
     if not files:
         raise SystemExit(f"在 {args.traj_dir} 下找不到 {args.suite} 的轨迹")
 
+    # ⚠️ 一次评测 = 一个 EVAL-* 目录。同一个 suite 往往有好几轮
+    # （重复跑的、token 消融跑的 --tok96-tome-fixpos ...），
+    # 兜底 glob 会把它们**全部**吞进来。后果有两种，都不报错：
+    #   ① 同一条 episode 被算两遍 —— 窗口数翻倍，n 是假的
+    #   ② 混进别的策略的轨迹 —— 动作不同，回放出的场景就不是基线那个
+    # 所以宁可停下来让人选，也不静默混合。
+    runs = sorted({Path(f).parent.name for f in files})
+    if len(runs) > 1:
+        raise SystemExit(
+            f"匹配到 {len(runs)} 轮评测的轨迹，不能混着算：\n  "
+            + "\n  ".join(runs)
+            + "\n\n用 --traj_dir 指定其中一个（选基线那轮，别选 tok/tome 消融那轮）：\n"
+              f"  python scripts/depth_diag.py --traj_dir {args.traj_dir}/{runs[0]} "
+              f"--suite {args.suite} --n_episodes {args.n_episodes}")
+    print(f"轨迹来源: {runs[0]}（{len(files)} 条）")
+
     rng = np.random.default_rng(args.seed)
     if len(files) > args.n_episodes:
         files = [files[i] for i in rng.choice(len(files), args.n_episodes, replace=False)]
