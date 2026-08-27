@@ -240,14 +240,34 @@ def main():
                  "attn": attn, "freeze_vision": args.freeze_vision,
                  "grad_ckpt": gc, "ok": False, "peak_gb": None,
                  "n_visual_tokens": (keep or N_PATCH) * K * args.cameras,
-                 "seq_len": None, "error": (r.stderr or "")[-200:]}
+                 "seq_len": None, "error": (r.stderr or "")[-600:]}
         results.append(d)
-        flag = f"{d['peak_gb']:.1f} GB" if d.get("peak_gb") else "OOM"
+
+        # ⚠️ **不能把任何失败都当成 OOM。** 初版这么写过，结果一次签名/环境错误
+        # 让整张表全是 "OOM"，包括 K=1——而 K=1 的实际训练只用 16.8 GB。
+        # 那张表会直接导出"连单帧都塞不下、必须压缩"的错误结论，
+        # 而"压缩是使能而非优化"这个叙事本项目已经撤回过一次（docs/06 阶段 B ①）。
+        # 之所以当场识破，是因为手上有独立的实测事实可对照；没有对照的话
+        # 这类静默错误会一路带进决策。
+        err = d.get("error") or ""
+        is_oom = ("OutOfMemoryError" in err or "out of memory" in err.lower()
+                  or d.get("oom") is True)
+        if d.get("peak_gb"):
+            flag = f"{d['peak_gb']:.1f} GB"
+        elif d.get("error") == "timeout":
+            flag = "超时"
+        elif is_oom:
+            flag = "OOM"
+        else:
+            flag = "❌崩溃"          # 不是显存问题，是代码/环境错了
         warn = ""
         if gc and d.get("ok") and not d.get("grad_ckpt_active"):
             warn = "  ⚠️ 梯度检查点未生效"
-        if d.get("error"):
-            warn += f"  [{d['error'][:80]}]"
+        if d.get("error") and d["error"] != "timeout":
+            # 取**末尾**：异常类型与消息在 traceback 最后一行，
+            # 取开头只会拿到中间的文件路径，最没有信息量的那段
+            tail = " ".join(err.strip().splitlines()[-1:])[:120]
+            warn += f"  [{tail}]"
         print(f"tok={d['n_visual_tokens']:>4}  {flag}{warn}")
 
     suffix = ("_batch" if args.sweep_batch else "")
