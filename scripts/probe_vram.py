@@ -167,10 +167,13 @@ SWEEP = [
     (1, 0, 4, "train", True), (4, 96, 4, "train", True),
 ]
 
-# K=1 的批量扫描: 阶段 B 第 4 步(单帧 LoRA 复现)不需要多帧，
-# 而 batch=1 跑 7B 的 GPU 利用率很低。找出不开检查点时能吃下的最大 batch，
-# 直接决定那次 20-45 小时的复现能压到多久。
-SWEEP_BATCH = [(1, 0, b, "train", gc) for b in (2, 4, 8, 16) for gc in (False, True)]
+# 批量扫描: batch=1 跑 7B 的 GPU 利用率很低，找出能吃下的最大 batch，
+# 直接决定那次 20-45 小时的训练能压到多久。
+# 默认扫 K=1(单帧复现)，但主线是 K=8 —— 用 `--sweep_batch --K 8` 扫主线配置，
+# 因为**多帧下的 batch 上限不能由 K=1 外推**: 每加一个 batch 要多存一整份
+# K 帧的视觉激活，K=8 时这份开销是 K=1 的八倍。
+def sweep_batch(K=1, keep=0):
+    return [(K, keep, b, "train", gc) for b in (2, 4, 8, 16) for gc in (False, True)]
 
 
 def main():
@@ -214,9 +217,9 @@ def main():
     if attn == "sdpa":
         print("  ⚠️ 未装 flash-attn，测的是 sdpa 的显存。长序列上 sdpa 比 flash-attn"
               "\n     费显存，K 大时差距明显——这组数字是**保守下界**。")
-    print(f"共 {len(SWEEP)} 个配置，每个都要重新加载 7B 模型（约 1 分钟），"
-          f"预计 {len(SWEEP)}~{len(SWEEP)*2} 分钟\n")
-    plan = SWEEP_BATCH if args.sweep_batch else SWEEP
+    plan = sweep_batch(args.K, args.keep) if args.sweep_batch else SWEEP
+    print(f"共 {len(plan)} 个配置，每个都要重新加载 7B 模型（约 1 分钟），"
+          f"预计 {len(plan)}~{len(plan)*2} 分钟\n")
     results = []
     for i, (K, keep, batch, mode, gc) in enumerate(plan, 1):
         cmd = ([sys.executable, "-u", __file__, "--K", str(K), "--keep", str(keep),
@@ -276,7 +279,7 @@ def main():
             warn += f"  [{tail}]"
         print(f"tok={d['n_visual_tokens']:>4}  {flag}{warn}")
 
-    suffix = ("_batch" if args.sweep_batch else "")
+    suffix = (f"_batch_K{args.K}" if args.sweep_batch else "")
     suffix += ("_frozen" if args.freeze_vision else "")
     suffix += (f"_cam{args.cameras}" if args.cameras != 1 else "")
     out = args.out.replace(".json", f"{suffix}.json")
@@ -288,7 +291,7 @@ def main():
         ok = [d for d in results if d.get("ok")]
         if ok:
             best = max(ok, key=lambda d: (d["batch"], not d["grad_ckpt"]))
-            print(f"\n=== 单帧复现建议 ===")
+            print(f"\n=== K={args.K} keep={args.keep or N_PATCH} 的批量建议 ===")
             print(f"  batch={best['batch']} "
                   f"{'+ 梯度检查点' if best['grad_ckpt'] else '(不开检查点)'}"
                   f"  峰值 {best['peak_gb']} GB")
