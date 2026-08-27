@@ -249,7 +249,8 @@ def main():
                  "attn": attn, "freeze_vision": args.freeze_vision,
                  "grad_ckpt": gc, "ok": False, "peak_gb": None,
                  "n_visual_tokens": (keep or N_PATCH) * K * args.cameras,
-                 "seq_len": None, "error": (r.stderr or "")[-600:]}
+                 "seq_len": None, "error": (r.stderr or "")[-600:],
+                 "returncode": r.returncode}
         results.append(d)
 
         # ⚠️ **不能把任何失败都当成 OOM。** 初版这么写过，结果一次签名/环境错误
@@ -259,14 +260,27 @@ def main():
         # 之所以当场识破，是因为手上有独立的实测事实可对照；没有对照的话
         # 这类静默错误会一路带进决策。
         err = d.get("error") or ""
-        is_oom = ("OutOfMemoryError" in err or "out of memory" in err.lower()
-                  or d.get("oom") is True)
+        # 显存耗尽有好几种长相: Python 异常、CUDA driver 报错、cuBLAS 分配失败。
+        # 只认 `OutOfMemoryError` 会把后两种误判成代码错误。
+        is_oom = (d.get("oom") is True
+                  or any(k in err for k in ("OutOfMemoryError",
+                                            "CUBLAS_STATUS_ALLOC_FAILED",
+                                            "cudaErrorMemoryAllocation"))
+                  or "out of memory" in err.lower())
+        # stderr 全空 + 非零退出 = 进程被信号杀掉，连 traceback 都没来得及写。
+        # Python 异常一定会留 traceback，所以这一支只可能是外部杀进程:
+        # SIGKILL(9) 通常是宿主机/容器内存不足或驱动级 OOM。**这不是代码错误**,
+        # 早先把它记成「❌崩溃」，等于把一个显存结论藏进了"环境有问题"里。
+        rc = d.get("returncode")
+        killed = (not err.strip()) and isinstance(rc, int) and rc < 0
         if d.get("peak_gb"):
             flag = f"{d['peak_gb']:.1f} GB"
         elif d.get("error") == "timeout":
             flag = "超时"
         elif is_oom:
             flag = "OOM"
+        elif killed:
+            flag = f"被杀 signal {-rc}" + ("（多半是显存/内存耗尽）" if -rc == 9 else "")
         else:
             flag = "❌崩溃"          # 不是显存问题，是代码/环境错了
         warn = ""
