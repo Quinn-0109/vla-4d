@@ -219,6 +219,12 @@ def main() -> None:
 
     for i, f in enumerate(files):
         traj = json.loads(Path(f).read_text())
+        # 评测目录里除了每条轨迹，还躺着汇总 json（成功率之类）。
+        # 不挑出来的话它会一路走到 traj["task_id"] 才崩，
+        # 而那时前面几条已经渲染完了，白跑。
+        if not {"task_id", "episode_idx", "steps"} <= traj.keys():
+            print(f"  [{i+1}/{len(files)}] 跳过非轨迹文件 {Path(f).name}")
+            continue
         dep = replay_depth(traj, bmark)
         if dep is None:
             continue
