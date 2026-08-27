@@ -127,6 +127,7 @@ def measure(K: int, keep: int, batch: int, mode: str, ckpt_grad: bool,
     att = torch.ones_like(ids)
     torch.cuda.reset_peak_memory_stats()
 
+    oom = False
     try:
         if mode == "train":
             labels = ids.clone()
@@ -141,7 +142,12 @@ def measure(K: int, keep: int, batch: int, mode: str, ckpt_grad: bool,
         peak = torch.cuda.max_memory_allocated() / 1e9
         ok = True
     except torch.cuda.OutOfMemoryError:
-        peak, ok = float("nan"), False
+        # ⚠️ **必须把 oom 标出来。** 子进程在这里已经正确识别了显存耗尽，
+        #    但早先只记 ok=False 就返回，父进程收到一个能正常解析、
+        #    既没有 peak_gb 也没有 error 的 JSON，只好归到「❌崩溃」——
+        #    于是每一个真 OOM 都被写成了"代码/环境错了"。
+        #    子进程知道答案而父进程把它丢了，这比测错还难查。
+        peak, ok, oom = float("nan"), False, True
 
     # 确认梯度检查点真的挂上了——静默失效会让我们把"没省下来"读成"省不了"
     gc_live = any(getattr(m, "gradient_checkpointing", False) for m in model.modules())
@@ -153,7 +159,7 @@ def measure(K: int, keep: int, batch: int, mode: str, ckpt_grad: bool,
             "n_visual_tokens": n_vis,
             "seq_len": 1 + n_vis + LANG_LEN,
             "weights_gb": round(weights_gb, 2),
-            "peak_gb": None if not ok else round(peak, 2), "ok": ok}
+            "peak_gb": None if not ok else round(peak, 2), "ok": ok, "oom": oom}
 
 
 SWEEP = [
