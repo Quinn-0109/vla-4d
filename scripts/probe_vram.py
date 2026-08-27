@@ -83,6 +83,12 @@ def measure(K: int, keep: int, batch: int, mode: str, ckpt_grad: bool,
     """
     from transformers import AutoModelForVision2Seq
 
+    # 每个时间步 cameras 张图 → 视觉主干实际要前向 K*cameras 次。
+    # ⚠️ 这一行是加 --cameras 时漏掉的：docstring 写了"内部按 K*cameras 帧处理"，
+    #    但变量没定义，于是每个配置都以 NameError 崩掉——而父进程把任何失败
+    #    都报成 OOM，整张决策表全是假的 OOM。两个 bug 叠在一起才没被立刻看穿。
+    n_img = K * cameras
+
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
 
