@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
+import re
 import os
 import sys
 from pathlib import Path
@@ -83,28 +85,36 @@ def real_depth(env, d: np.ndarray) -> np.ndarray:
         return near / (1.0 - d * (1.0 - near / far))
 
 
-def anchor_check(env) -> tuple[int, float]:
+def anchor_check(env, verbose: bool = True) -> tuple[int, float]:
     """
-    ⭐ 外部锚点。取若干已知世界坐标的 site，投影到像素并预测深度，
-    与渲染深度比对。返回 (参与比对的点数, 最大误差 cm)。
+    ⭐ 外部锚点 + **自诊断**。
 
-    只统计**可见**的点：预测深度比渲染深度**大**很多说明该点被挡住了，
-    那是遮挡不是模型错，剔掉；预测深度**小**很多才是真错（凭空穿到物体前面）。
+    取已知世界坐标的 site，用我们的相机模型算出它该落在哪个像素、深度该是多少，
+    与渲染深度比对。误差大的时候光报一个数没用，所以再做一件事：
+    把整张深度图反投影成点云，**找离真值最近的那个像素**。
+    预测像素与最近像素的关系直接指出错在哪一处——
+
+        最近点在 (H−1−v, u)      → 深度图的上下翻转判断反了
+        最近点在 (v, W−1−u)      → 左右
+        像素对得上但深度差恒定    → z 的符号或近远平面换算
+
+    只统计**可见**的点：预测深度比渲染深度大很多是被挡住了（遮挡不是模型错）。
     """
     sim = env.sim
-    # 渲染分辨率下建相机（不翻转：这里直接用原始深度图，像素坐标最直接）
     cam = read_camera(env, RES, RES, flipped=False)
     out = sim.render(camera_name=CAM, width=RES, height=RES, depth=True)
     d = out[1] if isinstance(out, tuple) else out
     if d.ndim == 3:
         d = d[..., 0]
-    dm = real_depth(env, d)
-    # ⚠️ MuJoCo 渲染出来的图像**上下是倒的**（OpenGL 原点在左下）。
-    #    robosuite 的 observation 里已经翻好，sim.render 拿到的是原始朝向。
-    dm = dm[::-1]
+    dm_raw = real_depth(env, d)
+    # MuJoCo/OpenGL 的原点在左下，渲染出来的图上下是倒的。robosuite 的
+    # observation 里已经翻好，sim.render 拿到的是原始朝向 —— 但这一条正是
+    # 现在要验的，所以两种都算，让数据自己说话。
+    variants = {"翻转 [::-1]": dm_raw[::-1], "不翻": dm_raw}
 
     names = [n for n in sim.model.site_names
              if any(t in n for t in ("grip", "eef", "hand"))][:8]
+    best_name, best = None, None
     errs = []
     for n in names:
         try:
@@ -114,12 +124,35 @@ def anchor_check(env) -> tuple[int, float]:
         uv, pred = cam.project(w.unsqueeze(0))
         u, v = float(uv[0, 0]), float(uv[0, 1])
         if not (1 <= u < RES - 1 and 1 <= v < RES - 1):
-            continue                                     # 不在画面里
-        rend = float(dm[int(round(v)), int(round(u))])
-        err = float(pred[0]) - rend
-        if err > 0.03:                                   # 被遮挡：预测点在渲染表面之后
             continue
-        errs.append(abs(err))
+        for vname, dm in variants.items():
+            rend = float(dm[int(round(v)), int(round(u))])
+            err = float(pred[0]) - rend
+            if vname == "翻转 [::-1]":
+                if err > 0.03:
+                    continue                              # 遮挡
+                errs.append(abs(err))
+            if best is None or abs(err) < best[0]:
+                best = (abs(err), n, vname, u, v, float(pred[0]), rend)
+        best_name = n
+
+    if verbose and best_name is not None:
+        # 全图最近点：不依赖任何翻转假设
+        for vname, dm in variants.items():
+            grid_v, grid_u = np.meshgrid(np.arange(RES), np.arange(RES), indexing="ij")
+            uvs = torch.tensor(np.stack([grid_u.ravel(), grid_v.ravel()], -1),
+                               dtype=torch.float64)
+            dd = torch.tensor(np.ascontiguousarray(dm).ravel(), dtype=torch.float64)
+            pc = cam.backproject(uvs, dd)
+            w = torch.tensor(np.array(sim.data.get_site_xpos(best_name)),
+                             dtype=torch.float64)
+            k = int(torch.argmin(torch.linalg.norm(pc - w, dim=-1)))
+            uvp, _ = cam.project(w.unsqueeze(0))
+            print(f"    [{vname}] site {best_name}: 预测像素 "
+                  f"(u={float(uvp[0,0]):.0f}, v={float(uvp[0,1]):.0f})，"
+                  f"点云最近像素 (u={k % RES}, v={k // RES})，"
+                  f"距离 {float(torch.linalg.norm(pc[k]-w))*100:.1f} cm")
+
     if not errs:
         return 0, float("nan")
     return len(errs), max(errs) * 100.0
@@ -137,66 +170,85 @@ def main() -> None:
     bmark = benchmark.get_benchmark_dict()[args.suite]()
     n = min(args.n_tasks, bmark.n_tasks)
 
-    ref, worst_err, n_pts = None, 0.0, 0
+    cams, worst_err, n_pts = {}, 0.0, 0
     for i in range(n):
         env = build_env(bmark.get_task(i))
         env.seed(0)
         env.reset()
-        cam = read_camera(env, IMG, IMG, flipped=True)
-        if ref is None:
-            ref = cam
-        else:
-            # 2. 跨任务一致性
-            dp = float(torch.abs(cam.pos - ref.pos).max())
-            dr = float(torch.abs(cam.rot - ref.rot).max())
-            df = abs(cam.fovy - ref.fovy)
-            if max(dp, dr, df) > 1e-6:
-                raise SystemExit(
-                    f"❌ task {i} 的 agentview 与 task 0 不同（Δpos={dp:.2e} "
-                    f"Δrot={dr:.2e} Δfovy={df:.2e}）。\n"
-                    "   相机不是常量，不能把参数写死成一份 —— "
-                    "metric_coords 要改成按 task 取参数。")
-        k, err = anchor_check(env)
+        cams[i] = read_camera(env, IMG, IMG, flipped=True)
+        k, err = anchor_check(env, verbose=(i == 0))
         n_pts += k
         worst_err = max(worst_err, 0.0 if np.isnan(err) else err)
         print(f"  task {i}: 锚点 {k} 个，最大误差 {err:.2f} cm")
         env.close()
 
-    assert ref is not None
-    print(f"\n✅ 跨 {n} 个任务 agentview 完全一致（可以常量化）")
+    # ⚠️ 实测：agentview **不是**跨任务常量。libero_10 的十个任务跨厨房/客厅/
+    #    书房多个场景，每个 BDDL 自己摆相机，实测 Δpos 达 0.65 m。
+    #    所以按 task 存一份，metric_coords 按 task_id 取。
+    #    反投影到**世界系**之后坐标仍跨任务可比 —— 这正是要反投影的理由之一。
+    ref = cams[0]
+    dp = max(float(torch.abs(c.pos - ref.pos).max()) for c in cams.values())
+    dr = max(float(torch.abs(c.rot - ref.rot).max()) for c in cams.values())
+    print(f"\n跨 {n} 个任务的 agentview 差异：Δpos 最大 {dp:.3f} m，Δrot 最大 {dr:.3f}")
+    print("  → 相机**按 task 存**（世界系坐标仍可比）" if dp > 1e-6
+          else "  → 相机跨任务一致，可以常量化")
+
     print(f"   fovy={ref.fovy:.4f}°  focal={ref.focal():.2f} px @ {IMG}²")
-    print(f"   pos={[round(float(x), 4) for x in ref.pos]}")
 
     # 3. 锚点判读
     print(f"\n=== 锚点验证（{n_pts} 个 site）===")
     if n_pts == 0:
-        print("  ⚠️ 没有可用锚点（site 名没匹配上或全被遮挡）。**反投影未经外部验证**，"
-              "\n     不要就这么去跑 G4：约定错了不会崩，只会得到一个镜像/偏移的世界。")
+        print("  ⚠️ 没有可用锚点。**反投影未经外部验证**，不要就这么去跑 G4。")
     elif worst_err <= args.tol_cm:
         print(f"  ✅ 最大误差 {worst_err:.2f} cm ≤ {args.tol_cm} cm，"
               "相机模型与 MuJoCo 约定一致。")
     else:
         print(f"  ❌ 最大误差 {worst_err:.2f} cm > {args.tol_cm} cm。"
-              "\n     按可能性排查：y 的符号、−z 朝向、翻转、内参用了 256 而非 224。"
+              "\n     看上面 task 0 那两行诊断：预测像素与点云最近像素的关系"
+              "\n     直接指出错在哪一处（上下翻转 / 左右 / z 的符号）。"
               "\n     **不要带着这个误差往下走**——它会整体污染 G4 的坐标。")
 
-    ref.to_json(args.out)
-    print(f"\n-> {args.out}")
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(
+        {str(i): {"fovy": c.fovy, "height": c.height, "width": c.width,
+                  "pos": c.pos.tolist(), "rot": c.rot.reshape(-1).tolist(),
+                  "flipped": c.flipped} for i, c in cams.items()}, indent=2))
+    print(f"\n-> {out}（按 task_id 索引）")
 
     # 4. 工作空间包围盒
+    if n_pts == 0 or worst_err > args.tol_cm:
+        print("\n（锚点未通过，跳过包围盒统计 —— 用一个错的相机算出来的包围盒"
+              "\n  会让人以为这一步做完了，比不算更糟）")
+        return
     files = sorted(glob.glob(f"{args.cache_dir}/*.npy"))
     if not files:
         print(f"\n（{args.cache_dir} 下无深度缓存，跳过包围盒统计）")
         return
-    xyz = []
-    for f in files[:20]:
+
+    # ⚠️ 每条 episode 要用**它自己那个 task 的相机**。缓存文件名形如
+    #    {suite}_t{task_id}_e{ep}.npy（depth_diag.py 写的）。
+    #    全用 task 0 的相机算，就是刚刚才发现的那个错的翻版。
+    xyz, skipped = [], 0
+    for f in files:
+        m = re.search(r"_t(\d+)_e\d+\.npy$", Path(f).name)
+        if m is None or int(m.group(1)) not in cams:
+            skipped += 1
+            continue
         a = np.load(f).astype(np.float32)[..., 1]         # 均值通道
         d = torch.from_numpy(a.reshape(a.shape[0], -1)).double()
-        xyz.append(ref.patch_xyz(d).reshape(-1, 3))
+        xyz.append(cams[int(m.group(1))].patch_xyz(d).reshape(-1, 3))
+    if not xyz:
+        print(f"\n（{len(files)} 个缓存文件都没有对应的相机参数 —— "
+              f"用 --n_tasks {bmark.n_tasks} 把全部任务都导出来）")
+        return
+    if skipped:
+        print(f"\n（跳过 {skipped} 条：其 task 未在本次 --n_tasks 范围内）")
+
     p = torch.cat(xyz)
     lo = torch.quantile(p, 0.01, dim=0)
     hi = torch.quantile(p, 0.99, dim=0)
-    print("\n=== 工作空间包围盒（p1–p99，米）===")
+    print("\n=== 工作空间包围盒（p1–p99，米，%d 条 episode）===" % len(xyz))
     for i, ax in enumerate("xyz"):
         print(f"  {ax}: [{float(lo[i]):+.3f}, {float(hi[i]):+.3f}]  "
               f"跨度 {float(hi[i]-lo[i]):.3f}")
