@@ -21,6 +21,10 @@
     export OPENVLA_ROOT=<openvla 路径>
     python scripts/check_wire.py --arms G1,G3,G4,M2
 
+权重默认用手上已有的 libero-spatial 微调版（挂点验证与权重是哪一份无关，
+省一次 15 GB 下载）。已经下过就加 `--offline` 完全走本地缓存；
+也可以 `--ckpt <本地目录>` 直接指路径。
+
 只做推理，不反传；显存与评测同量级（K=8 不压缩约 16.7 GB）。
 """
 
@@ -35,6 +39,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
+# ⚠️ 与 probe_vram / finetune_single 保持一致：国内直连 huggingface.co 会超时。
+#    这一行是新写脚本最容易漏的，漏了就是五次重试后报 ConnectTimeout。
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
+
 _ROOT = os.environ.get("OPENVLA_ROOT")
 if _ROOT is None:
     raise SystemExit("请先 export OPENVLA_ROOT=<openvla 仓库路径>")
@@ -47,7 +55,8 @@ from common.camera import Camera  # noqa: E402
 from pooling.wire import (WireConfig, assert_rope_active, set_batch,  # noqa: E402
                           unwire, wire)
 
-CKPT = "openvla/openvla-7b"
+# 挂点验证与权重是哪一份无关，用手上已有的即可，省一次 15 GB 下载。
+CKPT = os.environ.get("PROBE_CKPT", "openvla/openvla-7b-finetuned-libero-spatial")
 N_PATCH = 256
 
 
@@ -93,7 +102,14 @@ def main() -> None:
     ap.add_argument("--batch", type=int, default=1)
     ap.add_argument("--cache_dir", default="results/depth_cache")
     ap.add_argument("--camera", default="results/tables/camera_libero.json")
+    ap.add_argument("--ckpt", default=CKPT,
+                    help="HF 仓库名或**本地目录**。已经下过的话直接给本地路径最省事")
+    ap.add_argument("--offline", action="store_true",
+                    help="完全走本地缓存，不联网（权重已下过就用这个）")
     args = ap.parse_args()
+    if args.offline:
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
     assert torch.cuda.is_available(), "需要 GPU"
     dev, K, B = "cuda", args.K, args.batch
@@ -106,9 +122,10 @@ def main() -> None:
           f"包围盒 " + " ".join(f"{a}[{float(bbox[0][i]):+.2f},{float(bbox[1][i]):+.2f}]"
                                 for i, a in enumerate("xyz")))
 
-    processor = AutoProcessor.from_pretrained(CKPT, trust_remote_code=True)
+    print(f"权重：{args.ckpt}   HF_ENDPOINT={os.environ.get('HF_ENDPOINT')}")
+    processor = AutoProcessor.from_pretrained(args.ckpt, trust_remote_code=True)
     model = AutoModelForVision2Seq.from_pretrained(
-        CKPT, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True,
+        args.ckpt, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True,
         trust_remote_code=True, attn_implementation="flash_attention_2").to(dev).eval()
 
     prompt = ("In: What action should the robot take to pick up the black bowl?\nOut:")
