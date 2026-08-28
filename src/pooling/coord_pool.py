@@ -230,6 +230,7 @@ def coord_bin_pool(
     n_group: tuple[int, ...] = (),
     n_t: int | None = None,
     enforce_n: int | None = None,
+    valid: torch.Tensor | None = None,
 ) -> PoolOut:
     """
     把 (B, T, D) 的 token 按坐标分箱、箱内平均，压到 budget 个。
@@ -242,6 +243,11 @@ def coord_bin_pool(
     n_t                t 轴分几个箱。**必须显式给定**，理由见 `_resolve_bins`——
                        放任自由细化会让跨帧合并几乎不发生，主实验静默失去功效。
                        G3/G4/M2 必须取**同一个值**（它无量纲，可以）。
+    valid  (B, T) bool 哪些输入 token 参与池化。**补帧必须在这里屏蔽掉**
+                       （`docs/06` §4.1 纪律 2）：episode 开头的窗口把第 0 帧重复
+                       若干次，不屏蔽的话 K 份完全相同的内容落进 K 个不同的 t 箱，
+                       白占预算，还会把「跨帧合并率 ≥25%」那道防退化闸门撑高到失效。
+                       被屏蔽的 token 在 `assign` 里是 -1。
     enforce_n          若给定，只保留 patch 数最多的 enforce_n 个箱。
                        用来把各组的**有效** token 数拉到严格相等——分箱是离散的，
                        G2/G3/G4 各自能用满的槽数未必一样（见 __main__ 自测的打印），
@@ -274,17 +280,24 @@ def coord_bin_pool(
     used = torch.zeros(b, dtype=torch.long, device=device)
 
     for i in range(b):
+        # 只有 valid 的 token 参与分箱与池化；其余在 assign 里保持 -1
+        vi = (torch.arange(t, device=device) if valid is None
+              else valid[i].nonzero(as_tuple=True)[0])
+        if vi.numel() == 0:
+            continue
+        qi, fi, ci = q[i][vi], feat[i][vi], coord[i][vi]
+        tv = vi.numel()
         with torch.no_grad():
             # extent = 各轴的物理跨度，让体素在物理空间里是立方体（见 _resolve_bins）
-            g = _resolve_bins(q[i], budget, group_axes, n_group, n_t,
+            g = _resolve_bins(qi, budget, group_axes, n_group, n_t,
                               extent=span)
             gs = torch.tensor(g, device=device, dtype=q.dtype)
             gmax = torch.tensor([x - 1 for x in g], device=device)
-            idx = (q[i] * gs).floor().long().clamp(min=torch.zeros_like(gmax), max=gmax)
-            keys, inv = torch.unique(idx, dim=0, return_inverse=True)   # (M, C), (T,)
+            idx = (qi * gs).floor().long().clamp(min=torch.zeros_like(gmax), max=gmax)
+            keys, inv = torch.unique(idx, dim=0, return_inverse=True)   # (M, C), (Tv,)
             m = keys.shape[0]
             cnt = torch.zeros(m, device=device).index_add_(
-                0, inv, torch.ones(t, device=device))
+                0, inv, torch.ones(tv, device=device))
 
             # 槽位不足时保留 patch 数最多的箱；并列按箱下标，保证确定性
             if m > n_out:
@@ -298,9 +311,9 @@ def coord_bin_pool(
 
         # 均值池化。scatter 走 fp32：bf16 的 7 位有效位在累加几十个 patch 时会丢精度
         acc_f = feat.new_zeros(m, d, dtype=torch.float32).index_add_(
-            0, inv, feat[i].float())
+            0, inv, fi.float())
         acc_c = coord.new_zeros(m, c, dtype=torch.float32).index_add_(
-            0, inv, coord[i].float())
+            0, inv, ci.float())
         mean_f = acc_f / cnt.unsqueeze(-1)
         mean_c = acc_c / cnt.unsqueeze(-1)
 
@@ -322,7 +335,7 @@ def coord_bin_pool(
 
         slot = torch.full((m,), -1, dtype=torch.long, device=device)
         slot[kept] = torch.arange(k, device=device)
-        out_a[i] = slot[inv]
+        out_a[i, vi] = slot[inv]
 
     return PoolOut(out_f, out_c, out_m, out_s, out_a, used)
 
