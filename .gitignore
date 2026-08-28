@@ -31,3 +31,11 @@ checkpoints/
 # 提交看起来成功，文件却从没进过仓库。本项目栽过一次：kframe.py 写完、
 # 自检跑过、docs 里引用了它，但机器上 git pull 下来根本没有这个文件。
 /data/
+
+# 训练机上会冒出来的杂物
+MUJOCO_LOG.TXT
+*.whl
+.ipynb_checkpoints/
+# ⚠️ 上面这条附个原因：用 Jupyter 打开仓库里的脚本，它会存副本、也可能改写原文件。
+#    本项目已经因此丢过一次内容 —— finetune_kframe.py 被截断成 0 字节，
+#    `git diff` 显示 259 行全删。**别用 Jupyter 编辑 scripts/ 下的文件。**
