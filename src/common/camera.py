@@ -19,7 +19,7 @@ G4 与 M2 的池化坐标 `(t, x, y, z)` 全靠这一步。在它补上之前，
    中心在 `r*14 + 6.5`。差半个 patch 在度量空间里是几毫米到几厘米，
    刚好落在"分箱分不分得开"的量级上。
 
-`python src/common/camera.py` 跑 6 项自检（纯 torch，不需要仿真器）。
+`python src/common/camera.py` 跑 7 项自检（纯 torch，不需要仿真器）。
 真机上还要用 `scripts/dump_camera.py` 与 robosuite 自己的
 `transform_from_pixels_to_world` 对齐——**自洽不等于对**，
 本项目已经栽过一次"子进程知道答案、父进程把它丢了"。
@@ -90,13 +90,17 @@ class Camera:
         y = -(v - self.height / 2.0) * depth / f        # 约定 1：图像 v 向下，相机 +y 向上
         z = -depth                                      # 约定 1：相机看向 −z
         cam = torch.stack([x, y, z], dim=-1)            # (..., 3)
-        rot = self.rot.to(cam.dtype)
-        return cam @ rot.transpose(-1, -2) + self.pos.to(cam.dtype)
+        # ⚠️ 参数跟着**输入**走。Camera 从 json 读出来是 CPU 张量，而训练时
+        #    depth 在 GPU 上——不 `.to` 就是 "Expected all tensors to be on the
+        #    same device"。会报错，不会静默，但每次接线都要撞一遍。
+        rot = self.rot.to(device=cam.device, dtype=cam.dtype)
+        pos = self.pos.to(device=cam.device, dtype=cam.dtype)
+        return cam @ rot.transpose(-1, -2) + pos
 
     def project(self, world: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """反投影的逆。返回 (uv, depth)。仅用于自检与排错。"""
-        rot = self.rot.to(world.dtype)
-        cam = (world - self.pos.to(world.dtype)) @ rot
+        rot = self.rot.to(device=world.device, dtype=world.dtype)
+        cam = (world - self.pos.to(device=world.device, dtype=world.dtype)) @ rot
         f = self.focal()
         depth = -cam[..., 2]
         u = cam[..., 0] * f / depth + self.width / 2.0
@@ -118,6 +122,11 @@ class Camera:
             uu = (self.width - 1) - uu
             vv = (self.height - 1) - vv
         return torch.stack([uu.reshape(-1), vv.reshape(-1)], dim=-1)
+
+    def to(self, device) -> "Camera":
+        """搬到指定设备。训练循环里可以一次搬好，省得每步都 `.to`。"""
+        return Camera(self.fovy, self.height, self.width,
+                      self.pos.to(device), self.rot.to(device), self.flipped)
 
     def patch_xyz(self, depth: torch.Tensor) -> torch.Tensor:
         """
@@ -143,7 +152,7 @@ def _selftest() -> None:
     ctr = torch.tensor([[IMG / 2.0, IMG / 2.0]], dtype=torch.float64)
     p = eye.backproject(ctr, torch.tensor([1.5], dtype=torch.float64))
     assert torch.allclose(p, torch.tensor([[0.0, 0.0, -1.5]], dtype=torch.float64), atol=1e-9), p
-    print("✅ 1/6 图像中心 + 深度 1.5 m → 相机系 (0,0,−1.5)：看向 −z")
+    print("✅ 1/7 图像中心 + 深度 1.5 m → 相机系 (0,0,−1.5)：看向 −z")
 
     # 2. 往返
     uv = torch.rand(64, 2, dtype=torch.float64) * IMG
@@ -151,7 +160,7 @@ def _selftest() -> None:
     w = eye.backproject(uv, d)
     uv2, d2 = eye.project(w)
     assert torch.allclose(uv, uv2, atol=1e-8) and torch.allclose(d, d2, atol=1e-8)
-    print("✅ 2/6 project ∘ backproject = 恒等（随机 64 点，误差 < 1e-8）")
+    print("✅ 2/7 project ∘ backproject = 恒等（随机 64 点，误差 < 1e-8）")
 
     # 3. 位姿不变：换个相机位姿，往返仍成立，且世界点随之刚体变换
     cam2 = Camera(fovy=45.0, height=IMG, width=IMG,
@@ -162,20 +171,20 @@ def _selftest() -> None:
     assert torch.allclose(uv, uv3, atol=1e-8) and torch.allclose(d, d3, atol=1e-8)
     expect = w @ cam2.rot.T + cam2.pos
     assert torch.allclose(w2, expect, atol=1e-9)
-    print("✅ 3/6 任意位姿下往返成立，且世界点 = R·相机点 + t")
+    print("✅ 3/7 任意位姿下往返成立，且世界点 = R·相机点 + t")
 
     # 4. 相似三角形：深度翻倍，横向偏移翻倍
     off = torch.tensor([[IMG / 2.0 + 40.0, IMG / 2.0]], dtype=torch.float64)
     a = eye.backproject(off, torch.tensor([1.0], dtype=torch.float64))
     b = eye.backproject(off, torch.tensor([2.0], dtype=torch.float64))
     assert abs(b[0, 0] - 2 * a[0, 0]) < 1e-9 and a[0, 0] > 0
-    print("✅ 4/6 深度翻倍 → 横向偏移翻倍（相似三角形），且 u 增大对应 +x")
+    print("✅ 4/7 深度翻倍 → 横向偏移翻倍（相似三角形），且 u 增大对应 +x")
 
     # 5. v 向下 = 世界 −y（约定 1 的回归测试；写成 + 号就会挂在这里）
     down = eye.backproject(torch.tensor([[IMG / 2.0, IMG / 2.0 + 40.0]], dtype=torch.float64),
                            torch.tensor([1.0], dtype=torch.float64))
     assert down[0, 1] < 0, "图像下方必须映到相机系 −y；这一条挂了说明 y 的符号写反了"
-    print("✅ 5/6 图像下方 → 相机系 −y（符号写反会得到一个上下镜像的世界）")
+    print("✅ 5/7 图像下方 → 相机系 −y（符号写反会得到一个上下镜像的世界）")
 
     # 6. 翻转：flipped 版的 patch (0,0) 必须等于未翻转版的 patch (15,15)
     fl = Camera(fovy=45.0, height=IMG, width=IMG, pos=eye.pos, rot=eye.rot, flipped=True)
@@ -184,7 +193,13 @@ def _selftest() -> None:
     b = eye.patch_xyz(d256).reshape(GRID, GRID, 3)
     assert torch.allclose(a[0, 0], b[GRID - 1, GRID - 1], atol=1e-9)
     assert torch.allclose(a[3, 5], b[GRID - 1 - 3, GRID - 1 - 5], atol=1e-9)
-    print("✅ 6/6 flipped=True 时 patch (r,c) ≡ 未翻转的 (15−r, 15−c)")
+    print("✅ 6/7 flipped=True 时 patch (r,c) ≡ 未翻转的 (15−r, 15−c)")
+
+    d = torch.rand(2, GRID * GRID, dtype=torch.float64)
+    out = eye.patch_xyz(d)
+    assert out.device == d.device and out.dtype == d.dtype
+    assert eye.to("cpu").pos.device.type == "cpu"
+    print("✅ 7/7 反投影的输出设备/精度跟随输入（相机参数常驻 CPU，深度在 GPU）")
 
     print("\n⚠️ 以上全是**自洽性**检验：坐标系约定与 MuJoCo 是否一致，"
           "\n   必须在真机上用 scripts/dump_camera.py 与 robosuite 自己的"

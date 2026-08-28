@@ -154,8 +154,13 @@ def _pool_and_coords(emb: torch.Tensor, cfg: WireConfig, bt: _Batch):
     if cfg.metric:
         if not bt.cameras:
             raise RuntimeError(f"{cfg.arm} 需要每个样本的相机，set_batch 里没给。")
+        # ⚠️ **坐标必须留在 fp32**，不能跟着 emb 转成 bf16。
+        #    bf16 只有 8 位尾数，在 ±2 m 量程上相邻可表示值差约 1 cm ——
+        #    正好把 G4 要分辨的尺度磨掉，而且**不报任何错**：
+        #    分箱照跑、训练照收敛，只是度量坐标退化成了厘米级的量化网格。
+        #    特征走 bf16，坐标走 fp32，两者本来就不必同精度。
         pc = torch.cat([metric_coords(bt.depth[i:i + 1].to(dev), k, bt.cameras[i])
-                        for i in range(b)], dim=0).to(emb.dtype)
+                        for i in range(b)], dim=0).float()
         lo, hi = metric_extent(k, cfg.bbox.to(dev), device=dev)
     else:
         pc, (lo, hi) = gc, grid_extent(k, device=dev)
