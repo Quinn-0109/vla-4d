@@ -128,7 +128,16 @@ def _cloud(env, cam_name: str, flip: bool, n: int = 4000) -> torch.Tensor | None
     return cam.backproject(uv[idx], dd[idx])
 
 
-def consistency_check(env) -> dict:
+def _nn_p10(b: torch.Tensor, a: torch.Tensor) -> tuple[float, float]:
+    """b 中每点到 a 的最近邻距离的 (p10, 中位数)，单位 cm。分块算，免得占几 GB。"""
+    mins = []
+    for i in range(0, b.shape[0], 2000):
+        mins.append(torch.cdist(b[i:i + 2000], a).min(dim=1).values)
+    d = torch.cat(mins)
+    return float(torch.quantile(d, 0.10)) * 100.0, float(d.median()) * 100.0
+
+
+def consistency_check(env, n: int = 4000) -> dict:
     """
     ⭐ **主判据：两台相机的点云必须在世界系里重合。**
 
@@ -142,23 +151,25 @@ def consistency_check(env) -> dict:
     返回 {翻转与否: (共视部分 p10, 中位数)}，单位 cm。判据取 **p10**：
     中位数会被视角重叠不足污染（B 看得到而 A 看不到的表面本来就配不上），
     低分位才是"确实共视的那部分对得有多准"。
+
+    ⚠️ 另带一个**密度检验**：p10 有个采样下限——两次独立采样之间的最近邻间距
+    本身就是厘米量级，分不清"准到毫米"和"差一厘米的系统偏移"。
+    点数翻四倍后 p10 应按 n^(-1/3) ≈ 0.63× 缩小；**几乎不动就说明是系统偏移**。
     """
-    alt = next((c for c in ALT_CAMS
-                if _try_cam(env, c)), None)
+    alt = next((c for c in ALT_CAMS if _try_cam(env, c)), None)
     if alt is None:
         return {}
     res = {}
     for flip in (True, False):
-        a = _cloud(env, CAM, flip)
-        b = _cloud(env, alt, flip)
+        a, b = _cloud(env, CAM, flip, n), _cloud(env, alt, flip, n)
         if a is None or b is None:
             continue
-        d = torch.cdist(b, a).min(dim=1).values
-        # ⚠️ 只看中位数会被**视角重叠不足**污染：B 看得到而 A 看不到的表面
-        #    （背面、被挡住的地面）本来就配不上，与模型对错无关。
-        #    低分位才是"确实共视的那部分对得有多准"。两个都报。
-        res[flip] = (float(torch.quantile(d, 0.10)) * 100.0,
-                     float(d.median()) * 100.0)
+        res[flip] = _nn_p10(b, a)
+    if res:
+        best = min(res, key=lambda f: res[f][0])
+        a4, b4 = _cloud(env, CAM, best, n * 4), _cloud(env, alt, best, n * 4)
+        if a4 is not None and b4 is not None:
+            res["dense"] = (_nn_p10(b4, a4)[0], res[best][0], n, n * 4)
     return {"alt": alt, **res}
 
 
@@ -269,6 +280,18 @@ def main() -> None:
         if ratio < 3:
             print(f"  ⚠️ 两种翻转只差 {ratio:.1f} 倍，判别力不足 —— "
                   "这个场景可能过于对称，换个 task 复核。")
+        if "dense" in cons:
+            p_dense, p_sparse, n0, n1 = cons["dense"]
+            shrink = p_dense / max(p_sparse, 1e-9)
+            print(f"\n  密度检验：点数 {n0} → {n1}，p10 从 {p_sparse:.2f} 降到 "
+                  f"{p_dense:.2f} cm（{shrink:.2f}×，理论 0.63×）")
+            if shrink < 0.80:
+                print("    ✅ 随密度缩小 —— p10 是**采样下限**，不是系统偏移。"
+                      "反投影的真实精度好于这个数。")
+            else:
+                print(f"    ⚠️ 几乎不动 —— 存在约 {p_dense:.1f} cm 的**系统偏移**。"
+                      "\n       量级上像 patch 中心取整或内外参分辨率；"
+                      "\n       小于体素箱宽(~30 cm)时不致命，但要记进文档。")
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
