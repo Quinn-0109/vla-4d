@@ -19,7 +19,7 @@ G4 与 M2 的池化坐标 `(t, x, y, z)` 全靠这一步。在它补上之前，
    中心在 `r*14 + 6.5`。差半个 patch 在度量空间里是几毫米到几厘米，
    刚好落在"分箱分不分得开"的量级上。
 
-`python -m common.camera` 跑 6 项自检（纯 torch，不需要仿真器）。
+`python src/common/camera.py` 跑 6 项自检（纯 torch，不需要仿真器）。
 真机上还要用 `scripts/dump_camera.py` 与 robosuite 自己的
 `transform_from_pixels_to_world` 对齐——**自洽不等于对**，
 本项目已经栽过一次"子进程知道答案、父进程把它丢了"。
@@ -190,6 +190,15 @@ def _selftest() -> None:
           "\n   必须在真机上用 scripts/dump_camera.py 与 robosuite 自己的"
           "\n   transform_from_pixels_to_world 对齐才算数。")
 
+
+if __name__ == "__main__" and __package__ in (None, ""):
+    # 直接 `python src/.../x.py` 跑自检时把 src/ 放上 sys.path。
+    # 各脚本用的都是 `from common.x import ...` 这种以 src/ 为根的写法
+    # （scripts/*.py 里那句 sys.path.insert(..., "src") 就是干这个的），
+    # 少了这几行就只有 rope4d 一个模块得换个跑法，是纯粹的绊脚石。
+    import sys as _sys
+    from pathlib import Path as _Path
+    _sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
 
 if __name__ == "__main__":
     _selftest()

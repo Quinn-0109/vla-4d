@@ -235,8 +235,17 @@ def assemble(
 
 
 # ---------------------------------------------------------------- 自检
+if __name__ == "__main__" and __package__ in (None, ""):
+    # 直接 `python src/.../x.py` 跑自检时把 src/ 放上 sys.path。
+    # 各脚本用的都是 `from common.x import ...` 这种以 src/ 为根的写法
+    # （scripts/*.py 里那句 sys.path.insert(..., "src") 就是干这个的），
+    # 少了这几行就只有 rope4d 一个模块得换个跑法，是纯粹的绊脚石。
+    import sys as _sys
+    from pathlib import Path as _Path
+    _sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
+
 if __name__ == "__main__":
-    from src.pooling.coord_pool import (GRID, N_T_DEFAULT, coord_bin_pool,
+    from pooling.coord_pool import (GRID, N_T_DEFAULT, coord_bin_pool,
                                         grid_coords, grid_extent, metric_coords,
                                         metric_extent)
 
@@ -257,8 +266,14 @@ if __name__ == "__main__":
     gc = grid_coords(K).unsqueeze(0).repeat(B, 1, 1)
     glo, ghi = grid_extent(K)
     depth = 1.2 + 0.2 * torch.sin(torch.linspace(0, 9, T)).reshape(1, K, -1).repeat(B, 1, 1)
-    mc = metric_coords(depth, K)
-    bbox = torch.tensor([[0.0, 0.0, 0.9], [float(GRID), float(GRID), 1.4]])
+    # 合成相机；真机参数由 scripts/dump_camera.py 导出并用仿真器真值验证
+    from common.camera import Camera as _Cam
+    _cam = _Cam(fovy=45.0, height=224, width=224,
+                pos=torch.zeros(3, dtype=torch.float64),
+                rot=torch.eye(3, dtype=torch.float64), flipped=True)
+    mc = metric_coords(depth, K, _cam)
+    bbox = torch.stack([mc[..., 1:].reshape(-1, 3).min(dim=0).values,
+                        mc[..., 1:].reshape(-1, 3).max(dim=0).values])
     mlo, mhi = metric_extent(K, bbox)
 
     g4 = coord_bin_pool(feat, mc, N, mlo, mhi, n_t=N_T_DEFAULT)

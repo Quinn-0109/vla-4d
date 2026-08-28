@@ -350,6 +350,15 @@ def assert_cross_frame_merge(
 
 
 # ---------------------------------------------------------------- 自检
+if __name__ == "__main__" and __package__ in (None, ""):
+    # 直接 `python src/.../x.py` 跑自检时把 src/ 放上 sys.path。
+    # 各脚本用的都是 `from common.x import ...` 这种以 src/ 为根的写法
+    # （scripts/*.py 里那句 sys.path.insert(..., "src") 就是干这个的），
+    # 少了这几行就只有 rope4d 一个模块得换个跑法，是纯粹的绊脚石。
+    import sys as _sys
+    from pathlib import Path as _Path
+    _sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
+
 if __name__ == "__main__":
     torch.manual_seed(0)
     K, N, D = 8, 256, 64
