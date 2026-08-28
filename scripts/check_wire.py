@@ -151,15 +151,30 @@ def main() -> None:
         finally:
             unwire(model, st)
 
+    # 参照物：**完全不接线**的原模型，K=1、同样的随机图。
+    # loss 的绝对值单看没有意义——随机噪声图本来就会给出很高的 loss。
+    # 有了这个数才分得清「垃圾输入」和「我们的 RoPE 把模型打乱了」。
+    with torch.no_grad():
+        ref_loss = float(model(
+            input_ids=ids, attention_mask=att, labels=labels,
+            pixel_values=torch.randn(B, 6, 224, 224, dtype=torch.bfloat16,
+                                     device=dev)).loss)
+    print(f"\n[参照] 原模型未接线，K=1，同样的随机图 → loss {ref_loss:.4f}"
+          f"   （均匀分布约 {float(np.log(32064)):.1f}）")
+
     res = {}
     for arm in args.arms.split(","):
         arm = arm.strip()
         lg, loss, calls = run(arm, depth)
         res[arm] = lg
         n_layers = len(model.language_model.model.layers)
-        print(f"\n[{arm}] 序列 {lg.shape[1]}  loss {loss:.4f}  "
-              f"rotary_emb 调用 {calls}/{n_layers} 层")
+        rel = loss / ref_loss if ref_loss else float("nan")
+        print(f"\n[{arm}] 序列 {lg.shape[1]}  loss {loss:.4f}"
+              f"（参照的 {rel:.2f}×）  rotary_emb 调用 {calls}/{n_layers} 层")
         assert np.isfinite(loss), f"{arm} 的 loss 不是有限数"
+        if rel > 2.0:
+            print(f"    ⚠️ 比参照高一倍以上。随机图下不必然是错，但值得记一笔："
+                  "\n       真数据上若仍然如此，先怀疑 RoPE 的通道划分或归一化。")
 
     print(f"\n{'='*60}\n=== C: 改深度 → G4 变、G3 不变 ===")
     dep2 = depth + 0.15                      # 整体推远 15 cm
