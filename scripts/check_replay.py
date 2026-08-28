@@ -101,6 +101,34 @@ def find_task(bmark, lang: str) -> int | None:
     return None
 
 
+def demo_init_states(task, n: int = 60):
+    """
+    从 LIBERO 的**演示** HDF5 里取每条 demo 的初始状态。
+
+    ⚠️ 这是与 `get_task_init_states()` **不同的一批**：后者给的是**评测用**的
+    50 个初始摆放，而 modified_libero_rlds 是从**演示数据**转换来的。
+    两者不是同一批 —— 拿评测初始状态去对演示画面，50 个候选里一个对的都没有，
+    "最像的那个"只是噪声，误差就停在"不同摆放"的量级上（实测 10.2）。
+    """
+    try:
+        import h5py
+
+        from libero.libero import get_libero_path
+        root = Path(get_libero_path("datasets"))
+    except Exception:
+        return []
+    hits = list(root.rglob(f"{task.name}_demo.hdf5")) or list(
+        root.rglob(f"{task.name}*.hdf5"))
+    if not hits:
+        return []
+    out = []
+    with h5py.File(hits[0], "r") as f:
+        for k in list(f["data"].keys())[:n]:
+            st = f["data"][k]["states"]
+            out.append(np.asarray(st[0]))
+    return out
+
+
 def match_init(env, bmark, tid: int, ref: np.ndarray, n_try: int):
     """
     逐个试初始状态，找与 RLDS 第 0 帧最像的那个；同时定下翻转与否。
@@ -111,17 +139,22 @@ def match_init(env, bmark, tid: int, ref: np.ndarray, n_try: int):
       · best 10.2 / second 10.4 → 所有候选都差不多，初始状态根本不是区分因素，
                                   问题在渲染设置（而"最像的那个"只是噪声）
     """
-    states = bmark.get_task_init_states(tid)
+    evals = list(bmark.get_task_init_states(tid))[:n_try]
+    demos = demo_init_states(bmark.get_task(tid), n_try)
+    cands = [("eval", j, st) for j, st in enumerate(evals)] + \
+            [("demo", j, st) for j, st in enumerate(demos)]
     scores = []
-    for j in range(min(n_try, len(states))):
+    for src, j, st in cands:
         env.reset()
-        obs = env.set_init_state(states[j])
+        obs = env.set_init_state(st)
         scores.append((diff(rgb_of(obs, True), ref),
-                       diff(rgb_of(obs, False), ref), j))
-    flipped = sorted(s[0] for s in scores)
-    best_row = min(scores, key=lambda x: x[0])
-    return (best_row[2], True, flipped[0], flipped[1],
-            min(s[1] for s in scores))
+                       diff(rgb_of(obs, False), ref), src, j, st))
+    flipped = sorted(x[0] for x in scores)
+    best = min(scores, key=lambda x: x[0])
+    return {"src": best[2], "idx": best[3], "state": best[4],
+            "best": flipped[0], "second": flipped[1],
+            "noflip": min(x[1] for x in scores),
+            "n_eval": len(evals), "n_demo": len(demos)}
 
 
 def diff_profile(a: np.ndarray, b: np.ndarray) -> dict:
@@ -169,7 +202,7 @@ def main() -> None:
     eps = load_episodes(args.data_root, name, args.n_episodes)
     bmark = benchmark.get_benchmark_dict()[args.suite]()
 
-    worst_init, worst_end, n_ok = 0.0, 0.0, 0
+    worst_init, worst_end, n_ok = 0.0, None, 0
     for e_i, ep in enumerate(eps):
         tid = find_task(bmark, ep["lang"])
         if tid is None:
@@ -177,15 +210,20 @@ def main() -> None:
             continue
         env = build_env(bmark.get_task(tid))
         env.seed(0)
-        j, flip, d0, d1, d_noflip = match_init(
-            env, bmark, tid, ep["images"][0], args.n_init_try)
+        m = match_init(env, bmark, tid, ep["images"][0], args.n_init_try)
+        j, flip, d0, d1, d_noflip = m["idx"], True, m["best"], m["second"], m["noflip"]
         print(f"\n  [{e_i}] task {tid}  RLDS 图像 {ep['images'].shape[1:]}  "
-              f"init {j}  第0帧误差 {d0:.2f}")
+              f"候选 {m['n_eval']} eval + {m['n_demo']} demo")
+        print(f"       最像的是 **{m['src']}** 的第 {j} 个  第0帧误差 {d0:.2f}")
         print(f"       次好的候选 {d1:.2f}（差 {d1 - d0:+.2f}）   "
               f"不翻转的最好 {d_noflip:.2f}")
+        if m["n_demo"] == 0:
+            print("       ⚠️ 没找到演示 HDF5 —— 候选里只有**评测**初始状态，"
+                  "\n          而 RLDS 是从**演示**转换来的，两者不是同一批。"
+                  "\n          下载 LIBERO 演示数据后重跑，这一条才有意义。")
 
         env.reset()
-        obs = env.set_init_state(bmark.get_task_init_states(tid)[j])
+        obs = env.set_init_state(m["state"])
         prof = diff_profile(rgb_of(obs, flip), ep["images"][0])
         print(f"       误差分布 p50={prof['p50']:.1f} p95={prof['p95']:.1f} "
               f"max={prof['max']:.0f}  最大 10% 的像素占总误差 "
@@ -208,7 +246,7 @@ def main() -> None:
 
         # 重放：RLDS 的动作直接喂回去
         env.reset()
-        obs = env.set_init_state(bmark.get_task_init_states(tid)[j])
+        obs = env.set_init_state(m["state"])
         T = min(len(ep["actions"]), ep["images"].shape[0])
         curve = []
         for t in range(T):
@@ -219,17 +257,24 @@ def main() -> None:
         env.close()
         print("       " + "  ".join(f"t={t}:{d:.1f}" for t, d in curve))
         end = curve[-1][1]
-        worst_init, worst_end = max(worst_init, d0), max(worst_end, end)
+        worst_init = max(worst_init, d0)
+        worst_end = end if worst_end is None else max(worst_end, end)
         n_ok += end <= args.tol
 
     print(f"\n{'=' * 60}\n=== 判读 ===")
     print(f"  {n_ok}/{len(eps)} 条 episode 全程误差 ≤ {args.tol}")
-    print(f"  最差的第 0 帧误差 {worst_init:.2f}，最差的末帧误差 {worst_end:.2f}")
+    # ⚠️ 末帧误差要区分「测出来是 0」和「压根没测到」。初版两者都印 0.00，
+    #    读起来像"末帧完美"，实际是所有 episode 都卡在第 0 帧 continue 掉了。
+    end_txt = "未测（都卡在第 0 帧）" if worst_end is None else f"{worst_end:.2f}"
+    print(f"  最差的第 0 帧误差 {worst_init:.2f}，最差的末帧误差 {end_txt}")
     if n_ok == len(eps) and worst_end <= args.tol:
         print("  ✅ 回放能复现训练数据，可以给训练集缓存深度，G4/M2 解锁。")
     elif worst_init > args.tol:
         print("  ❌ **第 0 帧就对不上**，问题在初始状态或渲染设置，不是发散。"
-              "\n     先查：RLDS 的图像分辨率、相机名、是否已翻转。")
+              "\n     按上面每条 episode 的三行诊断判：次好只差 <1 = 所有候选都不对；"
+              "\n     误差集中 = 物体位置不同；误差均匀 = 渲染/编码设置不同。"
+              "\n     若候选里 demo 数为 0，先把 LIBERO 演示数据下下来再说 ——"
+              "\n     RLDS 是从演示转换来的，评测初始状态是另一批。")
     else:
         print("  ❌ **随时间发散**：初始状态对得上，重放却越走越远。"
               "\n     多半是控制器设置不同（RLDS 生成时的 controller config）。"
