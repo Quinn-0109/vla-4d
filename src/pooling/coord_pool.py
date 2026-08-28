@@ -64,22 +64,31 @@ def grid_coords(k: int, grid: int = GRID, device=None) -> torch.Tensor:
     return torch.stack([tt, hh, ww], dim=-1).reshape(-1, 3)
 
 
-def metric_coords(depth: torch.Tensor, k: int, grid: int = GRID) -> torch.Tensor:
+def metric_coords(depth: torch.Tensor, k: int, camera, grid: int = GRID) -> torch.Tensor:
     """
-    (t, x, y, z) 度量坐标，(B, k*grid*grid, 4)。G4/M2 的池化侧坐标。
+    (t, x, y, z) **世界系**度量坐标，(B, k*grid*grid, 4)。G4/M2 的池化侧坐标。
 
     `depth` 是 patch 级深度 (B, k, grid*grid)，由仿真器回放离线缓存
     （docs/06 §2.4：只存 256 个值/帧，不是全分辨率深度图）。
+    `camera` 是 `common.camera.Camera`，由 `scripts/dump_camera.py` 导出并
+    **用仿真器真值验证过**的常量参数。
 
-    ⚠️ 这里给的是**占位实现**：真正的反投影需要相机内外参，把像素射线按深度
-       推到世界系。LIBERO 的相机是固定的，内外参可从 robosuite 取出后常量化。
-       接口先定死，免得下游代码等它。
+    ⚠️ `camera` 是**必填**的。早先这里是个占位实现，返回 `(t, h, w, z)`——
+    x/y 还是图像网格坐标。那样的"G4"只是一个带深度通道的 G3，
+    **而它不会报任何错**：分箱照跑、训练照收敛、对照表照填。
+    所以宁可让调用方多传一个参数，也不给一个能静默降级的默认值。
     """
+    if camera is None:
+        raise ValueError(
+            "metric_coords 需要相机参数才能做反投影。"
+            "先跑 scripts/dump_camera.py 导出，再 Camera.from_json(...) 传进来。"
+            "缺了它就只能得到图像网格坐标，那是 G3 不是 G4。")
     b = depth.shape[0]
-    base = grid_coords(k, grid, device=depth.device)                 # (T, 3)
-    out = base.unsqueeze(0).repeat(b, 1, 1)                          # (B, T, 3) = (t,h,w)
-    z = depth.reshape(b, -1, 1)
-    return torch.cat([out, z], dim=-1)                               # (B, T, 4) 占位: (t,h,w,z)
+    d = depth.reshape(b, k, grid * grid)
+    xyz = camera.patch_xyz(d).to(depth.dtype)                        # (B, k, 256, 3)
+    t = torch.arange(k, device=depth.device, dtype=depth.dtype)
+    t = t.view(1, k, 1, 1).expand(b, k, grid * grid, 1)
+    return torch.cat([t, xyz], dim=-1).reshape(b, -1, 4)             # (B, T, 4) = (t,x,y,z)
 
 
 # ---------------------------------------------------------------- 分箱规则
@@ -355,8 +364,18 @@ if __name__ == "__main__":
     #    **下面 G4 的槽位利用率与跨帧占比都不可当作预测**——
     #    真值深度缓存好（docs/06 §4.2）之后必须重测一遍。
     depth = 1.2 + 0.2 * torch.sin(torch.linspace(0, 9, T)).reshape(1, K, -1).repeat(2, 1, 1)
-    mc = metric_coords(depth, K)
-    bbox = torch.tensor([[0.0, 0.0, 0.9], [float(GRID), float(GRID), 1.4]])
+    # 自检用一台合成相机（45° 视场、原点、看向 −z）。真机上的参数由
+    # scripts/dump_camera.py 导出并用仿真器真值验证，从 json 读。
+    from common.camera import Camera as _Cam
+    cam = _Cam(fovy=45.0, height=224, width=224,
+               pos=torch.zeros(3, dtype=torch.float64),
+               rot=torch.eye(3, dtype=torch.float64), flipped=True)
+    mc = metric_coords(depth, K, cam)
+    # 包围盒同样由数据本身定，免得自检里出现一个凭空的常量。
+    # 真机上这个 bbox 来自 dump_camera.py 的 p1–p99 统计。
+    lo3 = mc[..., 1:].reshape(-1, 3).min(dim=0).values
+    hi3 = mc[..., 1:].reshape(-1, 3).max(dim=0).values
+    bbox = torch.stack([lo3, hi3])
     mlo, mhi = metric_extent(K, bbox)
 
     print(f"输入 {T} token（K={K} × {GRID}×{GRID}），预算 N={N}\n")
@@ -444,7 +463,9 @@ if __name__ == "__main__":
   ② G4 的跨帧占比随 n_t 上升掉得比 G3 快。同样先归因于合成深度
      （z 跨帧恒定，(x,y,z) 几乎没有时间结构），真值深度下重看。
 
-下一步（docs/06 §4.2）：把 metric_coords 的占位实现换成真正的反投影，
-用 robosuite 的相机内外参 + 回放缓存的 patch 级深度。接口已经定死，不用改调用方。
+✅ metric_coords 已换成真正的反投影（common/camera.py），x/y 是世界系坐标而非
+图像网格。相机参数须由 scripts/dump_camera.py 导出——那个脚本会用仿真器
+自己的 site 世界坐标做锚点验证，因为坐标系约定错了不会崩，只会得到一个
+镜像或偏移的世界。
 """)
     print("全部通过。")
