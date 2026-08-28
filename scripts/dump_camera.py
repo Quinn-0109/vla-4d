@@ -1,23 +1,30 @@
 #!/usr/bin/env python
 """
-导出 LIBERO agentview 的相机参数，并**用仿真器自己的真值验证反投影**。
+导出 LIBERO 各任务的相机参数，并**用仿真器自己的真值验证反投影**。
 
 `src/common/camera.py` 的 6 项自检只证明它自洽。坐标系约定与 MuJoCo 是否一致，
-必须拿外部锚点验——本项目已经栽过一次"子进程知道答案却把它丢了"。
+必须拿外部证据验。
 
-三件事，缺一不可：
+三件事：
 
-1. **导出参数**（fovy / pos / rot）→ `results/tables/camera_libero.json`。
-2. **跨任务一致性**：agentview 在所有任务里必须是同一台相机，否则不能常量化。
-   不一致就报错——把一个会变的东西当常量，是那种跑完才发现的错。
-3. ⭐ **锚点验证**：拿仿真器里已知世界坐标的 site（夹爪等），用我们的相机模型
-   投影到像素并预测深度，再与**渲染出来的深度**比对。约定错在任何一处
-   （y 的符号、−z、翻转、内参分辨率），这一步都会以厘米级的误差暴露。
+1. **按 task 导出参数**（fovy / pos / rot）→ `results/tables/camera_libero.json`。
+   ⚠️ agentview **不是**跨任务常量：libero_10 的十个任务跨多个场景，
+   每个 BDDL 自己摆相机，实测 Δpos 达 0.65 m。反投影到世界系之后
+   坐标仍跨任务可比——这正是要反投影的理由之一。
+2. ⭐ **主判据：两台相机的点云必须在世界系里重合**（`consistency_check`）。
+   不依赖挑点，翻转判断错了两片云必然对不上。
+3. 辅助判据：site 到点云的最近点距离（`site_check`）。
+
+**这个脚本的判据本身错过两次，都记在对应函数的 docstring 里**：
+拿"预测像素处的深度差"当误差（自由空间的 site 会报 60+ cm 假误差）、
+以及渲染 B 相机的深度却用 A 相机的位姿反投影（两片云差 70 cm）。
+**判据错比结果错更难发现，因为它看起来完全正常。**
 
     export OPENVLA_ROOT=<openvla 路径>
     python scripts/dump_camera.py --n_tasks 5
 
-顺带从深度缓存统计工作空间包围盒，给 `coord_pool.metric_extent` 用。
+顺带从深度缓存统计工作空间包围盒（**锚点没过就不算**），
+给 `coord_pool.metric_extent` 用。
 """
 
 from __future__ import annotations
@@ -62,9 +69,16 @@ def build_env(task, resolution: int = RES):
                                  "camera_depths": True})
 
 
-def read_camera(env, height: int, width: int, flipped: bool) -> Camera:
+def read_camera(env, height: int, width: int, flipped: bool,
+                name: str = CAM) -> Camera:
+    """
+    ⚠️ `name` 是必须的。初版把 `CAM` 写死在函数体里，于是两相机一致性检验
+    **拿 frontview 的深度配 agentview 的位姿反投影**，两片点云差 70 cm——
+    看起来像"相机模型整个错了"，实际是测试代码自己的 bug。
+    两种翻转都报 70.1 cm、只差 0.2%，正是"与翻转无关的恒定位姿错配"的指纹。
+    """
     sim = env.sim
-    cid = sim.model.camera_name2id(CAM)
+    cid = sim.model.camera_name2id(name)
     return Camera(fovy=float(sim.model.cam_fovy[cid]),
                   height=height, width=width,
                   pos=torch.tensor(np.array(sim.data.cam_xpos[cid]), dtype=torch.float64),
@@ -102,7 +116,7 @@ def _cloud(env, cam_name: str, flip: bool, n: int = 4000) -> torch.Tensor | None
     dm = real_depth(env, d)
     if flip:
         dm = dm[::-1]
-    cam = read_camera(env, RES, RES, flipped=False)   # 直接用原始像素坐标
+    cam = read_camera(env, RES, RES, flipped=False, name=cam_name)  # 用**这台**相机
     vv, uu = np.meshgrid(np.arange(RES), np.arange(RES), indexing="ij")
     uv = torch.tensor(np.stack([uu.ravel(), vv.ravel()], -1), dtype=torch.float64)
     dd = torch.tensor(np.ascontiguousarray(dm).ravel(), dtype=torch.float64)
@@ -123,8 +137,11 @@ def consistency_check(env) -> dict:
     误差凭空多出半米。第一版就栽在这里。
 
     翻转判断若是错的，两台相机各自被扭曲的方式**取决于各自的位姿**，不是一个
-    共同的世界变换，所以两片点云对不上。翻错了必然差几十厘米，翻对了差几毫米。
-    返回 {翻转与否: 中位最近邻距离(cm)}。
+    共同的世界变换，所以两片点云对不上。
+
+    返回 {翻转与否: (共视部分 p10, 中位数)}，单位 cm。判据取 **p10**：
+    中位数会被视角重叠不足污染（B 看得到而 A 看不到的表面本来就配不上），
+    低分位才是"确实共视的那部分对得有多准"。
     """
     alt = next((c for c in ALT_CAMS
                 if _try_cam(env, c)), None)
@@ -137,7 +154,11 @@ def consistency_check(env) -> dict:
         if a is None or b is None:
             continue
         d = torch.cdist(b, a).min(dim=1).values
-        res[flip] = float(d.median()) * 100.0
+        # ⚠️ 只看中位数会被**视角重叠不足**污染：B 看得到而 A 看不到的表面
+        #    （背面、被挡住的地面）本来就配不上，与模型对错无关。
+        #    低分位才是"确实共视的那部分对得有多准"。两个都报。
+        res[flip] = (float(torch.quantile(d, 0.10)) * 100.0,
+                     float(d.median()) * 100.0)
     return {"alt": alt, **res}
 
 
@@ -197,10 +218,11 @@ def main() -> None:
                 print(f"\n=== 主判据：agentview 与 {cons['alt']} 的点云重合度 ===")
                 for flip in (True, False):
                     if flip in cons:
+                        p10, med = cons[flip]
                         print(f"  深度图{'翻转 [::-1]' if flip else '不翻     '} → "
-                              f"中位最近邻距离 {cons[flip]:.2f} cm")
+                              f"共视部分(p10) {p10:.2f} cm，中位 {med:.2f} cm")
                 best_flip = min((f for f in (True, False) if f in cons),
-                                key=lambda f: cons[f])
+                                key=lambda f: cons[f][0])
                 sites = site_check(env, best_flip)
                 if sites:
                     print(f"\n  辅助：site 到点云的最近点距离（翻转={best_flip}）")
@@ -228,9 +250,9 @@ def main() -> None:
               "\n     不要就这么去跑 G4：约定错了不会崩，只会得到一个镜像或偏移的世界。")
         ok = False
     else:
-        best_flip = min((True, False), key=lambda f: cons[f])
-        worst = cons[best_flip]
-        ratio = cons[not best_flip] / max(worst, 1e-6)
+        best_flip = min((True, False), key=lambda f: cons[f][0])
+        worst = cons[best_flip][0]                       # 判据取共视部分(p10)
+        ratio = cons[not best_flip][0] / max(worst, 1e-6)
         print(f"  最优翻转设置：flipped={best_flip}（{worst:.2f} cm，"
               f"另一种是它的 {ratio:.1f} 倍）")
         ok = worst <= args.tol_cm and best_flip is True
