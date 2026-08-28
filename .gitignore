@@ -26,4 +26,8 @@ __pycache__/
 *.bin
 *.safetensors
 checkpoints/
-data/
+# ⚠️ 必须带前导斜杠：不带的话 `data/` 会匹配**任意层级**的 data 目录，
+# 把 `src/data/`（K 帧数据模块）一起吞掉 —— 而 `git add -A` 不会有任何提示，
+# 提交看起来成功，文件却从没进过仓库。本项目栽过一次：kframe.py 写完、
+# 自检跑过、docs 里引用了它，但机器上 git pull 下来根本没有这个文件。
+/data/
