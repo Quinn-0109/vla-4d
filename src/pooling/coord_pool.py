@@ -18,7 +18,7 @@
 量纲不同、最优值必然不同**——各自调优等于给 G4 开小灶，核心对照会被一句话问废。
 硬分箱守住的规矩是**"没有在两臂之间取值不同的自由参数"**：空间轴的箱数由预算
 按确定性规则求出，时间轴的箱数 `n_t` 是显式的**无量纲整数、两臂取同一个值**
-（为什么必须显式给定，见 `_resolve_bins` —— 放任自由细化会让主实验静默失去功效）。
+（为什么必须显式给定，见 `_resolve_bins` —— 时间与空间之间没有可比的物理跨度）。
 
 ⚠️ 已知代价：分箱均值池化正是 docs/04 §4.3 判为"只作 baseline"的那类算子。
    若粗到两组都被地板效应压住，差值会被压向 0 造成假阴性。
@@ -92,9 +92,22 @@ def metric_coords(depth: torch.Tensor, k: int, camera, grid: int = GRID) -> torc
 
 
 # ---------------------------------------------------------------- 分箱规则
-def _bin_counts(idx: torch.Tensor) -> int:
+def _flat_key(idx: torch.Tensor, gs) -> torch.Tensor:
+    """
+    多进制整数键：把 (T, C) 的箱下标压成 (T,) 的 int64。
+
+    二维 `unique(dim=0)` 要按行排序，比一维慢一到两个数量级——
+    自检当初就是被它挂住的。各轴箱数 ≤ budget，四轴相乘远不到 int64 上限。
+    """
+    key = torch.zeros(idx.shape[0], dtype=torch.int64, device=idx.device)
+    for ax in range(idx.shape[1]):
+        key = key * int(gs[ax]) + idx[:, ax]
+    return key
+
+
+def _bin_counts(idx: torch.Tensor, gs) -> int:
     """给定每个 patch 的整数箱下标 (T, C)，数有多少个非空箱。"""
-    return torch.unique(idx, dim=0).shape[0]
+    return int(torch.unique(_flat_key(idx, gs)).numel())
 
 
 def _resolve_bins(
@@ -103,17 +116,31 @@ def _resolve_bins(
     group_axes: tuple[int, ...],
     n_group: tuple[int, ...],
     n_t: int | None = None,
+    extent: list[float] | torch.Tensor | None = None,
 ) -> list[int]:
     """
     确定每个轴分几个箱。**这是本模块唯一的"超参"，而它由规则定死、不可调。**
 
-    规则：**贪心细化当前最粗的轴**，每次把某个轴的箱数 +1，只要非空箱数仍 ≤ budget；
-    并列时取轴下标小者。没有任何一个轴还能细化时停止。
+    规则：**体素在物理空间里是立方体**——各自由轴的箱数与该轴的物理跨度成正比，
+    由单个标量分辨率 `s`（箱/单位长度）决定；二分搜索出**非空箱数仍 ≤ budget 的
+    最大 s**。确定性、无自由参数，G3 与 G4 用同一条规则。
 
-    为什么用这条规则而不是"各轴均分"（docs/06 §3.0.5 ③）：
-    均分只能取整数立方根，G3 三轴在 budget=256 下只能到 6×6×6=216，白白浪费 40 个槽；
-    贪心细化能走到 7×6×6=252。而它同样是**确定性的、无自由参数的**，
-    并且对 G3 与 G4 用的是同一条规则，没有各自调优的余地。
+    ⚠️ **换掉了原来的"贪心细化最粗的轴"，因为它在真值深度上塌了。**
+    贪心每次把某个轴 +1，且要求非空箱数**严格增加**（不加这条会死循环）。
+    问题是占用数随箱数是**阶梯状**的：实测
+
+        [2,2,2,1] → 8 个非空箱    [2,3,2,1] → 8（细一刀没增加）    [2,4,4,1] → 12
+
+    单步 +1 打不出新格子是常事，贪心就停在平台上。图像网格是密的、细一刀必然
+    多出格子，所以 G3 从不触发；度量坐标的点贴在一层薄壳上，平台到处都是——
+    **真值深度实测 G4 只用到 63/256 槽，而 G3 用了 242**。三组用 `enforce_n`
+    拉平后公共预算被砍掉四分之三，且**不报任何错**，只会让所有臂一起变弱、
+    差异被压向 0。
+
+    二分搜索没有这个毛病：占用数随 s 单调不减，跨过平台不需要"每一步都有进展"。
+    另外它给的是**物理各向同性**的体素——对度量坐标而言这本就是更该有的性质，
+    而贪心的 [7,6,6] 之类在物理上是扁的。
+    代价是 G3 从 252 降到接近但略低于 budget 的一个数，由 `enforce_n` 统一拉平。
 
     ⚠️ ~~它同时防住 t 轴退化~~ —— **这句话是错的，实测推翻**。见下面 `n_t` 的说明：
        贪心细化确实不会把 t 轴一次推满，但会推到 6–7 个箱，**跨帧合并照样几乎不发生**。
@@ -122,13 +149,19 @@ def _resolve_bins(
     `group_axes` 里的轴不参与细化，直接按 `n_group` 给的全分辨率分箱——
     G2 用它把 t 轴钉死成"每帧一箱"，从而实现帧独立池化。
 
-    ⚠️⚠️ **`n_t` 必须显式给定，别用自由细化。** 这是实测撞出来的：
-    K=8 时 t 轴只有 8 个取值，纯贪心会把它推到 6–7 个箱，于是
+    ⚠️⚠️ **`n_t` 必须显式给定。** 理由随分箱规则换过一次，记下两版：
 
-        G3 [7,6,6]    跨帧 token 仅 36/252，最大跨度 2 帧
-        G4 [6,6,5,5]  跨帧 token 仅 23/251，最大跨度 2 帧
+    **旧理由（已随贪心一起作废）**：贪心会把 t 推到 6–7 个箱，于是
+    G3 [7,6,6] 跨帧 token 仅 36/252、G4 [6,6,5,5] 仅 23/251，两组基本都在做
+    逐帧空间池化。二分搜索没有这个毛病——自由细化现在给 [4,8,8]，
+    每个时间箱盖 2 帧，跨帧合并确实发生。
 
-    **两组基本都在做逐帧的空间池化**，后果是三连击：
+    **现在的理由：时间与空间之间没有可比的"物理跨度"。** 二分搜索的前提是
+    "体素在物理空间里是立方体"，而 t 轴的跨度是 8 帧、空间轴是 16 格——
+    把 1 帧当成 1 格是**任意的**，K 或 grid 一变，t 的箱数就跟着漂。
+    所以 t 必须由调用方钉死，且 G3/G4/M2 取同一个值。
+
+    留着旧理由是因为它描述的后果仍然值得防（下面三连击），只是成因换了：
     ① "静止表面在多帧可见 → 塌成一个带 size 的 token"这个机制根本没发生；
     ② G3 几乎不跨帧 → G3 ≈ G2，粒度对照空转；
     ③ docs/06 §1.2① 的"同一 (h,w) 不同帧可能是不同表面"这个**错误合并机制
@@ -156,32 +189,34 @@ def _resolve_bins(
         idx = torch.clamp((q * scale).floor().long(), min=torch.zeros_like(
             torch.tensor(gs, device=q.device)), max=torch.tensor(
             [x - 1 for x in gs], device=q.device))
-        return _bin_counts(idx)
-
-    if occupied(g) > budget:                 # 连最粗的划分都超预算，直接返回
-        return g
+        return _bin_counts(idx, gs)
 
     fixed = set(group_axes) | ({0} if n_t is not None else set())
     free = [ax for ax in range(c) if ax not in fixed]
-    cur = occupied(g)
-    while free:
-        coarsest = min(g[ax] for ax in free)      # 只细化当前最粗的轴，并列取下标小者
-        advanced = False
+    if not free or occupied(g) > budget:
+        return g
+
+    # 各自由轴的箱数 ∝ 该轴物理跨度；`extent=None` 时退化成各轴等分。
+    ext = [1.0] * c if extent is None else [float(x) for x in extent]
+    base = min(ext[ax] for ax in free) or 1.0
+
+    def bins_for(res: int) -> list[int]:
+        t = list(g)
         for ax in free:
-            if g[ax] != coarsest:
-                continue
-            trial = list(g)
-            trial[ax] += 1
-            n = occupied(trial)
-            # ⚠️ 必须**真的增加**非空箱数才接受。只判 `<= budget` 会死循环：
-            # 箱数超过数据本身的分辨率后（比如 h 轴已经 16 个箱、原始就只有 16 行），
-            # 再细化非空箱数不变，贪心会永远认为"还能细"。自测直接挂住。
-            if n <= budget and n > cur:
-                g, cur, advanced = trial, n, True
-                break
-        if not advanced:
-            break
-    return g
+            t[ax] = max(1, int(round(res * ext[ax] / base)))
+        return t
+
+    # 占用数随 res 单调不减 → 二分搜索最大的可行 res。
+    # 上界取 budget：某个轴分到比预算还多的箱毫无意义（非空箱数本就 ≤ budget）。
+    lo_r, hi_r, best = 1, budget, g
+    while lo_r <= hi_r:
+        mid = (lo_r + hi_r) // 2
+        t = bins_for(mid)
+        if occupied(t) <= budget:
+            best, lo_r = t, mid + 1
+        else:
+            hi_r = mid - 1
+    return best
 
 
 # ---------------------------------------------------------------- 主算子
@@ -240,7 +275,9 @@ def coord_bin_pool(
 
     for i in range(b):
         with torch.no_grad():
-            g = _resolve_bins(q[i], budget, group_axes, n_group, n_t)
+            # extent = 各轴的物理跨度，让体素在物理空间里是立方体（见 _resolve_bins）
+            g = _resolve_bins(q[i], budget, group_axes, n_group, n_t,
+                              extent=span)
             gs = torch.tensor(g, device=device, dtype=q.dtype)
             gmax = torch.tensor([x - 1 for x in g], device=device)
             idx = (q[i] * gs).floor().long().clamp(min=torch.zeros_like(gmax), max=gmax)
@@ -413,15 +450,15 @@ if __name__ == "__main__":
     except AssertionError:
         print("    ✓ G2 没有跨帧 token（帧独立，符合预期）")
 
-    print("\n[2b] ⚠️ n_t 不给定（放任贪心细化）时，断言必须拦下来")
-    loose = coord_bin_pool(feat, gc, N, glo, ghi)          # n_t=None
-    try:
-        assert_cross_frame_merge(loose, gc)
-        raise SystemExit("    ✗ 没拦住 —— 断言阈值太松，会放过假阴性")
-    except AssertionError as e:
-        print(f"    ✓ 拦下了：{str(e).splitlines()[0][:60]}…")
-    print("    这正是实测撞出来的坑：自由细化给 [7,6,6]，跨帧仅 14%，"
-          "旧断言（>0）能过，机制却没发生")
+    print("\n[2b] n_t 不给定时 t 轴分几个箱（旧贪心在这里退化过）")
+    free_g = _resolve_bins(((gc[0] - glo) / (ghi - glo)).clamp(0, 1 - 1e-6),
+                           N, (), (), None, extent=(ghi - glo))
+    assert free_g[0] > 1, f"t 轴只有 {free_g[0]} 个箱，退化成逐帧了"
+    print(f"    ✓ 自由细化给 {free_g}，t 轴 {free_g[0]} 个箱 "
+          f"→ 每箱盖 {K / free_g[0]:.0f} 帧，跨帧合并确实发生")
+    print("    旧贪心在这里给 [7,6,6]（近乎逐帧、跨帧仅 14%），二分搜索没有这个毛病。")
+    print("    **但 n_t 仍必须显式给定**：二分的前提是「体素在物理空间里是立方体」，")
+    print("    而把 1 帧当成 1 格是任意的 —— K 或 grid 一变，t 的箱数就跟着漂。")
 
     print("\n[3] 每个 patch 恰好落进一个箱，不重不漏")
     for name, o in [("G2", g2), ("G3", g3), ("G4", g4)]:
@@ -464,7 +501,7 @@ if __name__ == "__main__":
     print("""
 ⚠️ 两处只在真实深度下才有意义，别拿上面的数当结论：
 
-  ① G4 的槽位利用率明显低于 G3（161 vs 242）。这是合成深度退化造成的，
+  ① G4 的槽位利用率明显低于 G3（100 vs 242）。这是合成深度退化造成的，
      但**机制是真的**：G3 的网格箱数与数据无关，G4 的体素占用取决于场景，
      所以 enforce_n 拉平后的公共预算会被 G4 拖低。真实深度下要重测，
      若仍明显偏低，说明 G4 的度量分箱在浪费预算，要调 metric_extent 的包围盒。
