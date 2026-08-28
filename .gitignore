@@ -9,6 +9,13 @@ results/tables/*
 !results/figures/
 results/figures/*
 !results/figures/*.png
+# 评测日志：每个几十 KB 的纯文本，却是阶段 0/1 全部结论的原始出处。
+# 轨迹 JSON 与 MP4 太大不入库，日志属于"结论本身"那一类，应当版本化。
+# ⚠️ 当初漏了这条 —— 30 个日志在训练机上只有一份拷贝，而那台机器的
+#    results/ 已经丢过一次东西（深度缓存）。
+!results/logs/
+results/logs/*
+!results/logs/*.txt
 
 rollouts/
 runs/                 # 微调输出: adapter + 优化器状态 + metrics.jsonl
