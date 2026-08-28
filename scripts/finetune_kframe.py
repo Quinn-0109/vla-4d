@@ -152,6 +152,22 @@ def main(cfg: Config) -> None:
         start_step = ck["step"]
         print(f"从 {src} 续训，已完成 {start_step} 步")
 
+    # ⚠️ 数据集路径先自己查一遍。tfds 找不到时会吐三百行的全球数据集清单
+    #    （abstract_reasoning、ag_news…），真正有用的那两行被埋在最后，
+    #    而问题通常只是路径写错或那个 suite 没下。
+    root = Path(cfg.data_root_dir).expanduser()
+    ds_dir = root / cfg.dataset_name
+    if not ds_dir.is_dir() or not any(ds_dir.glob("*/*.tfrecord*")):
+        have = sorted(d.name for d in root.iterdir() if d.is_dir()) if root.is_dir() else []
+        raise SystemExit(
+            f"找不到数据集 {cfg.dataset_name}\n"
+            f"  --data_root_dir 解析为: {root}"
+            f"{'（这个目录不存在）' if not root.is_dir() else ''}\n"
+            f"  该目录下已有: {have or '（空）'}\n\n"
+            f"用绝对路径指过去，例如：\n"
+            f"  --data_root_dir ~/autodl-tmp/datasets/modified_libero_rlds\n"
+            f"没下过的话：bash scripts/prepare_finetune.sh data")
+
     action_tokenizer = ActionTokenizer(processor.tokenizer)
 
     # ⚠️ 必须在构造 RLDSDataset **之前**打补丁（见 data.kframe.patch_strided_chunking）
