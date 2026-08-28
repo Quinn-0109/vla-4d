@@ -104,18 +104,50 @@ def find_task(bmark, lang: str) -> int | None:
 def match_init(env, bmark, tid: int, ref: np.ndarray, n_try: int):
     """
     逐个试初始状态，找与 RLDS 第 0 帧最像的那个；同时定下翻转与否。
-    返回 (init_idx, flip, 误差)。
+    返回 (init_idx, flip, 最好误差, 次好误差, 不翻的最好误差)。
+
+    ⚠️ **必须同时报次好**。只报最好分不清两种情况：
+      · best 10.2 / second 25   → 确实找到了那一个初始状态，10.2 是渲染差异
+      · best 10.2 / second 10.4 → 所有候选都差不多，初始状态根本不是区分因素，
+                                  问题在渲染设置（而"最像的那个"只是噪声）
     """
     states = bmark.get_task_init_states(tid)
-    best = (None, False, 1e9)
+    scores = []
     for j in range(min(n_try, len(states))):
         env.reset()
         obs = env.set_init_state(states[j])
-        for flip in (True, False):
-            d = diff(rgb_of(obs, flip), ref)
-            if d < best[2]:
-                best = (j, flip, d)
-    return best
+        scores.append((diff(rgb_of(obs, True), ref),
+                       diff(rgb_of(obs, False), ref), j))
+    flipped = sorted(s[0] for s in scores)
+    best_row = min(scores, key=lambda x: x[0])
+    return (best_row[2], True, flipped[0], flipped[1],
+            min(s[1] for s in scores))
+
+
+def diff_profile(a: np.ndarray, b: np.ndarray) -> dict:
+    """
+    误差长什么样 —— **这决定了病因**。
+
+    · 全图均匀的小差 → 编码/渲染设置不同（JPEG、光照、纹理），初始状态其实对了
+    · 集中在少数像素 → 物体位置不同，初始状态没对上
+    """
+    d = np.abs(a.astype(np.int16) - b.astype(np.int16)).mean(axis=-1).ravel()
+    d_sorted = np.sort(d)[::-1]
+    top10 = d_sorted[: max(1, len(d) // 10)].sum() / max(d.sum(), 1e-9)
+    return {"mean": float(d.mean()), "p50": float(np.median(d)),
+            "p95": float(np.percentile(d, 95)), "max": float(d.max()),
+            "top10_share": float(top10)}
+
+
+def _dump(a: np.ndarray, b: np.ndarray, e_i: int, tid: int) -> None:
+    """并排存图。数字说不清的时候，看一眼最快。"""
+    from PIL import Image
+    d = np.abs(a.astype(np.int16) - b.astype(np.int16)).astype(np.uint8)
+    out = Path("results/figures")
+    out.mkdir(parents=True, exist_ok=True)
+    p = out / f"replay_t{tid}_e{e_i}.png"
+    Image.fromarray(np.concatenate([a, b, d], axis=1)).save(p)
+    print(f"       -> {p}（左：回放  中：RLDS  右：差）")
 
 
 def main() -> None:
@@ -126,6 +158,8 @@ def main() -> None:
     ap.add_argument("--n_episodes", type=int, default=5)
     ap.add_argument("--n_init_try", type=int, default=50)
     ap.add_argument("--num_steps_wait", type=int, default=10)
+    ap.add_argument("--dump", action="store_true",
+                    help="把回放帧与 RLDS 帧并排存成 PNG，肉眼比对")
     ap.add_argument("--tol", type=float, default=5.0,
                     help="平均绝对像素差的容忍上限（0–255）")
     args = ap.parse_args()
@@ -143,11 +177,31 @@ def main() -> None:
             continue
         env = build_env(bmark.get_task(tid))
         env.seed(0)
-        j, flip, d0 = match_init(env, bmark, tid, ep["images"][0], args.n_init_try)
-        print(f"\n  [{e_i}] task {tid}  init {j}  翻转={flip}  第0帧误差 {d0:.2f}")
+        j, flip, d0, d1, d_noflip = match_init(
+            env, bmark, tid, ep["images"][0], args.n_init_try)
+        print(f"\n  [{e_i}] task {tid}  RLDS 图像 {ep['images'].shape[1:]}  "
+              f"init {j}  第0帧误差 {d0:.2f}")
+        print(f"       次好的候选 {d1:.2f}（差 {d1 - d0:+.2f}）   "
+              f"不翻转的最好 {d_noflip:.2f}")
+
+        env.reset()
+        obs = env.set_init_state(bmark.get_task_init_states(tid)[j])
+        prof = diff_profile(rgb_of(obs, flip), ep["images"][0])
+        print(f"       误差分布 p50={prof['p50']:.1f} p95={prof['p95']:.1f} "
+              f"max={prof['max']:.0f}  最大 10% 的像素占总误差 "
+              f"{prof['top10_share']:.0%}")
+        if args.dump:
+            _dump(rgb_of(obs, flip), ep["images"][0], e_i, tid)
+
         if d0 > args.tol:
-            print(f"       ❌ 连第 0 帧都对不上（>{args.tol}）——"
-                  "初始状态没找对，或 RLDS 的渲染设置与我们不同。")
+            if d1 - d0 < 1.0:
+                print(f"       ❌ 所有初始状态都差不多（次好只差 {d1 - d0:.2f}）——"
+                      "\n          初始状态不是区分因素，问题在**渲染设置**。")
+            elif prof["top10_share"] > 0.6:
+                print("       ❌ 误差集中在少数像素——**物体位置不同**，初始状态没对上。")
+            else:
+                print("       ❌ 误差全图均匀——**渲染/编码设置不同**"
+                      "（JPEG、光照、纹理、fovy）。")
             env.close()
             worst_init = max(worst_init, d0)
             continue
