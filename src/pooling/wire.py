@@ -103,6 +103,7 @@ class _State:
         self.batch: Optional[_Batch] = None
         self.rope: Optional[tuple] = None
         self.rope_calls: int = 0        # 我们的 rotary_emb 被真正调用了几次
+        self.orig: dict = {}            # 原始实现，unwire 时还回去
 
     def take(self) -> _Batch:
         if self.batch is None:
@@ -248,13 +249,34 @@ def _patch_rope(model, cfg: WireConfig, state: _State) -> None:
 
 
 def wire(model, cfg: WireConfig) -> _State:
-    """挂上四个点，返回 state。训练循环每步 `state.batch = _Batch(...)`。"""
+    """挂上四个点，返回 state。训练循环每步调 `set_batch(state, ...)`。"""
     state = _State()
+    state.orig = {
+        "vision": model.vision_backbone.forward,
+        "projector": model.projector.forward,
+        "rotary": [l.self_attn.rotary_emb
+                   for l in model.language_model.model.layers],
+    }
     _patch_vision(model, cfg.K)
     if cfg.arm != "G0":
         _patch_projector(model, cfg, state)
         _patch_rope(model, cfg, state)
     return state
+
+
+def unwire(model, state: _State) -> None:
+    """
+    还原成原始模型。**一个进程里连测多组时必须调**，否则包装层会套娃：
+    第二次 wire 拿到的 "orig" 已经是第一次的包装，K 帧切分会做两遍，
+    视觉 token 数变成 K² 倍 —— 那会直接 OOM，算是这一类里少见的会报错的。
+    """
+    if not state.orig:
+        return
+    model.vision_backbone.forward = state.orig["vision"]
+    model.projector.forward = state.orig["projector"]
+    for layer, rot in zip(model.language_model.model.layers, state.orig["rotary"]):
+        layer.self_attn.rotary_emb = rot
+    state.orig = {}
 
 
 def assert_rope_active(state: _State) -> None:
