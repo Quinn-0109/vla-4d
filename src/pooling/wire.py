@@ -22,7 +22,7 @@
    忘了调 = 拿上一批的深度算这一批的坐标，**不会报错**。所以 state 是一次性的：
    消费掉就作废，下一次 forward 拿不到就抛异常。
 
-`python src/pooling/wire.py` 跑 7 项自检（桩模型，不加载 7B）。
+`python src/pooling/wire.py` 跑 8 项自检（桩模型，不加载 7B）。
 """
 
 from __future__ import annotations
@@ -104,6 +104,9 @@ class _State:
         self.rope: Optional[tuple] = None
         self.rope_calls: int = 0        # 我们的 rotary_emb 被真正调用了几次
         self.orig: dict = {}            # 原始实现，unwire 时还回去
+        # 32 层用的是同一条序列，cos/sin 只算一次（build_rope 不便宜）
+        self.rope_cache = None
+        self.rope_cache_key = None
 
     def take(self) -> _Batch:
         if self.batch is None:
@@ -111,6 +114,7 @@ class _State:
                 "forward 前没有调用 set_batch()。深度与相机不在 pixel_values 里，"
                 "沿用上一批的值不会报错、loss 照降，但坐标全是错的 —— 所以这里硬抛。")
         b, self.batch = self.batch, None
+        self.rope_cache = self.rope_cache_key = None      # 新一批，缓存作废
         return b
 
 
@@ -195,16 +199,15 @@ def _patch_projector(model, cfg: WireConfig, state: _State) -> None:
         bt = state.take()
         emb, pos1d, coord_pe, _ = _pool_and_coords(emb, cfg, bt)
 
-        # ⚠️ 文本起点固定在 K*256+1，与存活 token 数无关（docs/06 §2.3 ②）。
-        #    阶段 1 最硬的那个发现：位置编码错了值 −54 个点，比压缩本身大五倍。
-        n_vis = emb.shape[1]
+        # ⚠️ 这里**只准备视觉部分**，整条序列留到 `_Rope.forward` 再拼。
+        #    投影器看不到 `input_ids`，文本有多长它不知道；早先在这里写死
+        #    `n_text=0`，于是 cos 只有 1+2048 长而 q 是 1+2048+19，
+        #    直接在 apply_rotary_pos_emb 里维度对不上。**幸好它会报错** ——
+        #    这是本轮少见的一个不静默的错。
         lo, hi = (metric_extent(cfg.K, cfg.bbox.to(emb.device), device=emb.device)
                   if cfg.arm == "G4"
                   else grid_extent(cfg.K, device=emb.device))
-        c_norm = normalize(coord_pe.float(), lo, hi, cfg.K)
-        p1, c4, isvis = assemble(c_norm, pos1d, torch.ones_like(pos1d, dtype=torch.bool),
-                                 n_text=0, k=cfg.K)
-        state.rope = (p1, c4, isvis, n_vis)
+        state.rope = (normalize(coord_pe.float(), lo, hi, cfg.K), pos1d)
         return emb
 
     model.projector.forward = wrapped
@@ -228,8 +231,24 @@ def _patch_rope(model, cfg: WireConfig, state: _State) -> None:
             if state.rope is None:
                 raise RuntimeError("rotary_emb 被调用时 state.rope 还没建好")
             state.rope_calls += 1
-            p1, c4, isvis, n_vis = state.rope
-            cos, sin = build_rope(p1, c4, isvis, cfg.head_dim, plan)
+            c_norm, pos1d = state.rope
+            # 真实序列长只有到这里才知道（x 是 value_states: (B, heads, T, hd)）。
+            # 布局 [BOS] [视觉 n_vis] [文本]，所以 n_text = T − 1 − n_vis。
+            total = x.shape[-2]
+            n_vis = c_norm.shape[1]
+            n_text = total - 1 - n_vis
+            if n_text < 0:
+                raise RuntimeError(
+                    f"序列长 {total} 比 1+视觉 {1 + n_vis} 还短 —— 池化输出与"
+                    "实际喂进 LLM 的视觉块对不上，先查 projector 那一步。")
+            key = (total, n_text)
+            if state.rope_cache_key != key:
+                p1, c4, isvis = assemble(
+                    c_norm, pos1d, torch.ones_like(pos1d, dtype=torch.bool),
+                    n_text=n_text, k=cfg.K)
+                state.rope_cache = build_rope(p1, c4, isvis, cfg.head_dim, plan)
+                state.rope_cache_key = key
+            cos, sin = state.rope_cache
             return cos.to(x.dtype), sin.to(x.dtype)
 
     layers = model.language_model.model.layers
@@ -329,17 +348,17 @@ def _selftest() -> None:
         e, p, c, _ = run(arm)
         assert e.shape == (B, N_PATCH, D), (arm, e.shape)
         assert p.shape == (B, N_PATCH) and c.shape[-1] in (3, 4)
-    print("✅ 1/7 token 数：G1 保持 2048，四个池化臂都压到 256")
+    print("✅ 1/8 token 数：G1 保持 2048，四个池化臂都压到 256")
 
     _, _, c4, _ = run("G4")
     _, _, cm, _ = run("M2")
     assert c4.shape[-1] == 4 and cm.shape[-1] == 3
-    print("✅ 2/7 M2 的错配：池化侧与 G4 同为度量坐标，PE 侧是 3 轴 (t,h,w)")
+    print("✅ 2/8 M2 的错配：池化侧与 G4 同为度量坐标，PE 侧是 3 轴 (t,h,w)")
 
     e4, _, _, _ = run("G4")
     e2, _, _, _ = run("M2")
     assert torch.equal(e4, e2), "M2 的池化侧必须与 G4 逐位相同"
-    print("✅ 3/7 M2 与 G4 的池化输出逐位相同（只有 PE 侧不同）")
+    print("✅ 3/8 M2 与 G4 的池化输出逐位相同（只有 PE 侧不同）")
 
     pad = torch.ones(B, K, dtype=torch.bool)
     pad[:, :3] = False                       # 前 3 帧是补帧
@@ -351,7 +370,7 @@ def _selftest() -> None:
         valid=pad.repeat_interleave(N_PATCH, dim=1))
     assert (out.assign[:, :3 * N_PATCH] == -1).all()
     assert int(out.size[0].sum()) == int(pad[0].sum()) * N_PATCH
-    print("✅ 4/7 补帧被屏蔽：assign 全 -1，且不占任何箱")
+    print("✅ 4/8 补帧被屏蔽：assign 全 -1，且不占任何箱")
 
     for n_keep in (120, 200, 256):
         p1 = torch.arange(n_keep).float().unsqueeze(0)
@@ -362,7 +381,7 @@ def _selftest() -> None:
         first_text = float(pos[0, 1 + n_keep])
         assert first_text == K * N_PATCH + 1, (n_keep, first_text)
         assert not bool(isv[0, 1 + n_keep]) and bool(isv[0, 1])
-    print(f"✅ 5/7 文本起点恒为 K*256+1 = {K * N_PATCH + 1}，与存活 token 数无关"
+    print(f"✅ 5/8 文本起点恒为 K*256+1 = {K * N_PATCH + 1}，与存活 token 数无关"
           "（120/200/256 三种存活数都试过）")
 
     st = _State()
@@ -378,7 +397,7 @@ def _selftest() -> None:
         raise SystemExit("    ✗ state 被消费两次竟然过了")
     except RuntimeError:
         pass
-    print("✅ 6/7 state 是一次性的：没 set_batch 或重复消费都硬抛")
+    print("✅ 6/8 state 是一次性的：没 set_batch 或重复消费都硬抛")
 
     st2 = _State()
     st2.n_layers = 32
@@ -389,7 +408,43 @@ def _selftest() -> None:
             assert not should_raise, f"{calls} 次调用竟然过了"
         except RuntimeError:
             assert should_raise
-    print("✅ 7/7 assert_rope_active：0 次和部分层都拦下，32/32 才放行")
+    print("✅ 7/8 assert_rope_active：0 次和部分层都拦下，32/32 才放行")
+
+    # 回归：cos/sin 的长度必须跟着**真实序列长**走，不能在投影器里写死。
+    # 初版把 n_text 写死成 0，真模型上 q 是 2068 而 cos 是 2049，
+    # 直接在 apply_rotary_pos_emb 里维度对不上。
+    class _Attn:
+        pass
+
+    class _Layer:
+        def __init__(self):
+            self.self_attn = _Attn()
+            self.self_attn.rotary_emb = torch.nn.Identity()
+
+    class _FakeLM:
+        def __init__(self):
+            self.model = type("M", (), {"layers": [_Layer() for _ in range(4)]})()
+
+    class _Fake:
+        def __init__(self):
+            self.vision_backbone = type("V", (), {"forward": staticmethod(lambda x: x)})()
+            self.projector = type("P", (), {"forward": staticmethod(lambda x: x)})()
+            self.language_model = _FakeLM()
+
+    fake, cfg = _Fake(), WireConfig(arm="G3", K=K)
+    st = wire(fake, cfg)
+    n_vis = 256
+    st.rope = (torch.rand(1, n_vis, 3) * 16, torch.arange(n_vis).float().unsqueeze(0))
+    rope = fake.language_model.model.layers[0].self_attn.rotary_emb
+    for n_text in (7, 19, 40):
+        total = 1 + n_vis + n_text
+        cos, sin = rope(torch.zeros(1, 4, total, cfg.head_dim))
+        assert cos.shape[1] == total, (n_text, cos.shape)
+    assert st.rope_calls == 3
+    unwire(fake, st)
+    assert isinstance(fake.language_model.model.layers[0].self_attn.rotary_emb,
+                      torch.nn.Identity), "unwire 没还原"
+    print("✅ 8/8 cos/sin 跟随真实序列长（7/19/40 三种文本长度），unwire 能还原")
 
     print("\n⚠️ 尚未验证、必须在真模型上做的两件事："
           "\n  ① 端到端挂上 7B 后，**第一次 forward 之后调 `assert_rope_active`** —— "
