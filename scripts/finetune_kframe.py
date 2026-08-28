@@ -54,6 +54,12 @@ from data.kframe import (KFrameBatchTransform, PaddedCollatorKFrame,  # noqa: E4
 from pooling.wire import WireConfig, assert_rope_active, set_batch, wire  # noqa: E402
 
 # 微批 × 累积，有效批恒为 16（docs/06 §4.3 的显存实测）
+#
+# ⚠️ K=8 的 (2, 8) 是按 **G1**（2048 个视觉 token）定的。
+#    池化臂在投影器之后就压到 256，LLM 只看 ~295 长的序列，实测只用 16.3 GB，
+#    还有 9 GB 余量 —— 用 `--micro 4` 之类量一下，微批翻倍就把累积步数减半。
+#    **但有效批必须恒为 16**，所以只让改微批，累积由它自动配平。
+EFF_BATCH = 16
 MICRO = {1: (16, 1), 8: (2, 8)}
 
 
@@ -85,6 +91,7 @@ class Config:
     log_steps: int = 10
     resume_from: Optional[str] = None
     bench_only: bool = False
+    micro: int = 0                             # 0 = 用 MICRO 表；>0 覆盖，累积自动配平
     run_id_note: Optional[str] = None
     # fmt: on
 
@@ -103,6 +110,15 @@ def main(cfg: Config) -> None:
             "而 G2 vs G0 正是前提检验，本来就排在最前。")
 
     micro, accum = MICRO[cfg.K]
+    if cfg.micro:
+        # ⚠️ **有效批必须恒为 16**（docs/06 §4.3）。只让改微批，累积自动配平；
+        #    除不尽就直接拒绝 —— 有效批一旦跟着显存漂移，跨臂比较就作废了，
+        #    而那种漂移不会有任何提示。
+        if EFF_BATCH % cfg.micro:
+            raise SystemExit(
+                f"--micro {cfg.micro} 除不尽有效批 {EFF_BATCH}。"
+                f"可选：{[m for m in (1, 2, 4, 8, 16) if EFF_BATCH % m == 0]}")
+        micro, accum = cfg.micro, EFF_BATCH // cfg.micro
     exp_id = (f"{cfg.arm}+{cfg.dataset_name}+K{cfg.K}s{cfg.stride}"
               f"+N{cfg.budget}+nt{cfg.n_t}+b{micro}x{accum}"
               f"+lr{cfg.learning_rate}+lora-r{cfg.lora_rank}"
