@@ -52,6 +52,7 @@ from experiments.robot.libero.libero_utils import (  # noqa: E402
 from experiments.robot.robot_utils import (invert_gripper_action,  # noqa: E402
                                            normalize_gripper_action)
 
+from common.imgproc import center_crop_resize  # noqa: E402
 from pooling.wire import (WireConfig, assert_rope_active, set_batch,  # noqa: E402
                           wire)
 
@@ -75,6 +76,7 @@ class Config:
     num_steps_wait: int = 10
     unnorm_key: Optional[str] = None           # 默认取 task_suite_name + "_no_noops"
     stats_json: Optional[str] = None           # 默认找 <adapter>/../../dataset_statistics.json
+    center_crop: bool = True                   # ⚠️ 训练开了 image_aug 就必须开，见下
     seed: int = 7                              # 沿用阶段 0
     local_log_dir: str = "results/logs"
     run_note: str = ""
@@ -138,8 +140,11 @@ def main(cfg: Config) -> None:
                                    n_t=cfg.n_t))
     model.eval()
 
+    print(f"中心裁: {'开' if cfg.center_crop else '**关**'}"
+          f"（训练用 image_aug=True，关掉就是训练/评测不一致）")
     run_id = (f"EVAL-{cfg.task_suite_name}-{cfg.arm}-K{cfg.K}s{cfg.stride}"
-              f"-seed{cfg.seed}" + (f"--{cfg.run_note}" if cfg.run_note else ""))
+              f"-seed{cfg.seed}{'' if cfg.center_crop else '-nocrop'}"
+              + (f"--{cfg.run_note}" if cfg.run_note else ""))
     Path(cfg.local_log_dir).mkdir(parents=True, exist_ok=True)
     log = open(os.path.join(cfg.local_log_dir, run_id + ".txt"), "w")
     print(f"日志: {log.name}")
@@ -171,6 +176,12 @@ def main(cfg: Config) -> None:
                 hist.appendleft(img)
                 frames, pad = build_window(hist, cfg.K, cfg.stride)
 
+                # ⚠️ **中心裁必须与训练侧的 random_resized_crop(scale=0.9) 对齐。**
+                #    训练是 image_aug=True，模型只见过裁过的画面；评测喂整张图
+                #    不会报错，只会让模型在一个没见过的分布上做决策。
+                #    见 common/imgproc.center_crop_resize。
+                if cfg.center_crop:
+                    frames = [center_crop_resize(f) for f in frames]
                 # (K*6, H, W)：每帧 6 通道，沿通道拼 —— 与训练侧同一约定
                 px = torch.cat([processor.image_processor.apply_transform(
                     Image.fromarray(f)) for f in frames],
