@@ -17,7 +17,10 @@ G0 仍然用它评；这份只加 K 帧历史窗口 + 接线。**评测协议其
     测的就是"训练与评测不一致"而不是方法本身
 """
 
-from __future__ import annotations
+# ⚠️ **不要加 `from __future__ import annotations`。**
+#    它把类型注解变成字符串，`draccus.wrap()` 拿到的就是 "Config" 而非类本身，
+#    `dataclasses.fields()` 随即抛 "must be called with a dataclass type or instance"。
+#    `finetune_single.py` 的文件头记过这个坑，我写这份时照样踩了 —— 所以再记一次。
 
 import json
 import os
