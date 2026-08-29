@@ -203,7 +203,7 @@ def main(cfg: Config) -> None:
     action_tokenizer = ActionTokenizer(processor.tokenizer)
 
     # ⚠️ 必须在构造 RLDSDataset **之前**打补丁（见 data.kframe.patch_strided_chunking）
-    patch_strided_chunking(cfg.stride)
+    patch_strided_chunking(cfg.stride, cfg.K)
     dataset = RLDSDataset(
         cfg.data_root_dir, cfg.dataset_name,
         KFrameBatchTransform(action_tokenizer, processor.tokenizer,
@@ -235,6 +235,21 @@ def main(cfg: Config) -> None:
         processor.save_pretrained(run_dir)
         print(f"\n[step {step}] 已存 -> {d}")
 
+    # ⚠️⚠️ **第一批就把形状钉死。** openvla 的 RLDSDataset 把 window_size=1 写死在
+    #    构造函数里，K 一旦没顶进去就会静默退化成单帧：pixel_values 变成
+    #    (B, 6, H, W)、序列长不变、loss 照降、acc 照升，只有拿去做 K 帧评测才露馅。
+    def check_shapes(batch) -> None:
+        pv, fm = batch["pixel_values"], batch["frame_pad_mask"]
+        if pv.shape[1] != cfg.K * 6 or fm.shape[1] != cfg.K:
+            raise SystemExit(
+                f"数据侧给的不是 K={cfg.K} 帧：pixel_values {tuple(pv.shape)}"
+                f"（应为 (B, {cfg.K * 6}, H, W)），frame_pad_mask {tuple(fm.shape)}"
+                f"（应为 (B, {cfg.K})）。\n"
+                f"实际 K = {pv.shape[1] // 6} —— 分窗补丁没生效或被官方的 "
+                f"window_size 顶回去了，先查 data.kframe.patch_strided_chunking。")
+        print(f"  ✓ 形状: pixel_values {tuple(pv.shape)}  "
+              f"frame_pad_mask {tuple(fm.shape)}  → K={pv.shape[1] // 6}")
+
     if cfg.eval_only:
         if not cfg.resume_from:
             raise SystemExit("--eval_only 要配 --resume_from <adapter 目录>，"
@@ -247,6 +262,8 @@ def main(cfg: Config) -> None:
             for i, batch in enumerate(loader):
                 if i >= cfg.eval_steps:
                     break
+                if i == 0:
+                    check_shapes(batch)
                 set_batch(state, depth=None,
                           frame_pad_mask=batch["frame_pad_mask"].to(dev))
                 with torch.autocast("cuda", dtype=torch.bfloat16):
@@ -281,6 +298,8 @@ def main(cfg: Config) -> None:
     checked_rope = False
     with tqdm.tqdm(total=cfg.max_steps, initial=start_step) as bar:
         for micro_idx, batch in enumerate(loader):
+            if micro_idx == 0:
+                check_shapes(batch)
             set_batch(state, depth=None,
                       frame_pad_mask=batch["frame_pad_mask"].to(dev))
             with torch.autocast("cuda", dtype=torch.bfloat16):

@@ -52,9 +52,17 @@ def strided_pad_fraction(traj_len: int, k: int, stride: int) -> float:
 
 # ---------------------------------------------------------------- TF 侧替换
 def strided_chunk_act_obs(traj: Dict, window_size: int, stride: int = 1,
-                          future_action_window_size: int = 0) -> Dict:
+                          k: int = None, future_action_window_size: int = 0) -> Dict:
     """
-    `traj_transforms.chunk_act_obs` 的带间隔替换版。签名兼容，多一个 `stride`。
+    `traj_transforms.chunk_act_obs` 的带间隔替换版。签名兼容，多 `stride` 与 `k`。
+
+    ⚠️⚠️ **`k` 必须由我们自己带进来，不能指望 `window_size`。**
+    openvla 的 `RLDSDataset.__init__` 把 `traj_transform_kwargs=dict(window_size=1, …)`
+    **写死**在构造函数里，外面传不进去；我们只替换了分窗函数，拿到的 window_size
+    永远是 1，`tf.range(0, 1, stride)` 于是只剩当前帧 —— **K 静默退化成 1**。
+    下游不会报任何错：pixel_values 变成 (B, 6, H, W)，视觉主干照跑，
+    池化把 256 个 patch 池成 256 个槽，序列长仍是 302，loss 照降、acc 照升。
+    只有把它和 K=8 的评测放在一起时才会露馅。
 
     与官方的**两处**差异，都要写清楚：
 
@@ -72,12 +80,19 @@ def strided_chunk_act_obs(traj: Dict, window_size: int, stride: int = 1,
     """
     import tensorflow as tf
 
+    if k is None:
+        k = window_size
+    elif window_size != 1:
+        raise RuntimeError(
+            f"官方传进来的 window_size={window_size}，不再是写死的 1 —— "
+            "openvla 改了 RLDSDataset，这个覆盖式的补丁要重新对一遍。")
+
     traj_len = tf.shape(traj["action"])[0]
 
     # ① 观测：带间隔的历史窗口
-    obs_offsets = tf.range(-(window_size - 1) * stride, 1, stride)          # (K,)
-    chunk_indices = tf.broadcast_to(obs_offsets, [traj_len, window_size]) + tf.broadcast_to(
-        tf.range(traj_len)[:, None], [traj_len, window_size]
+    obs_offsets = tf.range(-(k - 1) * stride, 1, stride)                    # (K,)
+    chunk_indices = tf.broadcast_to(obs_offsets, [traj_len, k]) + tf.broadcast_to(
+        tf.range(traj_len)[:, None], [traj_len, k]
     )
     floored = tf.maximum(chunk_indices, 0)
     traj["observation"] = tf.nest.map_structure(
@@ -99,7 +114,7 @@ def strided_chunk_act_obs(traj: Dict, window_size: int, stride: int = 1,
     return traj
 
 
-def patch_strided_chunking(stride: int) -> None:
+def patch_strided_chunking(stride: int, k: int) -> None:
     """
     把官方链路里的分窗函数换成带间隔的版本。**必须在构造 RLDSDataset 之前调用。**
 
@@ -112,9 +127,10 @@ def patch_strided_chunking(stride: int) -> None:
 
     from prismatic.vla.datasets.rlds import traj_transforms
 
+    assert k >= 1 and stride >= 1, (k, stride)
     if getattr(traj_transforms.chunk_act_obs, "_strided", False):
         raise RuntimeError("已经打过补丁了，重复调用会把 stride 叠起来")
-    patched = partial(strided_chunk_act_obs, stride=stride)
+    patched = partial(strided_chunk_act_obs, stride=stride, k=k)
     patched._strided = True                                  # type: ignore[attr-defined]
     traj_transforms.chunk_act_obs = patched                  # type: ignore[assignment]
 
