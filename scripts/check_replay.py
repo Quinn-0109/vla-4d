@@ -3,7 +3,7 @@
 回放保真度验证 —— **G4 / M2 的唯一前置**（`docs/06` §4.3）。
 
 G4 要的是**训练集**每一帧的 patch 级深度。RLDS 里没有深度，只能把动作序列
-放回仿真器重放、取仿真器的深度。这一步成立的前提是：
+放回仿真器、取仿真器的深度。这一步成立的前提是：
 
     **同一初始状态 + 同一动作序列 → 仿真器复现出 RLDS 里的那张画面。**
 
@@ -22,7 +22,7 @@ G4 照跑，只是它看的是一个和图像对不上的三维世界。
   2. 用 language_instruction 反查 task_id（LIBERO 里逐任务唯一）
   3. 逐个试该任务的初始状态，找出与 RLDS 第 0 帧最像的那个
      （顺带把"RLDS 图像是否已 180° 翻转"一并定下来，同 depth_diag 的做法）
-  4. 重放动作，在若干时刻比对画面，看误差**随时间怎么走**
+  4. ⭐ **逐帧设状态**（不重放动作）对齐并比对画面
 
     export OPENVLA_ROOT=<openvla 路径>
     python scripts/check_replay.py --suite libero_10 --n_episodes 5
@@ -99,6 +99,54 @@ def find_task(bmark, lang: str) -> int | None:
         if bmark.get_task(i).language.strip().lower() == lang:
             return i
     return None
+
+
+def demo_all_states(task, demo_key: str):
+    """取某条 demo 的**全部帧**的完整仿真状态 (T, state_dim)。"""
+    try:
+        import h5py
+
+        from libero.libero import get_libero_path
+        root = Path(get_libero_path("datasets"))
+    except Exception:
+        return None
+    hits = list(root.rglob(f"{task.name}_demo.hdf5")) or list(
+        root.rglob(f"{task.name}*.hdf5"))
+    if not hits:
+        return None
+    with h5py.File(hits[0], "r") as f:
+        return np.asarray(f["data"][demo_key]["states"])
+
+
+def align_by_state(env, states, rlds, flip: bool, stride: int = 2):
+    """
+    ⭐ **逐帧设状态，不重放动作。**
+
+    之前是 `env.step(action)` 一路走下去 —— 那必然累积误差：接触动力学
+    （抓取、碰撞）会把微小差异放大。实测 task 6 从中段开始漂（t=142 时 4.6，
+    末段 12–15），task 9 从头就偏；而 task 4 那条 100% 的帧都 ≤5，
+    说明**渲染与坐标那一侧本来就是对的，漂的是重放这个方法**。
+    demo HDF5 里存着每一帧的完整仿真状态，逐帧 set 就是零漂移。
+
+    顺带解决 no_noops 的对齐：先把整条 demo 渲一遍，再给每个 RLDS 帧找最匹配的。
+    **匹配到的下标必须单调递增** —— 免费的强验证：对齐正确必然单调，噪声不会。
+
+    返回 (每个 RLDS 帧的误差, 匹配到的 demo 下标)。
+    """
+    def small(a):
+        return a[::8, ::8].astype(np.int16)
+
+    bank, idxs = [], list(range(0, len(states), stride))
+    for t in idxs:
+        env.reset()
+        bank.append(rgb_of(env.set_init_state(states[t]), flip))
+    bank_s = np.stack([small(b) for b in bank])
+    errs, matches = [], []
+    for r in rlds:
+        j = int(np.abs(bank_s - small(r)).mean(axis=(1, 2, 3)).argmin())
+        errs.append(diff(bank[j], r))
+        matches.append(idxs[j])
+    return np.asarray(errs), np.asarray(matches)
 
 
 def demo_states(task, n_demo: int = 60, n_frame: int = 1):
@@ -214,6 +262,8 @@ def main() -> None:
     ap.add_argument("--n_episodes", type=int, default=5)
     ap.add_argument("--n_init_try", type=int, default=50)
     ap.add_argument("--num_steps_wait", type=int, default=10)
+    ap.add_argument("--align_stride", type=int, default=2,
+                    help="逐帧对齐时每隔几帧渲染一次")
     ap.add_argument("--demo_frames", type=int, default=40,
                     help="在选中的那条 demo 里往后扫多少帧找偏移（no_noops 用）")
     ap.add_argument("--dump", action="store_true",
@@ -289,31 +339,27 @@ def main() -> None:
             worst_init = max(worst_init, d0)
             continue
 
-        # 重放：RLDS 的动作直接喂回去
-        env.reset()
-        obs = env.set_init_state(m["state"])
-        T = min(len(ep["actions"]), ep["images"].shape[0])
-        alld, curve = [], []
-        for t in range(T):
-            d = diff(rgb_of(obs, flip), ep["images"][t])
-            alld.append(d)
-            if t in (0, T // 4, T // 2, 3 * T // 4, T - 1):
-                curve.append((t, d))
-            obs, *_ = env.step(ep["actions"][t].tolist())
+        # ⭐ 逐帧设状态对齐（不重放动作，见 align_by_state）
+        key = m["src"].split(":", 1)[1] if m["src"].startswith("demo:") else None
+        st_all = demo_all_states(bmark.get_task(tid), key) if key else None
+        if st_all is None:
+            print("       ⚠️ 取不到该 demo 的全帧状态，跳过对齐检验。")
+            env.close()
+            worst_init = max(worst_init, d0)
+            continue
+        errs, matches = align_by_state(env, st_all, ep["images"], flip,
+                                       args.align_stride)
         env.close()
-        print("       " + "  ".join(f"t={t}:{d:.1f}" for t, d in curve))
-        a = np.asarray(alld)
-        # ⚠️ **判据看的是「有多少帧的深度能用」，不是末帧对不对。**
-        #    深度是逐帧缓存的：95% 的帧准，就有 95% 的深度可用。
-        #    只看末帧会把"最后十几帧发散"误判成整条不可用（实测 episode 1：
-        #    t=0..213 都在 1.9–3.6，末帧 11.5）。这不是放宽标准，是把判据
-        #    对准了真正要保证的东西。**末帧仍然照报**，发散本身要写进论文。
-        good = float((a <= args.tol).mean())
-        print(f"       全程 {T} 帧：p50={np.median(a):.1f} p95={np.percentile(a, 95):.1f} "
-              f"max={a.max():.1f}   ≤{args.tol} 的帧占 **{good:.1%}**")
-        end = float(a[-1])
+        good = float((errs <= args.tol).mean())
+        mono = float((np.diff(matches) >= 0).mean())
+        print(f"       逐帧对齐（demo {len(st_all)} 帧，步长 {args.align_stride}）："
+              f"p50={np.median(errs):.1f} p95={np.percentile(errs, 95):.1f} "
+              f"max={errs.max():.1f}  ≤{args.tol} 占 **{good:.1%}**")
+        print(f"         匹配下标单调性 {mono:.1%}"
+              f"（对齐正确必然接近 100%）  覆盖 {matches.min()}–{matches.max()}")
+        end_err = float(errs[-1])
         worst_init = max(worst_init, d0)
-        worst_end = end if worst_end is None else max(worst_end, end)
+        worst_end = end_err if worst_end is None else max(worst_end, end_err)
         n_ok += good >= 0.95
 
     print(f"\n{'=' * 60}\n=== 判读 ===")
@@ -331,8 +377,9 @@ def main() -> None:
               "\n     若候选里 demo 数为 0，先把 LIBERO 演示数据下下来再说 ——"
               "\n     RLDS 是从演示转换来的，评测初始状态是另一批。")
     else:
-        print("  ❌ **随时间发散**：初始状态对得上，重放却越走越远。"
-              "\n     多半是控制器设置不同（RLDS 生成时的 controller config）。"
+        print("  ❌ **随时间发散**：初始状态对得上，逐帧设状态后仍越走越远。"
+              "\n     这就不是重放的累积误差了（逐帧 set 没有累积），"
+              "\n     要查 RLDS 与 demo 是不是根本不同源。"
               "\n     此时不能给训练集缓存深度 —— 深度会属于另一个场景，"
               "\n     而 G4 照跑不报错。回退方案见 docs/06 §6（单目深度）。")
 
