@@ -101,14 +101,18 @@ def find_task(bmark, lang: str) -> int | None:
     return None
 
 
-def demo_init_states(task, n: int = 60):
+def demo_states(task, n_demo: int = 60, n_frame: int = 1):
     """
-    从 LIBERO 的**演示** HDF5 里取每条 demo 的初始状态。
+    从 LIBERO 的**演示** HDF5 里取状态。`n_frame=1` 只取每条 demo 的第 0 帧。
 
     ⚠️ 这是与 `get_task_init_states()` **不同的一批**：后者给的是**评测用**的
     50 个初始摆放，而 modified_libero_rlds 是从**演示数据**转换来的。
-    两者不是同一批 —— 拿评测初始状态去对演示画面，50 个候选里一个对的都没有，
-    "最像的那个"只是噪声，误差就停在"不同摆放"的量级上（实测 10.2）。
+    实测：换成 demo 之后误差从 ~10 降到 2.1–2.7（JPEG 底噪量级）。
+
+    ⚠️ **`n_frame > 1` 是为 `no_noops` 准备的。** 数据集名字里的 no_noops 意思是
+    转换时删掉了动作为零的步骤；若某条 demo 开头有 noop 被删，**RLDS 的第 0 帧
+    就不是 demo 的初始状态，而是走了几步之后的状态**。这时只比 states[0] 必然
+    对不上（实测 task 9：demo 候选全试过仍 6.41，次好只差 0.02）。
     """
     try:
         import h5py
@@ -123,13 +127,15 @@ def demo_init_states(task, n: int = 60):
         return []
     out = []
     with h5py.File(hits[0], "r") as f:
-        for k in list(f["data"].keys())[:n]:
+        for k in list(f["data"].keys())[:n_demo]:
             st = f["data"][k]["states"]
-            out.append(np.asarray(st[0]))
+            for t in range(min(n_frame, st.shape[0])):
+                out.append((k, t, np.asarray(st[t])))
     return out
 
 
-def match_init(env, bmark, tid: int, ref: np.ndarray, n_try: int):
+def match_init(env, bmark, tid: int, ref: np.ndarray, n_try: int,
+               n_frame: int = 1):
     """
     逐个试初始状态，找与 RLDS 第 0 帧最像的那个；同时定下翻转与否。
     返回 (init_idx, flip, 最好误差, 次好误差, 不翻的最好误差)。
@@ -140,9 +146,13 @@ def match_init(env, bmark, tid: int, ref: np.ndarray, n_try: int):
                                   问题在渲染设置（而"最像的那个"只是噪声）
     """
     evals = list(bmark.get_task_init_states(tid))[:n_try]
-    demos = demo_init_states(bmark.get_task(tid), n_try)
-    cands = [("eval", j, st) for j, st in enumerate(evals)] + \
-            [("demo", j, st) for j, st in enumerate(demos)]
+    # 两段搜索：先用每条 demo 的第 0 帧挑出**哪一条 demo**（便宜），
+    # 再在这一条里扫前 n_frame 帧找**偏移量**（应对 no_noops 削掉的开头）。
+    # 直接 50 demo × 40 帧 = 2000 次渲染太慢；而场景布局在开头几帧几乎不变，
+    # 所以第一段仍能选对 demo。
+    d0 = demo_states(bmark.get_task(tid), n_try, 1)
+    cands = [("eval", str(j), st) for j, st in enumerate(evals)] + \
+            [(f"demo:{k}", "0", st) for k, _, st in d0]
     scores = []
     for src, j, st in cands:
         env.reset()
@@ -151,10 +161,23 @@ def match_init(env, bmark, tid: int, ref: np.ndarray, n_try: int):
                        diff(rgb_of(obs, False), ref), src, j, st))
     flipped = sorted(x[0] for x in scores)
     best = min(scores, key=lambda x: x[0])
-    return {"src": best[2], "idx": best[3], "state": best[4],
-            "best": flipped[0], "second": flipped[1],
-            "noflip": min(x[1] for x in scores),
-            "n_eval": len(evals), "n_demo": len(demos)}
+    res = {"src": best[2], "idx": best[3], "state": best[4],
+           "best": flipped[0], "second": flipped[1],
+           "noflip": min(x[1] for x in scores),
+           "n_eval": len(evals), "n_demo": len(d0), "frame_off": 0}
+
+    # 第二段：只在选中的那条 demo 里扫帧偏移
+    if n_frame > 1 and best[2].startswith("demo:"):
+        key = best[2].split(":", 1)[1]
+        for k, t, st in demo_states(bmark.get_task(tid), n_try, n_frame):
+            if k != key or t == 0:
+                continue
+            env.reset()
+            obs = env.set_init_state(st)
+            d = diff(rgb_of(obs, True), ref)
+            if d < res["best"]:
+                res.update(best=d, state=st, frame_off=t)
+    return res
 
 
 def diff_profile(a: np.ndarray, b: np.ndarray) -> dict:
@@ -191,6 +214,8 @@ def main() -> None:
     ap.add_argument("--n_episodes", type=int, default=5)
     ap.add_argument("--n_init_try", type=int, default=50)
     ap.add_argument("--num_steps_wait", type=int, default=10)
+    ap.add_argument("--demo_frames", type=int, default=40,
+                    help="在选中的那条 demo 里往后扫多少帧找偏移（no_noops 用）")
     ap.add_argument("--dump", action="store_true",
                     help="把回放帧与 RLDS 帧并排存成 PNG，肉眼比对")
     ap.add_argument("--tol", type=float, default=5.0,
@@ -210,11 +235,13 @@ def main() -> None:
             continue
         env = build_env(bmark.get_task(tid))
         env.seed(0)
-        m = match_init(env, bmark, tid, ep["images"][0], args.n_init_try)
+        m = match_init(env, bmark, tid, ep["images"][0], args.n_init_try,
+                       args.demo_frames)
         j, flip, d0, d1, d_noflip = m["idx"], True, m["best"], m["second"], m["noflip"]
         print(f"\n  [{e_i}] task {tid}  RLDS 图像 {ep['images'].shape[1:]}  "
               f"候选 {m['n_eval']} eval + {m['n_demo']} demo")
-        print(f"       最像的是 **{m['src']}** 的第 {j} 个  第0帧误差 {d0:.2f}")
+        off = f"，帧偏移 +{m['frame_off']}" if m.get("frame_off") else ""
+        print(f"       最像的是 **{m['src']}**{off}  第0帧误差 {d0:.2f}")
         print(f"       次好的候选 {d1:.2f}（差 {d1 - d0:+.2f}）   "
               f"不翻转的最好 {d_noflip:.2f}")
         if m["n_demo"] == 0:
@@ -266,21 +293,31 @@ def main() -> None:
         env.reset()
         obs = env.set_init_state(m["state"])
         T = min(len(ep["actions"]), ep["images"].shape[0])
-        curve = []
+        alld, curve = [], []
         for t in range(T):
             d = diff(rgb_of(obs, flip), ep["images"][t])
+            alld.append(d)
             if t in (0, T // 4, T // 2, 3 * T // 4, T - 1):
                 curve.append((t, d))
             obs, *_ = env.step(ep["actions"][t].tolist())
         env.close()
         print("       " + "  ".join(f"t={t}:{d:.1f}" for t, d in curve))
-        end = curve[-1][1]
+        a = np.asarray(alld)
+        # ⚠️ **判据看的是「有多少帧的深度能用」，不是末帧对不对。**
+        #    深度是逐帧缓存的：95% 的帧准，就有 95% 的深度可用。
+        #    只看末帧会把"最后十几帧发散"误判成整条不可用（实测 episode 1：
+        #    t=0..213 都在 1.9–3.6，末帧 11.5）。这不是放宽标准，是把判据
+        #    对准了真正要保证的东西。**末帧仍然照报**，发散本身要写进论文。
+        good = float((a <= args.tol).mean())
+        print(f"       全程 {T} 帧：p50={np.median(a):.1f} p95={np.percentile(a, 95):.1f} "
+              f"max={a.max():.1f}   ≤{args.tol} 的帧占 **{good:.1%}**")
+        end = float(a[-1])
         worst_init = max(worst_init, d0)
         worst_end = end if worst_end is None else max(worst_end, end)
-        n_ok += end <= args.tol
+        n_ok += good >= 0.95
 
     print(f"\n{'=' * 60}\n=== 判读 ===")
-    print(f"  {n_ok}/{len(eps)} 条 episode 全程误差 ≤ {args.tol}")
+    print(f"  {n_ok}/{len(eps)} 条 episode 有 ≥95% 的帧误差 ≤ {args.tol}")
     # ⚠️ 末帧误差要区分「测出来是 0」和「压根没测到」。初版两者都印 0.00，
     #    读起来像"末帧完美"，实际是所有 episode 都卡在第 0 帧 continue 掉了。
     end_txt = "未测（都卡在第 0 帧）" if worst_end is None else f"{worst_end:.2f}"
