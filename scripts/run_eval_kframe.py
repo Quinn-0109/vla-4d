@@ -74,6 +74,7 @@ class Config:
     num_trials_per_task: int = 50              # ⚠️ 主结论一律满量（docs/06 §3.0）
     num_steps_wait: int = 10
     unnorm_key: Optional[str] = None           # 默认取 task_suite_name + "_no_noops"
+    stats_json: Optional[str] = None           # 默认找 <adapter>/../../dataset_statistics.json
     seed: int = 7                              # 沿用阶段 0
     local_log_dir: str = "results/logs"
     run_note: str = ""
@@ -111,6 +112,27 @@ def main(cfg: Config) -> None:
         from peft import PeftModel
         model = PeftModel.from_pretrained(model, cfg.adapter).merge_and_unload()
         print(f"已加载 adapter: {cfg.adapter}")
+
+    # ⚠️ **动作反归一化的统计量必须注入。**
+    #    底座 openvla-7b 的 norm_stats 里只有 OXE 预训练那些数据集，没有 LIBERO；
+    #    LIBERO 的 q01/q99 是微调时从数据集算出来的，训练脚本存在
+    #    run_dir/dataset_statistics.json。官方流程用 finetuned checkpoint 绕过了
+    #    这一步，我们用 LoRA adapter 就得自己接回去 —— 不接会直接抛
+    #    "unnorm_key not in available dataset statistics"（好在会报错，不会静默）。
+    if unnorm not in model.norm_stats:
+        sj = Path(cfg.stats_json) if cfg.stats_json else (
+            Path(cfg.adapter).parents[1] / "dataset_statistics.json"
+            if cfg.adapter else None)
+        if sj is None or not sj.exists():
+            raise SystemExit(
+                f"底座里没有 `{unnorm}` 的动作统计量，也找不到 dataset_statistics.json。\n"
+                f"  找过: {sj}\n"
+                f"  它由训练脚本写在 run 目录下（save_dataset_statistics）。\n"
+                f"  用 --stats_json 指过去，或确认 --adapter 指的是 "
+                f"<run_dir>/adapter/stepN。")
+        d = json.loads(sj.read_text())
+        model.norm_stats[unnorm] = d.get(unnorm, d)
+        print(f"已注入动作统计量: {sj}")
 
     state = wire(model, WireConfig(arm=cfg.arm, K=cfg.K, budget=cfg.budget,
                                    n_t=cfg.n_t))
