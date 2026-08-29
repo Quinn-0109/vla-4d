@@ -312,6 +312,7 @@ def main() -> None:
     bmark = benchmark.get_benchmark_dict()[args.suite]()
 
     worst_init, worst_end, n_ok = 0.0, None, 0
+    depth_p95, rgb_good, monos, n_align = [], [], [], 0
     for e_i, ep in enumerate(eps):
         tid = find_task(bmark, ep["lang"])
         if tid is None:
@@ -401,32 +402,44 @@ def main() -> None:
               f"p50={np.median(dd):.2f} p95={np.percentile(dd, 95):.2f} "
               f"max={dd.max():.1f} cm")
         print(f"            对照：跳变阈值 5 cm，体素箱宽 ~30 cm")
+        depth_p95.append(float(np.percentile(dd, 95)))
+        rgb_good.append(good)
+        monos.append(mono)
+        n_align += 1
         end_err = float(errs[-1])
         worst_init = max(worst_init, d0)
         worst_end = end_err if worst_end is None else max(worst_end, end_err)
         n_ok += good >= 0.95
 
     print(f"\n{'=' * 60}\n=== 判读 ===")
-    print(f"  {n_ok}/{len(eps)} 条 episode 有 ≥95% 的帧误差 ≤ {args.tol}")
-    # ⚠️ 末帧误差要区分「测出来是 0」和「压根没测到」。初版两者都印 0.00，
-    #    读起来像"末帧完美"，实际是所有 episode 都卡在第 0 帧 continue 掉了。
-    end_txt = "未测（都卡在第 0 帧）" if worst_end is None else f"{worst_end:.2f}"
-    print(f"  最差的第 0 帧误差 {worst_init:.2f}，最差的末帧误差 {end_txt}")
-    if n_ok == len(eps) and worst_end <= args.tol:
-        print("  ✅ 回放能复现训练数据，可以给训练集缓存深度，G4/M2 解锁。")
-    elif worst_init > args.tol:
-        print("  ❌ **第 0 帧就对不上**，问题在初始状态或渲染设置，不是发散。"
-              "\n     按上面每条 episode 的三行诊断判：次好只差 <1 = 所有候选都不对；"
-              "\n     误差集中 = 物体位置不同；误差均匀 = 渲染/编码设置不同。"
-              "\n     若候选里 demo 数为 0，先把 LIBERO 演示数据下下来再说 ——"
-              "\n     RLDS 是从演示转换来的，评测初始状态是另一批。")
+    print(f"  能对上 demo 并完成对齐的 episode：{n_align}/{len(eps)}")
+    if not depth_p95:
+        print("  ❌ 一条都没对齐上，回放取深度这条路不通。"
+              "\n     回退方案见 docs/06 §6（单目深度估计）。")
+        return
+
+    # ⭐ **主判据是深度，不是 RGB。**
+    #    我们要缓存的是深度；RGB 只是找对应帧的手段。RGB 误差里混着机械臂的
+    #    亚帧位移 —— 它对像素敏感，对 patch 深度不敏感。真正该问的是：
+    #    「选错一帧」的代价（相邻帧深度差）相对于 G4 的两个尺度有多大。
+    p95 = float(np.median(depth_p95))
+    print(f"  相邻帧 patch 深度差的 p95（中位于各 episode）：**{p95:.2f} cm**")
+    print(f"    对照：跳变阈值 5 cm，体素箱宽 ~30 cm")
+    print(f"  RGB 误差 ≤{args.tol} 的帧占比：{np.median(rgb_good):.1%}（各 episode 中位）")
+    print(f"  匹配下标单调性：{np.median(monos):.1%}（对齐正确必然接近 100%）")
+
+    if p95 < 5.0 and np.median(monos) > 0.95:
+        print("\n  ✅ **可用**：对齐量化误差小于跳变阈值，更远小于箱宽；"
+              "\n     且匹配单调，说明帧对应关系正确。可以给训练集缓存深度。")
+    elif p95 < 30.0:
+        print(f"\n  🔶 深度误差 {p95:.1f} cm 介于跳变阈值与箱宽之间："
+              "\n     分箱不受影响，但跳变判定会被污染。§8.6 的跳变率要重测。")
     else:
-        print("  ❌ **随时间发散**：初始状态对得上，逐帧设状态后仍越走越远。"
-              "\n     这就不是重放的累积误差了（逐帧 set 没有累积），"
-              "\n     要查 RLDS 与 demo 是不是根本不同源。"
-              "\n     此时不能给训练集缓存深度 —— 深度会属于另一个场景，"
-              "\n     而 G4 照跑不报错。回退方案见 docs/06 §6（单目深度）。")
+        print(f"\n  ❌ 深度误差 {p95:.1f} cm 与箱宽同量级，分箱会错。回退单目深度。")
 
-
-if __name__ == "__main__":
-    main()
+    if n_align < len(eps):
+        print(f"\n  ⚠️ **{len(eps) - n_align}/{len(eps)} 条对不上，这是个混淆源。**"
+              "\n     若 G4/M2 只用能对上的子集训练，而 G2/G3 用全部，"
+              "\n     两者的数据量就不同，比较作废。"
+              "\n     **所有臂必须用同一个子集** —— 先跑大样本统计覆盖率，"
+              "\n     再决定是排除 episode 还是排除整个 task。")
