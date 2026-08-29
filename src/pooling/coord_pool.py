@@ -263,6 +263,20 @@ def coord_bin_pool(
     b, t, d = feat.shape
     c = coord.shape[-1]
     device = feat.device
+    # ⚠️ **token 数与坐标数必须逐一对应。** 2026-08 的教训：数据侧的 K 静默退化成 1，
+    #    feat 只有 256 个 token，而 wire 按 cfg.K=8 造了 2048 个坐标 —— 这一层当时
+    #    没有拦，整整 19.6 小时训出来的是单帧模型，而 loss/acc 全程正常。
+    #    这类"两边各自都合法、合起来不对"的错，只能在交界处拦。
+    if coord.shape[:2] != (b, t):
+        raise ValueError(
+            f"feat 有 {t} 个 token，coord 却给了 {coord.shape[1]} 个"
+            f"（feat {tuple(feat.shape)}，coord {tuple(coord.shape)}）。"
+            "多半是数据侧的 K 与接线的 cfg.K 不一致 —— 先跑 "
+            "scripts/check_kframe_shapes.py 看数据侧到底给了几帧。")
+    if valid is not None and tuple(valid.shape) != (b, t):
+        raise ValueError(
+            f"valid 应当是 {(b, t)}，收到 {tuple(valid.shape)} —— "
+            "补帧掩码与 token 数对不上。")
     if lo is None or hi is None:
         raise ValueError(
             "lo/hi 必须显式给定：按样本自适应归一化会让同一物理位置在不同样本里"
