@@ -58,6 +58,7 @@ except ImportError:                                    # 官方改过函数名�
         return tf.cast(tf.clip_by_value(tf.round(x), 0, 255), tf.uint8).numpy()
 
 from common.imgproc import center_crop_resize  # noqa: E402
+from common.runs import resolve_adapter  # noqa: E402
 from data.kframe import strided_chunk_indices  # noqa: E402
 from pooling.wire import (WireConfig, assert_rope_active, set_batch,  # noqa: E402
                           wire)
@@ -90,6 +91,7 @@ def main() -> None:
     ap.add_argument("--budget", type=int, default=256)
     ap.add_argument("--n_t", type=int, default=2)
     ap.add_argument("--adapter", default=None)
+    ap.add_argument("--run_root", default="runs", help="--adapter 找不到时列清单用")
     ap.add_argument("--vla_path", default="openvla/openvla-7b")
     ap.add_argument("--data_root_dir", default="datasets/modified_libero_rlds")
     ap.add_argument("--dataset_name", default="libero_10_no_noops")
@@ -101,6 +103,9 @@ def main() -> None:
     args = ap.parse_args()
     unnorm = args.unnorm_key or args.dataset_name
     dev = "cuda"
+    # ⚠️ 先把 checkpoint 路径查清楚再去加载 7B —— 否则要等三分钟才看到一句
+    #    与路径无关的 HFValidationError（见 common/runs 的说明）。
+    adapter = resolve_adapter(args.adapter, args.run_root) if args.adapter else None
 
     eps = load_episodes(args.data_root_dir, args.dataset_name, args.n_episodes)
     print(f"读到 {len(eps)} 条 episode，长度 {[len(e['actions']) for e in eps]}")
@@ -109,15 +114,14 @@ def main() -> None:
     model = AutoModelForVision2Seq.from_pretrained(
         args.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True,
         trust_remote_code=True, attn_implementation="flash_attention_2").to(dev)
-    if args.adapter:
+    if adapter:
         from peft import PeftModel
-        model = PeftModel.from_pretrained(model, args.adapter).merge_and_unload()
-        print(f"已加载 adapter: {args.adapter}")
+        model = PeftModel.from_pretrained(model, str(adapter)).merge_and_unload()
+        print(f"已加载 adapter: {adapter}")
 
     if unnorm not in model.norm_stats:
         sj = Path(args.stats_json) if args.stats_json else (
-            Path(args.adapter).parents[1] / "dataset_statistics.json"
-            if args.adapter else None)
+            adapter.parents[1] / "dataset_statistics.json" if adapter else None)
         if sj is None or not sj.exists():
             raise SystemExit(f"找不到动作统计量（找过 {sj}），用 --stats_json 指过去")
         d = json.loads(sj.read_text())

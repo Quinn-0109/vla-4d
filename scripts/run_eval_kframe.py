@@ -53,6 +53,7 @@ from experiments.robot.robot_utils import (invert_gripper_action,  # noqa: E402
                                            normalize_gripper_action)
 
 from common.imgproc import center_crop_resize  # noqa: E402
+from common.runs import resolve_adapter  # noqa: E402
 from pooling.wire import (WireConfig, assert_rope_active, set_batch,  # noqa: E402
                           wire)
 
@@ -76,6 +77,7 @@ class Config:
     num_steps_wait: int = 10
     unnorm_key: Optional[str] = None           # 默认取 task_suite_name + "_no_noops"
     stats_json: Optional[str] = None           # 默认找 <adapter>/../../dataset_statistics.json
+    run_root: str = "runs"                     # --adapter 找不到时列清单用
     center_crop: bool = True                   # ⚠️ 训练开了 image_aug 就必须开，见下
     seed: int = 7                              # 沿用阶段 0
     local_log_dir: str = "results/logs"
@@ -105,15 +107,17 @@ def main(cfg: Config) -> None:
     assert torch.cuda.is_available(), "需要 GPU"
     dev = "cuda"
     unnorm = cfg.unnorm_key or f"{cfg.task_suite_name}_no_noops"
+    # ⚠️ 先把 checkpoint 路径查清楚再去加载 7B（见 common/runs）。
+    adapter = resolve_adapter(cfg.adapter, cfg.run_root) if cfg.adapter else None
 
     processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
     model = AutoModelForVision2Seq.from_pretrained(
         cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True,
         trust_remote_code=True, attn_implementation="flash_attention_2").to(dev)
-    if cfg.adapter:
+    if adapter:
         from peft import PeftModel
-        model = PeftModel.from_pretrained(model, cfg.adapter).merge_and_unload()
-        print(f"已加载 adapter: {cfg.adapter}")
+        model = PeftModel.from_pretrained(model, str(adapter)).merge_and_unload()
+        print(f"已加载 adapter: {adapter}")
 
     # ⚠️ **动作反归一化的统计量必须注入。**
     #    底座 openvla-7b 的 norm_stats 里只有 OXE 预训练那些数据集，没有 LIBERO；
@@ -123,8 +127,7 @@ def main(cfg: Config) -> None:
     #    "unnorm_key not in available dataset statistics"（好在会报错，不会静默）。
     if unnorm not in model.norm_stats:
         sj = Path(cfg.stats_json) if cfg.stats_json else (
-            Path(cfg.adapter).parents[1] / "dataset_statistics.json"
-            if cfg.adapter else None)
+            adapter.parents[1] / "dataset_statistics.json" if adapter else None)
         if sj is None or not sj.exists():
             raise SystemExit(
                 f"底座里没有 `{unnorm}` 的动作统计量，也找不到 dataset_statistics.json。\n"
