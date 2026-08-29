@@ -118,6 +118,24 @@ def demo_all_states(task, demo_key: str):
         return np.asarray(f["data"][demo_key]["states"])
 
 
+def patch_depth(env, d: np.ndarray, flip: bool, grid: int = 16, patch: int = 16):
+    """深度缓冲 → 米 → patch 级均值 (16,16)。与 depth_diag 同一套换算与翻转。"""
+    from PIL import Image
+    try:
+        from robosuite.utils.camera_utils import get_real_depth_map
+        m = get_real_depth_map(env.sim, d[..., None])[..., 0]
+    except Exception:
+        mo = env.sim.model
+        ext = mo.stat.extent
+        near, far = mo.vis.map.znear * ext, mo.vis.map.zfar * ext
+        m = near / (1.0 - d * (1.0 - near / far))
+    if flip:
+        m = m[::-1, ::-1]
+    m = np.array(Image.fromarray(m.astype(np.float32), mode="F")
+                 .resize((224, 224), Image.BILINEAR))
+    return m.reshape(16, 14, 16, 14).transpose(0, 2, 1, 3).reshape(16, 16, -1).mean(-1)
+
+
 def align_by_state(env, states, rlds, flip: bool, stride: int = 2):
     """
     ⭐ **逐帧设状态，不重放动作。**
@@ -136,17 +154,21 @@ def align_by_state(env, states, rlds, flip: bool, stride: int = 2):
     def small(a):
         return a[::8, ::8].astype(np.int16)
 
-    bank, idxs = [], list(range(0, len(states), stride))
+    bank, dep, idxs = [], [], list(range(0, len(states), stride))
     for t in idxs:
         env.reset()
-        bank.append(rgb_of(env.set_init_state(states[t]), flip))
+        obs = env.set_init_state(states[t])
+        bank.append(rgb_of(obs, flip))
+        d = np.asarray(obs[f"{CAM}_depth"])
+        dep.append(patch_depth(env, d[..., 0] if d.ndim == 3 else d, flip))
     bank_s = np.stack([small(b) for b in bank])
     errs, matches = [], []
     for r in rlds:
         j = int(np.abs(bank_s - small(r)).mean(axis=(1, 2, 3)).argmin())
         errs.append(diff(bank[j], r))
-        matches.append(idxs[j])
-    return np.asarray(errs), np.asarray(matches)
+        matches.append(j)
+    dep = np.stack(dep)                                  # (n_bank, 16, 16)
+    return np.asarray(errs), np.asarray(matches), np.asarray(idxs), dep
 
 
 def demo_states(task, n_demo: int = 60, n_frame: int = 1):
@@ -347,9 +369,10 @@ def main() -> None:
             env.close()
             worst_init = max(worst_init, d0)
             continue
-        errs, matches = align_by_state(env, st_all, ep["images"], flip,
-                                       args.align_stride)
+        errs, mj, idxs, dep = align_by_state(env, st_all, ep["images"], flip,
+                                             args.align_stride)
         env.close()
+        matches = idxs[mj]
         good = float((errs <= args.tol).mean())
         mono = float((np.diff(matches) >= 0).mean())
         print(f"       逐帧对齐（demo {len(st_all)} 帧，步长 {args.align_stride}）："
@@ -357,6 +380,15 @@ def main() -> None:
               f"max={errs.max():.1f}  ≤{args.tol} 占 **{good:.1%}**")
         print(f"         匹配下标单调性 {mono:.1%}"
               f"（对齐正确必然接近 100%）  覆盖 {matches.min()}–{matches.max()}")
+        # ⭐ **RGB 误差只是代理，深度才是我们要的量。**
+        #    时间对齐有量化误差（步长 + no_noops 删帧），机械臂在动时差半帧
+        #    就有几个像素差 —— 但真正该问的是：差一帧，**深度**差多少？
+        #    拿它和 G4 的两个尺度比：跳变阈值 5 cm、体素箱宽 ~30 cm。
+        dd = np.abs(np.diff(dep, axis=0)).ravel() * 100          # cm
+        print(f"         ⭐ 相邻帧的 patch 深度差（= 对齐量化误差的上界）："
+              f"p50={np.median(dd):.2f} p95={np.percentile(dd, 95):.2f} "
+              f"max={dd.max():.1f} cm")
+        print(f"            对照：跳变阈值 5 cm，体素箱宽 ~30 cm")
         end_err = float(errs[-1])
         worst_init = max(worst_init, d0)
         worst_end = end_err if worst_end is None else max(worst_end, end_err)
