@@ -73,11 +73,18 @@ from pooling.wire import WireConfig, assert_rope_active, set_batch, wire  # noqa
 #   显存几乎不变（序列长都是 294，视觉主干冻结、分 K 次串行不留激活），
 #   时间翻 1.87 倍（8 倍视觉前向）。压缩必须靠效果说话。
 #
-# 16.6 GB 离 24 GB 还有余量，micro=4/8 值得各 `--bench_only` 两分钟再定。
+# 微批扫描（真 K=8，2026-08）：
+#
+#     micro=2  4.4 s/步  16.6 GB  30k 步 37.0 h
+#     micro=4  3.9 s/步  17.4 GB  30k 步 32.1 h
+#     micro=8  3.7 s/步  19.0 GB  30k 步 30.8 h   ← 取这个
+#
+# 2→8 省 16%，4→8 只再省 1.3 h 却多 1.6 GB —— 边际很小，但 24 GB 卡装得下。
+# 与 K=1 那轮"4→8 归零"的形状不同：那时每步只有 16 次视觉前向，现在是 128 次。
 #
 # ⚠️ **有效批必须恒为 16**，所以只让改微批，累积由它自动配平。
 EFF_BATCH = 16
-MICRO = {1: (16, 1), 8: (2, 8)}      # ⚠️ K=8 这组是待重测的暂定值，见上
+MICRO = {1: (16, 1), 8: (8, 2)}      # K=8 取 micro=8，见上表
 
 
 @dataclass
@@ -241,6 +248,12 @@ def main(cfg: Config) -> None:
                    d / "trainer_state.pt")
         processor.save_pretrained(run_dir)
         print(f"\n[step {step}] 已存 -> {d}")
+        # ⚠️ 续训**必须用同一个 --micro**：exp_id 里带 b{micro}x{accum}，
+        #    换了微批就写进另一个目录，等于从头再来而且不报错。
+        print(f"  续训: python scripts/finetune_kframe.py --arm {cfg.arm} "
+              f"--micro {micro} --data_root_dir {cfg.data_root_dir} "
+              + (f"--run_id_note {cfg.run_id_note} " if cfg.run_id_note else "")
+              + f"--resume_from {d}", flush=True)
 
     # ⚠️⚠️ **第一批就把形状钉死。** openvla 的 RLDSDataset 把 window_size=1 写死在
     #    构造函数里，K 一旦没顶进去就会静默退化成单帧：pixel_values 变成
