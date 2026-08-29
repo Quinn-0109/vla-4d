@@ -101,6 +101,12 @@ class Config:
     log_steps: int = 10
     resume_from: Optional[str] = None
     bench_only: bool = False
+    # ⚠️ 只前向、不更新，用来**复核某个 checkpoint 的 acc**。与 --resume_from 配合：
+    #    走的是这个文件里训练用的同一条链路（同一个 RLDSDataset、同一个
+    #    KFrameBatchTransform、同一套 acc 公式），所以数字与训练日志逐位可比 ——
+    #    另写一个评测脚本去"重现"训练输入，重现错了会长得像"模型没学会"。
+    eval_only: bool = False
+    eval_steps: int = 100                      # 只前向时跑几个微批
     micro: int = 0                             # 0 = 用 MICRO 表；>0 覆盖，累积自动配平
     run_id_note: Optional[str] = None
     # fmt: on
@@ -228,6 +234,47 @@ def main(cfg: Config) -> None:
                    d / "trainer_state.pt")
         processor.save_pretrained(run_dir)
         print(f"\n[step {step}] 已存 -> {d}")
+
+    if cfg.eval_only:
+        if not cfg.resume_from:
+            raise SystemExit("--eval_only 要配 --resume_from <adapter 目录>，"
+                             "否则复核的是没微调过的底座")
+        vla.eval()
+        hit = tot = 0
+        loss_sum = 0.0
+        checked = False
+        with torch.no_grad():
+            for i, batch in enumerate(loader):
+                if i >= cfg.eval_steps:
+                    break
+                set_batch(state, depth=None,
+                          frame_pad_mask=batch["frame_pad_mask"].to(dev))
+                with torch.autocast("cuda", dtype=torch.bfloat16):
+                    out = vla(input_ids=batch["input_ids"].to(dev),
+                              attention_mask=batch["attention_mask"].to(dev),
+                              pixel_values=batch["pixel_values"].to(torch.bfloat16).to(dev),
+                              labels=batch["labels"])
+                if not checked:
+                    assert_rope_active(state)
+                    print(f"  ✓ 4D RoPE 已生效（{state.rope_calls} 次）"
+                          f"  序列长 {out.logits.shape[1]}")
+                    checked = True
+                preds = out.logits[:, n_vis:-1].argmax(dim=2)
+                gt = batch["labels"][:, 1:].to(preds.device)
+                m = gt > action_tokenizer.action_token_begin_idx
+                hit += int(((preds == gt) & m).sum())
+                tot += int(m.sum())
+                loss_sum += float(out.loss)
+                if (i + 1) % 10 == 0:
+                    print(f"  {i + 1:>4}/{cfg.eval_steps} 微批  "
+                          f"acc {hit / max(tot, 1):.3f}  loss {loss_sum / (i + 1):.3f}",
+                          flush=True)
+        print(f"\n=== 只前向复核（{cfg.arm}，{cfg.resume_from}）===")
+        print(f"  动作 token 准确率 {hit / max(tot, 1):.4f}（{hit}/{tot}）")
+        print(f"  loss {loss_sum / max(min(cfg.eval_steps, i + 1), 1):.4f}")
+        print("  ⬆ 与训练日志末尾的 acc/loss 直接比。差不多 = 训练侧没问题，"
+              "问题在评测的输入构造；差很多 = checkpoint 或接线本身有问题。")
+        return
 
     vla.train()
     optimizer.zero_grad()

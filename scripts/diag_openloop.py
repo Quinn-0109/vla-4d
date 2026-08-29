@@ -150,6 +150,8 @@ def main() -> None:
     ap.add_argument("--t_from", choices=("all", "history"), default="all",
                     help="all=整条 episode 均匀采样（与训练同分布，缺省）；"
                          "history=只取历史完整的时刻")
+    ap.add_argument("--train_acc", type=float, default=0.0,
+                    help="训练日志里的 acc，用来判断 tf 有没有复现出训练那条路径")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
     unnorm = args.unnorm_key or args.dataset_name
@@ -265,14 +267,16 @@ def main() -> None:
         g = lab[0, 1:]
         m = g > atok.action_token_begin_idx
         z = atok.decode_token_ids_to_actions(pr[m].cpu().numpy())
-        return (int(((pr == g) & m).sum()), int(m.sum()),
-                denorm_action(np.asarray(z).reshape(-1)[:7], q01, q99, amask))
+        hit = (pr == g)[m].cpu().numpy()          # (7,) 每一维中没中
+        return (int(hit.sum()), int(m.sum()),
+                denorm_action(np.asarray(z).reshape(-1)[:7], q01, q99, amask),
+                hit)
 
     base_acc = None
     if args.also_base and adapter:
         h = n = 0
         for sm in samples:
-            a, b, _ = tf_once(sm)
+            a, b, _, _ = tf_once(sm)
             h, n = h + a, n + b
         base_acc = h / max(n, 1)
         print(f"\n【对照】**没加 adapter** 的底座，同样的 tf: acc {base_acc:.3f}"
@@ -286,13 +290,14 @@ def main() -> None:
     # ---------------- 正式测量 ----------------
     pred = {v: [] for v in variants}
     tf_hits = tf_tot = 0
-    gt_all, checked = [], False
+    gt_all, tf_dim, checked = [], [], False
     for sm in samples:
         gt_all.append(sm["act"])
         for v in variants:
             if v == "tf":
-                a, b, act_hat = tf_once(sm)
+                a, b, act_hat, hit = tf_once(sm)
                 tf_hits, tf_tot = tf_hits + a, tf_tot + b
+                tf_dim.append(hit)
                 pred[v].append(act_hat)
                 continue
             fr = sm["shuf"] if v == "shuffled" else sm["frames"]
@@ -334,7 +339,13 @@ def main() -> None:
           "≈1 等于常数预测）")
     if "tf" in variants:
         print(f"\nteacher forcing 的动作 token 准确率: {tf_hits / max(tf_tot, 1):.3f}"
-              f"（{tf_hits}/{tf_tot}）—— **直接和训练日志里的 acc 比**")
+              f"（{tf_hits}/{tf_tot}）—— **直接和训练日志里的 acc 比**"
+              + (f"，训练是 {args.train_acc:.3f}" if args.train_acc else ""))
+        if tf_dim:
+            d = np.stack(tf_dim).mean(axis=0)
+            print("  逐维: " + "  ".join(f"{n} {v:.2f}" for n, v in zip(DIMS, d)))
+        if base_acc is not None:
+            print(f"  底座（无 adapter）同样的 tf: {base_acc:.3f}")
 
     print("\n前 3 个时刻，逐维对照：")
     for i in range(min(3, len(gt))):
@@ -344,33 +355,40 @@ def main() -> None:
 
     print("\n判读：")
     tf_acc = tf_hits / max(tf_tot, 1)
-    has = lambda v: v in rel                                    # noqa: E731
+    g, sh, t_ = (rel.get(k, float("nan")) for k in ("gen", "shuffled", "tf"))
     if base_acc is not None and tf_acc <= base_acc + 0.02:
         print(f"  ❌ 微调后的 tf（{tf_acc:.3f}）并不比**没加 adapter 的底座**"
-              f"（{base_acc:.3f}）好 —— adapter 在这条路径上等于没起作用。"
-              "接线参数与训练是否一致、n_vis 切片、merge 是否真的落在目标层。")
-    elif "tf" in variants and tf_acc < 0.15:
-        print(f"  ❌ 连 teacher forcing 都只有 {tf_acc:.3f} —— **不是生成路径的问题**，"
-              "训练时那条前向在这里就复现不出来。查 adapter 是否真的合进去了、"
-              "接线参数（arm/K/budget/n_t）与训练是否一致、n_vis 切片。")
-    elif "tf" in variants and has("gen") and rel["gen"] > 0.9 > rel["tf"]:
-        print(f"  ⭐ teacher forcing 正常（acc {tf_acc:.3f}，MAE 比 {rel['tf']:.2f}）"
-              f"而自回归生成失效（{rel['gen']:.2f}）—— **坏在生成这条路径上**。")
-        if has("gen_nocache"):
-            if rel["gen_nocache"] < rel["gen"] * 0.8:
-                print(f"     关掉 KV cache 就好了（{rel['gen_nocache']:.2f}）—— "
-                      "定位到 wire._Rope 里按 position_ids 取 cos/sin 那一段。")
-            else:
-                print(f"     关掉 KV cache 也没好转（{rel['gen_nocache']:.2f}）—— "
-                      "不是 cache，查 prompt/29871/生成时的 pixel_values 通路。")
-    elif has("gen") and has("shuffled") and abs(rel["gen"] - rel["shuffled"]) < 0.05:
+              f"（{base_acc:.3f}）高 —— adapter 在这条路径上等于没起作用。"
+              "查接线参数与训练是否一致、n_vis 切片、merge 是否真落在目标层。")
+    elif args.train_acc and tf_acc < 0.7 * args.train_acc:
+        print(f"  ❌ tf 只有 {tf_acc:.3f}，训练日志是 {args.train_acc:.3f} —— "
+              "**训练那条前向在这里就复现不出来**，不是生成路径的问题。"
+              "用 `finetune_kframe.py --eval_only True --resume_from <adapter>` "
+              "复核：那条路径与训练逐位相同，能把'我这个脚本重写错了'从嫌疑里排掉。")
+    elif not (g < 0.9):
+        # ⚠️ 早先这里是个兜底的 else，于是 gen=1.08（比基线还差）也被打成"✅"。
+        #    判据错比结果错更难发现 —— 结论分支必须每条都自己带条件。
+        print(f"  ❌ 没有一个变体优于基线（gen {g:.2f}，tf {t_:.2f}，"
+              f"shuffled {sh:.2f}）—— 开环就已经不成立，闭环那边先别动。")
+        if abs(g - sh) < 0.05:
+            print("     且打乱画面几乎不改变预测 —— **画面没有进入决策**。")
+    elif t_ < 0.9 <= g:
+        print(f"  ⭐ tf 正常（{t_:.2f}）而自回归生成失效（{g:.2f}）—— "
+              "坏在生成这条路径上。")
+        if "gen_nocache" in rel:
+            ok = rel["gen_nocache"] < g * 0.8
+            print(f"     关掉 KV cache {'就好了' if ok else '也没好转'}"
+                  f"（{rel['gen_nocache']:.2f}）—— "
+                  + ("定位到 wire._Rope 里按 position_ids 取 cos/sin 那一段。"
+                     if ok else "不是 cache，查 prompt/29871/pixel_values 通路。"))
+    elif abs(g - sh) < 0.05:
         print("  ❌ 打乱画面几乎不改变预测 —— **画面没有进入决策**。"
               "查视觉挂点与 pixel_values 的通道排布。")
     else:
-        print(f"  ✅ 开环预测优于基线（gen {rel.get('gen', float('nan')):.2f}），"
+        print(f"  ✅ 开环预测优于基线（gen {g:.2f}，tf token acc {tf_acc:.3f}），"
               "策略是学到了的 —— 0% 出在**闭环**那一侧。")
-    if has("gen") and has("nocrop") and rel["nocrop"] > rel["gen"] * 1.15:
-        print(f"  ⚠️ 不裁剪时误差高 {rel['nocrop'] / rel['gen'] - 1:.0%}，"
+    if "gen" in rel and "nocrop" in rel and rel["nocrop"] > g * 1.15:
+        print(f"  ⚠️ 不裁剪时误差高 {rel['nocrop'] / g - 1:.0%}，"
               "评测务必带 --center_crop True。")
 
 
