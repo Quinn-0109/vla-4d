@@ -221,7 +221,10 @@ def main() -> None:
                     pred[v].append(denorm_action(np.asarray(z).reshape(-1)[:7],
                                                  q01, q99, amask))
                 else:
-                    set_batch(state, depth=None, frame_pad_mask=pad)
+                    # ⚠️ `use_cache=False` 的生成**每步重跑整条前向**，投影器
+                    #    因此被调用 1+7 次；带 cache 时只有 prefill 那一次。
+                    set_batch(state, depth=None, frame_pad_mask=pad,
+                              n_uses=8 if v == "gen_nocache" else 1)
                     with torch.no_grad():
                         a = model.predict_action(
                             input_ids=ids, pixel_values=px, unnorm_key=unnorm,

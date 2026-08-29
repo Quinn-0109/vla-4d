@@ -101,6 +101,7 @@ class _State:
 
     def __init__(self):
         self.batch: Optional[_Batch] = None
+        self.uses_left: int = 0         # 还允许被消费几次，见 set_batch(n_uses=)
         self.rope: Optional[tuple] = None
         self.rope_calls: int = 0        # 我们的 rotary_emb 被真正调用了几次
         self.orig: dict = {}            # 原始实现，unwire 时还回去
@@ -109,11 +110,17 @@ class _State:
         self.rope_cache_key = None
 
     def take(self) -> _Batch:
-        if self.batch is None:
+        if self.batch is None or self.uses_left <= 0:
             raise RuntimeError(
                 "forward 前没有调用 set_batch()。深度与相机不在 pixel_values 里，"
-                "沿用上一批的值不会报错、loss 照降，但坐标全是错的 —— 所以这里硬抛。")
-        b, self.batch = self.batch, None
+                "沿用上一批的值不会报错、loss 照降，但坐标全是错的 —— 所以这里硬抛。"
+                "\n（`use_cache=False` 的自回归生成会**逐步重跑整条前向**，"
+                "投影器于是被调用 1+max_new_tokens 次 —— 那种场合要 "
+                "`set_batch(..., n_uses=...)` 把次数说清楚，而不是把它改成常驻。）")
+        b = self.batch
+        self.uses_left -= 1
+        if self.uses_left == 0:
+            self.batch = None
         self.rope_cache = self.rope_cache_key = None      # 新一批，缓存作废
         return b
 
@@ -335,9 +342,21 @@ def assert_rope_active(state: _State) -> None:
             f"只有 {state.rope_calls}/{exp} 层用上了 4D RoPE —— 部分层走了别的路径。")
 
 
-def set_batch(state: _State, depth=None, frame_pad_mask=None, cameras=()) -> None:
+def set_batch(state: _State, depth=None, frame_pad_mask=None, cameras=(),
+              n_uses: int = 1) -> None:
+    """
+    交出这一批的深度 / 补帧掩码 / 相机。**每次 forward 前都要调。**
+
+    `n_uses` = 这一批允许被投影器消费几次，缺省 1（训练与带 KV cache 的生成
+    都只在 prefill 那一次跑投影器）。⚠️ 只有 `use_cache=False` 的自回归生成
+    例外：它每步都重跑整条前向，要传 `n_uses = 1 + max_new_tokens`。
+    说成一个**具体次数**而不是"常驻"，是为了让"忘了 set_batch"继续报错 ——
+    那才是这个机制存在的理由。
+    """
+    assert n_uses >= 1, n_uses
     state.batch = _Batch(depth=depth, frame_pad_mask=frame_pad_mask,
                          cameras=list(cameras))
+    state.uses_left = n_uses
 
 
 # ---------------------------------------------------------------- 自检
@@ -414,7 +433,16 @@ def _selftest() -> None:
         raise SystemExit("    ✗ state 被消费两次竟然过了")
     except RuntimeError:
         pass
-    print("✅ 6/9 state 是一次性的：没 set_batch 或重复消费都硬抛")
+    # use_cache=False 的生成每步重跑整条前向，投影器要被调 1+max_new_tokens 次
+    set_batch(st, depth=depth, frame_pad_mask=pad, cameras=[cam] * B, n_uses=3)
+    for _ in range(3):
+        st.take()
+    try:
+        st.take()
+        raise SystemExit("    ✗ 超出 n_uses 竟然过了")
+    except RuntimeError:
+        pass
+    print("✅ 6/9 state 是一次性的：没 set_batch、重复消费、超出 n_uses 都硬抛")
 
     st2 = _State()
     st2.n_layers = 32
