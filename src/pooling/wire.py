@@ -22,7 +22,7 @@
    忘了调 = 拿上一批的深度算这一批的坐标，**不会报错**。所以 state 是一次性的：
    消费掉就作废，下一次 forward 拿不到就抛异常。
 
-`python src/pooling/wire.py` 跑 8 项自检（桩模型，不加载 7B）。
+`python src/pooling/wire.py` 跑 9 项自检（桩模型，不加载 7B）。
 """
 
 from __future__ import annotations
@@ -237,23 +237,35 @@ def _patch_rope(model, cfg: WireConfig, state: _State) -> None:
                 raise RuntimeError("rotary_emb 被调用时 state.rope 还没建好")
             state.rope_calls += 1
             c_norm, pos1d = state.rope
-            # 真实序列长只有到这里才知道（x 是 value_states: (B, heads, T, hd)）。
-            # 布局 [BOS] [视觉 n_vis] [文本]，所以 n_text = T − 1 − n_vis。
-            total = x.shape[-2]
             n_vis = c_norm.shape[1]
-            n_text = total - 1 - n_vis
+
+            # ⚠️ **带 KV cache 的自回归解码每步只喂 1 个 token**，那时
+            #    x.shape[-2] == 1，按它推 n_text 会得到负数。真实位置在
+            #    `position_ids` 里（transformers 4.40 就是这么传的），
+            #    所以：按最大位置建整条序列的 cos/sin，再按 position_ids 取。
+            #    prefill 时 position_ids = arange(T)，取出来与整条一致。
+            if position_ids is not None:
+                need = int(position_ids.max().item()) + 1
+            else:
+                need = x.shape[-2]
+            n_text = need - 1 - n_vis
             if n_text < 0:
                 raise RuntimeError(
-                    f"序列长 {total} 比 1+视觉 {1 + n_vis} 还短 —— 池化输出与"
+                    f"序列长 {need} 比 1+视觉 {1 + n_vis} 还短 —— 池化输出与"
                     "实际喂进 LLM 的视觉块对不上，先查 projector 那一步。")
-            key = (total, n_text)
-            if state.rope_cache_key != key:
+            if state.rope_cache_key != need:
                 p1, c4, isvis = assemble(
                     c_norm, pos1d, torch.ones_like(pos1d, dtype=torch.bool),
                     n_text=n_text, k=cfg.K)
                 state.rope_cache = build_rope(p1, c4, isvis, cfg.head_dim, plan)
-                state.rope_cache_key = key
-            cos, sin = state.rope_cache
+                state.rope_cache_key = need
+            cos, sin = state.rope_cache                      # (B, need, hd)
+            if position_ids is not None and position_ids.shape[-1] != cos.shape[1]:
+                idx = position_ids.to(cos.device).long()
+                if idx.shape[0] != cos.shape[0]:
+                    idx = idx.expand(cos.shape[0], -1)
+                g = idx.unsqueeze(-1).expand(-1, -1, cos.shape[-1])
+                cos, sin = cos.gather(1, g), sin.gather(1, g)
             return cos.to(x.dtype), sin.to(x.dtype)
 
     layers = model.language_model.model.layers
@@ -353,17 +365,17 @@ def _selftest() -> None:
         e, p, c, _ = run(arm)
         assert e.shape == (B, N_PATCH, D), (arm, e.shape)
         assert p.shape == (B, N_PATCH) and c.shape[-1] in (3, 4)
-    print("✅ 1/8 token 数：G1 保持 2048，四个池化臂都压到 256")
+    print("✅ 1/9 token 数：G1 保持 2048，四个池化臂都压到 256")
 
     _, _, c4, _ = run("G4")
     _, _, cm, _ = run("M2")
     assert c4.shape[-1] == 4 and cm.shape[-1] == 3
-    print("✅ 2/8 M2 的错配：池化侧与 G4 同为度量坐标，PE 侧是 3 轴 (t,h,w)")
+    print("✅ 2/9 M2 的错配：池化侧与 G4 同为度量坐标，PE 侧是 3 轴 (t,h,w)")
 
     e4, _, _, _ = run("G4")
     e2, _, _, _ = run("M2")
     assert torch.equal(e4, e2), "M2 的池化侧必须与 G4 逐位相同"
-    print("✅ 3/8 M2 与 G4 的池化输出逐位相同（只有 PE 侧不同）")
+    print("✅ 3/9 M2 与 G4 的池化输出逐位相同（只有 PE 侧不同）")
 
     pad = torch.ones(B, K, dtype=torch.bool)
     pad[:, :3] = False                       # 前 3 帧是补帧
@@ -375,7 +387,7 @@ def _selftest() -> None:
         valid=pad.repeat_interleave(N_PATCH, dim=1))
     assert (out.assign[:, :3 * N_PATCH] == -1).all()
     assert int(out.size[0].sum()) == int(pad[0].sum()) * N_PATCH
-    print("✅ 4/8 补帧被屏蔽：assign 全 -1，且不占任何箱")
+    print("✅ 4/9 补帧被屏蔽：assign 全 -1，且不占任何箱")
 
     for n_keep in (120, 200, 256):
         p1 = torch.arange(n_keep).float().unsqueeze(0)
@@ -386,7 +398,7 @@ def _selftest() -> None:
         first_text = float(pos[0, 1 + n_keep])
         assert first_text == K * N_PATCH + 1, (n_keep, first_text)
         assert not bool(isv[0, 1 + n_keep]) and bool(isv[0, 1])
-    print(f"✅ 5/8 文本起点恒为 K*256+1 = {K * N_PATCH + 1}，与存活 token 数无关"
+    print(f"✅ 5/9 文本起点恒为 K*256+1 = {K * N_PATCH + 1}，与存活 token 数无关"
           "（120/200/256 三种存活数都试过）")
 
     st = _State()
@@ -402,7 +414,7 @@ def _selftest() -> None:
         raise SystemExit("    ✗ state 被消费两次竟然过了")
     except RuntimeError:
         pass
-    print("✅ 6/8 state 是一次性的：没 set_batch 或重复消费都硬抛")
+    print("✅ 6/9 state 是一次性的：没 set_batch 或重复消费都硬抛")
 
     st2 = _State()
     st2.n_layers = 32
@@ -413,7 +425,7 @@ def _selftest() -> None:
             assert not should_raise, f"{calls} 次调用竟然过了"
         except RuntimeError:
             assert should_raise
-    print("✅ 7/8 assert_rope_active：0 次和部分层都拦下，32/32 才放行")
+    print("✅ 7/9 assert_rope_active：0 次和部分层都拦下，32/32 才放行")
 
     # 回归：cos/sin 的长度必须跟着**真实序列长**走，不能在投影器里写死。
     # 初版把 n_text 写死成 0，真模型上 q 是 2068 而 cos 是 2049，
@@ -449,7 +461,22 @@ def _selftest() -> None:
     unwire(fake, st)
     assert isinstance(fake.language_model.model.layers[0].self_attn.rotary_emb,
                       torch.nn.Identity), "unwire 没还原"
-    print("✅ 8/8 cos/sin 跟随真实序列长（7/19/40 三种文本长度），unwire 能还原")
+    print("✅ 8/9 cos/sin 跟随真实序列长（7/19/40 三种文本长度），unwire 能还原")
+
+    # 回归：带 KV cache 的自回归解码每步只喂 1 个 token，x.shape[-2]==1，
+    # 按它推 n_text 会得到负数。真实位置在 position_ids 里。
+    f2, c2 = _Fake(), WireConfig(arm="G3", K=K)
+    st2 = wire(f2, c2)
+    st2.rope = (torch.rand(1, n_vis, 3) * 16, torch.arange(n_vis).float().unsqueeze(0))
+    rp = f2.language_model.model.layers[0].self_attn.rotary_emb
+    T = 1 + n_vis + 20
+    full, _ = rp(torch.zeros(1, 4, T, c2.head_dim), position_ids=torch.arange(T).unsqueeze(0))
+    dec, _ = rp(torch.zeros(1, 4, 1, c2.head_dim), position_ids=torch.tensor([[T - 1]]))
+    assert full.shape[1] == T and dec.shape[1] == 1
+    assert torch.allclose(dec[0, 0], full[0, T - 1]), "解码位必须与 prefill 同位置一致"
+    rp(torch.zeros(1, 4, 1, c2.head_dim), position_ids=torch.tensor([[T]]))  # 新生成位
+    unwire(f2, st2)
+    print("✅ 9/9 KV cache 解码：prefill / 解码位 / 新生成位三者一致（评测走 generate）")
 
     print("\n⚠️ 尚未验证、必须在真模型上做的两件事："
           "\n  ① 端到端挂上 7B 后，**第一次 forward 之后调 `assert_rope_active`** —— "
