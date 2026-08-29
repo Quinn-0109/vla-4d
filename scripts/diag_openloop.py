@@ -81,9 +81,40 @@ def load_episodes(data_root: str, name: str, n: int):
         out.append({
             "lang": steps[0]["language_instruction"].decode().strip().lower(),
             "images": np.stack([s["observation"]["image"] for s in steps]),
-            "actions": np.stack([s["action"] for s in steps]).astype(np.float64),
+            # ⚠️ 原始动作要过一遍 LIBERO 的变换才是模型见过的那个（见 libero_action）
+            "actions": libero_action(
+                np.stack([s["action"] for s in steps]).astype(np.float64)),
         })
     return out
+
+
+def libero_action(a):
+    """
+    openvla 的 `libero_dataset_transform`：**夹爪从 −1(开)/+1(关) 变成
+    `1 − clip(g, 0, 1)` ∈ {0, 1}**，前六维不动。
+
+    ⚠️ 这一条是我这个脚本第一版漏掉的：直接拿 tfds 的原始动作当真值，
+    夹爪那一维的真值和 teacher forcing 的标签就都是错的（真值 −1，而模型
+    被训成输出 0 或 1），那个 token 必然不中，acc 上限被压到 6/7。
+    判据本身错了比结果错更难发现 —— 所以下面 `check_stats` 拿 
+    dataset_statistics.json 对一遍，对不上就直接喊出来。
+    """
+    a = np.asarray(a, dtype=np.float64)
+    g = 1.0 - np.clip(a[..., -1:], 0.0, 1.0)
+    return np.concatenate([a[..., :6], g], axis=-1)
+
+
+def check_stats(acts, q01, q99) -> None:
+    """变换后的动作应当落在 dataset_statistics 的分位区间里，否则变换是错的。"""
+    lo, hi = np.percentile(acts, [1, 99], axis=0)
+    bad = [DIMS[i] for i in range(len(DIMS))
+           if abs(lo[i] - q01[i]) > 0.15 * max(abs(q99[i] - q01[i]), 1e-6)
+           or abs(hi[i] - q99[i]) > 0.15 * max(abs(q99[i] - q01[i]), 1e-6)]
+    print("动作变换自检（本样本 p1/p99 vs 统计量 q01/q99）: "
+          + ("✅ 各维一致" if not bad else f"⚠️ 对不上的维: {bad}"))
+    if bad:
+        print("   " + "  ".join(f"{d}:{a:+.2f}/{b:+.2f}→{c:+.2f}/{e:+.2f}"
+                                for d, a, b, c, e in zip(DIMS, lo, hi, q01, q99)))
 
 
 def norm_action(a, q01, q99, mask):
@@ -113,6 +144,12 @@ def main() -> None:
     ap.add_argument("--n_episodes", type=int, default=3)
     ap.add_argument("--n_steps", type=int, default=8, help="每条 episode 采样几个时刻")
     ap.add_argument("--variants", default=",".join(VARIANTS))
+    ap.add_argument("--also_base", action="store_true", default=True,
+                    help="先用**没加 adapter 的底座**跑一遍 tf 作对照（缺省开）")
+    ap.add_argument("--no_also_base", dest="also_base", action="store_false")
+    ap.add_argument("--t_from", choices=("all", "history"), default="all",
+                    help="all=整条 episode 均匀采样（与训练同分布，缺省）；"
+                         "history=只取历史完整的时刻")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
     unnorm = args.unnorm_key or args.dataset_name
@@ -130,10 +167,28 @@ def main() -> None:
     model = AutoModelForVision2Seq.from_pretrained(
         args.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True,
         trust_remote_code=True, attn_implementation="flash_attention_2").to(dev)
-    if adapter:
+    # ⚠️ **merge 到底改没改权重，要有数**。目标层名字对不上时 peft 会报错，
+    #    但"合进去了、幅度却近乎为零"不会报 —— 而它长得就像"模型没学会"。
+    #    merge 推迟到底座对照跑完之后，见 --also_base。
+    probe = [n for n, _ in model.named_parameters()
+             if n.endswith(("q_proj.weight", "v_proj.weight"))][:4]
+    snap = {n: p.detach().clone() for n, p in model.named_parameters() if n in probe}
+
+    def do_merge():
+        nonlocal model
         from peft import PeftModel
         model = PeftModel.from_pretrained(model, str(adapter)).merge_and_unload()
+        now = dict(model.named_parameters())
+        d = {n: float((now[n].detach() - snap[n]).abs().mean())
+             for n in probe if n in now}
         print(f"已加载 adapter: {adapter}")
+        print("  merge 权重变化 |Δ|/|W|: " + "  ".join(
+            f"{n.split('.')[-3]}.{n.split('.')[-2]} "
+            f"{d[n] / float(snap[n].abs().mean()):.2%}" for n in d))
+        if d and max(d.values()) == 0.0:
+            raise SystemExit(
+                "❌ merge 之后被探针盯着的权重**一个 bit 都没变** —— adapter 等于没加。"
+                "查 adapter_config.json 的 target_modules 与本次加载的模型是否同构。")
 
     if unnorm not in model.norm_stats:
         sj = Path(args.stats_json) if args.stats_json else (
@@ -150,6 +205,7 @@ def main() -> None:
         f"{n}[{a:+.2f},{b:+.2f}]" for n, a, b in zip(DIMS, q01, q99)))
     print(f"归一化 mask（False = 该维不归一化）: {amask.tolist()}")
 
+    check_stats(np.concatenate([e["actions"] for e in eps]), q01, q99)
     atok = ActionTokenizer(processor.tokenizer)
     state = wire(model, WireConfig(arm=args.arm, K=args.K, budget=args.budget,
                                    n_t=args.n_t))
@@ -157,9 +213,6 @@ def main() -> None:
     model.eval()
 
     rng = np.random.default_rng(args.seed)
-    pred = {v: [] for v in variants}
-    tf_hits = tf_tot = 0
-    gt_all, checked = [], False
 
     def pixels(frames, crop=True):
         if crop:
@@ -168,75 +221,99 @@ def main() -> None:
             Image.fromarray(f)) for f in frames],
             dim=0).unsqueeze(0).to(torch.bfloat16).to(dev)
 
+    # ---------------- 先把样本备齐（图像解码只做一次，两轮共用） ----------------
+    samples = []
     for ei, ep in enumerate(eps):
         T = len(ep["actions"])
-        # 只在有真实历史的时刻采样：窗口跨 (K-1)*stride 帧，开头全是重复第 0 帧，
-        # 那些时刻测的是"没有历史时模型怎么办"，不是我们要问的问题。
-        lo = min((args.K - 1) * args.stride, T - 1)
+        # ⚠️ 缺省整条 episode 均匀采样 —— **训练就是这么采的**，只挑历史完整的
+        #    时刻会和训练日志里的 acc 不同分布，那个数就没法直接比。
+        lo = (min((args.K - 1) * args.stride, T - 1)
+              if args.t_from == "history" else 0)
         ts = np.linspace(lo, T - 1, args.n_steps).round().astype(int)
         cache = {}
 
-        def frame(j):
-            if j not in cache:
-                cache[j] = resize_image(ep["images"][j], (224, 224))
-            return cache[j]
-
-        prompt = f"In: What action should the robot take to {ep['lang']}?\nOut:"
-        ids = processor.tokenizer(prompt, return_tensors="pt").input_ids.to(dev)
+        def frame(j, _c=cache, _e=ep):
+            if j not in _c:
+                _c[j] = resize_image(_e["images"][j], (224, 224))
+            return _c[j]
 
         for t in ts:
             idx = strided_chunk_indices(T, args.K, args.stride)[t]
-            pad = torch.from_numpy(idx >= 0).unsqueeze(0).to(dev)
-            base = [frame(int(max(j, 0))) for j in idx]
-            act = ep["actions"][t]
-            gt_all.append(act)
+            samples.append(dict(
+                lang=ep["lang"], act=ep["actions"][t],
+                pad=torch.from_numpy(idx >= 0).unsqueeze(0).to(dev),
+                frames=[frame(int(max(j, 0))) for j in idx],
+                shuf=[frame(int(rng.integers(0, T))) for _ in idx]))
+        print(f"  episode {ei} ({ep['lang'][:38]}…) 采样时刻 {ts.tolist()}"
+              f"  窗口填充 {float((strided_chunk_indices(T, args.K, args.stride)[ts] < 0).mean()):.1%}")
 
-            for v in variants:
-                fr = ([frame(int(rng.integers(0, T))) for _ in idx]
-                      if v == "shuffled" else base)
-                px = pixels(fr, crop=(v != "nocrop"))
+    # ---------------- 一次 teacher forcing 前向 = 训练时那条路径 ----------------
+    def tf_once(sm):
+        pb = PurePromptBuilder("openvla")
+        pb.add_turn("human",
+                    f"What action should the robot take to {sm['lang']}?")
+        pb.add_turn("gpt", atok(norm_action(sm["act"], q01, q99, amask)))
+        tid = torch.tensor(processor.tokenizer(
+            pb.get_prompt(), add_special_tokens=True).input_ids).unsqueeze(0).to(dev)
+        lab = tid.clone()
+        lab[:, : -(len(sm["act"]) + 1)] = -100
+        set_batch(state, depth=None, frame_pad_mask=sm["pad"])
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+            out = model(input_ids=tid, attention_mask=torch.ones_like(tid),
+                        pixel_values=pixels(sm["frames"]), labels=lab)
+        pr = out.logits[:, n_vis:-1].argmax(dim=2)[0]
+        g = lab[0, 1:]
+        m = g > atok.action_token_begin_idx
+        z = atok.decode_token_ids_to_actions(pr[m].cpu().numpy())
+        return (int(((pr == g) & m).sum()), int(m.sum()),
+                denorm_action(np.asarray(z).reshape(-1)[:7], q01, q99, amask))
 
-                if v == "tf":
-                    # ---- 与训练逐位相同的那条路径：teacher forcing 单次前向 ----
-                    pb = PurePromptBuilder("openvla")
-                    pb.add_turn("human",
-                                f"What action should the robot take to {ep['lang']}?")
-                    pb.add_turn("gpt", atok(norm_action(act, q01, q99, amask)))
-                    tid = processor.tokenizer(pb.get_prompt(),
-                                              add_special_tokens=True).input_ids
-                    tid = torch.tensor(tid).unsqueeze(0).to(dev)
-                    lab = tid.clone()
-                    lab[:, : -(len(act) + 1)] = -100
-                    set_batch(state, depth=None, frame_pad_mask=pad)
-                    with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-                        out = model(input_ids=tid, attention_mask=torch.ones_like(tid),
-                                    pixel_values=px, labels=lab)
-                    p = out.logits[:, n_vis:-1].argmax(dim=2)[0]
-                    g = lab[0, 1:]
-                    m = g > atok.action_token_begin_idx
-                    tf_hits += int(((p == g) & m).sum())
-                    tf_tot += int(m.sum())
-                    z = atok.decode_token_ids_to_actions(
-                        p[m].cpu().numpy())          # 归一化空间
-                    pred[v].append(denorm_action(np.asarray(z).reshape(-1)[:7],
-                                                 q01, q99, amask))
-                else:
-                    # ⚠️ `use_cache=False` 的生成**每步重跑整条前向**，投影器
-                    #    因此被调用 1+7 次；带 cache 时只有 prefill 那一次。
-                    set_batch(state, depth=None, frame_pad_mask=pad,
-                              n_uses=8 if v == "gen_nocache" else 1)
-                    with torch.no_grad():
-                        a = model.predict_action(
-                            input_ids=ids, pixel_values=px, unnorm_key=unnorm,
-                            do_sample=False,
-                            **({"use_cache": False} if v == "gen_nocache" else {}))
-                    pred[v].append(np.asarray(a, dtype=np.float64).reshape(-1)[:7])
+    base_acc = None
+    if args.also_base and adapter:
+        h = n = 0
+        for sm in samples:
+            a, b, _ = tf_once(sm)
+            h, n = h + a, n + b
+        base_acc = h / max(n, 1)
+        print(f"\n【对照】**没加 adapter** 的底座，同样的 tf: acc {base_acc:.3f}"
+              f"（{h}/{n}）—— 微调后的数字必须显著高于它")
+        assert_rope_active(state)
+        print(f"  ✓ 4D RoPE 已生效（{state.rope_calls} 次）")
 
-                if not checked:
-                    assert_rope_active(state)
-                    print(f"  ✓ 4D RoPE 已生效（{state.rope_calls} 次）")
-                    checked = True
-        print(f"  episode {ei} ({ep['lang'][:38]}…) 采样时刻 {ts.tolist()}")
+    if adapter:
+        do_merge()
+
+    # ---------------- 正式测量 ----------------
+    pred = {v: [] for v in variants}
+    tf_hits = tf_tot = 0
+    gt_all, checked = [], False
+    for sm in samples:
+        gt_all.append(sm["act"])
+        for v in variants:
+            if v == "tf":
+                a, b, act_hat = tf_once(sm)
+                tf_hits, tf_tot = tf_hits + a, tf_tot + b
+                pred[v].append(act_hat)
+                continue
+            fr = sm["shuf"] if v == "shuffled" else sm["frames"]
+            px = pixels(fr, crop=(v != "nocrop"))
+            # ⚠️ `use_cache=False` 的生成**每步重跑整条前向**，投影器因此被调
+            #    1+7 次；带 cache 时只有 prefill 那一次。
+            set_batch(state, depth=None, frame_pad_mask=sm["pad"],
+                      n_uses=8 if v == "gen_nocache" else 1)
+            with torch.no_grad():
+                a = model.predict_action(
+                    input_ids=torch.tensor(processor.tokenizer(
+                        f"In: What action should the robot take to "
+                        f"{sm['lang']}?\nOut:").input_ids).unsqueeze(0).to(dev),
+                    pixel_values=px, unnorm_key=unnorm, do_sample=False,
+                    **({"use_cache": False} if v == "gen_nocache" else {}))
+            pred[v].append(np.asarray(a, dtype=np.float64).reshape(-1)[:7])
+        if not checked:
+            # 挂点错了不会崩，只会全程用 1D RoPE —— 每次真前向后都要确认一遍
+            assert_rope_active(state)
+            print(f"  ✓ 4D RoPE 已生效（{state.rope_calls} 次）")
+            checked = True
 
     gt = np.stack(gt_all)
     scale = np.maximum((q99 - q01) / 2.0, 1e-6)
@@ -268,7 +345,11 @@ def main() -> None:
     print("\n判读：")
     tf_acc = tf_hits / max(tf_tot, 1)
     has = lambda v: v in rel                                    # noqa: E731
-    if "tf" in variants and tf_acc < 0.15:
+    if base_acc is not None and tf_acc <= base_acc + 0.02:
+        print(f"  ❌ 微调后的 tf（{tf_acc:.3f}）并不比**没加 adapter 的底座**"
+              f"（{base_acc:.3f}）好 —— adapter 在这条路径上等于没起作用。"
+              "接线参数与训练是否一致、n_vis 切片、merge 是否真的落在目标层。")
+    elif "tf" in variants and tf_acc < 0.15:
         print(f"  ❌ 连 teacher forcing 都只有 {tf_acc:.3f} —— **不是生成路径的问题**，"
               "训练时那条前向在这里就复现不出来。查 adapter 是否真的合进去了、"
               "接线参数（arm/K/budget/n_t）与训练是否一致、n_vis 切片。")
