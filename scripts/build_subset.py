@@ -45,11 +45,13 @@ if _ROOT is None:
     raise SystemExit("请先 export OPENVLA_ROOT=<openvla 仓库路径>")
 sys.path.insert(0, str(Path(_ROOT).expanduser().resolve()))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from libero.libero import benchmark  # noqa: E402
 
 from check_replay import (align_by_state, build_env, demo_all_states,  # noqa: E402
                           diff_profile, find_task, match_init, rgb_of)
+from data.depth_cache import hash_bytes  # noqa: E402
 
 TOL = 5.0            # 平均绝对像素差
 MIN_GOOD = 0.90      # 逐帧对齐里 ≤TOL 的帧占比
@@ -62,18 +64,27 @@ def episode_stream(data_root: str, name: str):
     256² × 3 ≈ 18 GB）。同时把 episode 级的元数据一并带出来 —— 训练时要靠它
     把深度查回去，见下面 `describe_features`。
     """
+    import tensorflow as tf
     import tensorflow_datasets as tfds
 
+    # ⚠️ **必须 SkipDecoding 拿到未解码的 JPEG 字节** —— 深度缓存的键就是它的
+    #    指纹（`data/depth_cache`）。训练那边在轨迹变换阶段看到的也正是这份字节，
+    #    两边指纹才对得上。解码后再哈希会因增广/重采样而对不上，且不报错。
     b = tfds.builder(name, data_dir=str(Path(data_root).expanduser()))
-    for i, ep in enumerate(b.as_dataset(split="train", shuffle_files=False)):
-        steps = list(ep["steps"].as_numpy_iterator())
-        meta = {k: (v.numpy().decode() if v.dtype.name == "string" else
-                    v.numpy().tolist())
-                for k, v in ep.items() if k != "steps"} if hasattr(ep, "items") else {}
+    ds = b.as_dataset(split="train", shuffle_files=False, decoders={
+        "steps": {"observation": {"image": tfds.decode.SkipDecoding()}}})
+    for i, ep in enumerate(ds):
+        raw = [s["observation"]["image"] for s in ep["steps"]]
         yield i, {
-            "meta": meta,
-            "lang": steps[0]["language_instruction"].decode().strip().lower(),
-            "images": np.stack([s["observation"]["image"] for s in steps]),
+            "meta": {k: v.numpy().decode() if v.dtype == tf.string else v.numpy()
+                     for k, v in ep["episode_metadata"].items()}
+            if "episode_metadata" in ep else {},
+            "lang": next(iter(ep["steps"]))["language_instruction"]
+            .numpy().decode().strip().lower(),
+            "images": np.stack([tf.io.decode_image(r, expand_animations=False)
+                                .numpy() for r in raw]),
+            "hash": np.array([int(hash_bytes([r])[0].numpy()) for r in raw],
+                             dtype=np.uint64),
         }
 
 
@@ -191,10 +202,10 @@ def main() -> None:
             ok, why = judge(m["best"], good, mono)
             rec.update(good=good, mono=mono, ok=ok, why=why, demo=key)
             if ok:
-                # 对齐后每个 RLDS 帧的 patch 级深度 (T,16,16)。float16 足够：
-                # 分辨率 ~1 mm，而体素箱宽约 30 cm、跳变阈值 5 cm。
-                np.save(out / "depth" / f"ep{i:04d}.npy",
-                        dep[mj].astype(np.float16))
+                # 对齐后每个 RLDS 帧的 patch 级深度 (T,16,16)，按帧指纹存。
+                # float16 足够：分辨率 ~1 mm，而体素箱宽约 30 cm、跳变阈值 5 cm。
+                np.savez(out / "depth" / f"ep{i:04d}.npz",
+                         hash=ep["hash"], depth=dep[mj].astype(np.float16))
             _append(log, rec)
             print(f"  [{i:>4}] task {tid}  d0={m['best']:.2f}  "
                   f"对齐 {good:.0%}  单调 {mono:.0%}  → {'✅' if ok else '❌ ' + why}")
@@ -237,6 +248,24 @@ def summarize(log: Path, out: Path) -> None:
             why[r.get("why", "?")] = why.get(r.get("why", "?"), 0) + 1
     if why:
         print("  失败原因：" + "  ".join(f"{k} ×{v}" for k, v in why.items()))
+
+    # 合并成一张表，训练侧只读这一个文件（DepthCache.load）
+    parts = sorted((out / "depth").glob("ep*.npz"))
+    if parts:
+        hs, ds_ = [], []
+        for f in parts:
+            z = np.load(f)
+            hs.append(z["hash"])
+            ds_.append(z["depth"])
+        h, d = np.concatenate(hs), np.concatenate(ds_)
+        u, first = np.unique(h, return_index=True)
+        if len(u) != len(h):
+            print(f"  ⚠️ {len(h) - len(u)} 帧指纹重复（同一帧被两条 episode 收录？）"
+                  "，只保留首次出现的")
+            h, d = h[np.sort(first)], d[np.sort(first)]
+        np.savez_compressed(out / "depth_cache.npz", hash=h, depth=d)
+        print(f"深度缓存 -> {out / 'depth_cache.npz'}  {len(h)} 帧，"
+              f"{(out / 'depth_cache.npz').stat().st_size / 2**20:.0f} MB")
 
     sub = out / "subset.json"
     sub.write_text(json.dumps({

@@ -89,6 +89,21 @@ def strided_chunk_act_obs(traj: Dict, window_size: int, stride: int = 1,
 
     traj_len = tf.shape(traj["action"])[0]
 
+    # ⓪ ⭐ **在这里给每帧打指纹** —— G4/M2 靠它把离线渲染的深度查回来。
+    #    这个位置是唯一可行的：更早没有统一的 image_primary 键，更晚图像已被
+    #    解码 + 增广（frame transform 里），按内容做指纹就不成立了。
+    #    指纹随观测一起被 gather，于是每个窗口的 K 帧各自带着自己的键。
+    #    见 data/depth_cache.py —— 哈希函数只在那里定义一次，两边共用。
+    img = traj["observation"].get("image_primary")
+    if img is not None and img.dtype == tf.string:
+        from data.depth_cache import hash_bytes
+        traj["observation"]["img_hash"] = hash_bytes(img)
+    elif img is not None:
+        # 不报错就意味着 G4 拿不到深度而没人知道 —— octo 改了解码时机就得改这里
+        raise RuntimeError(
+            f"image_primary 在分窗时已不是未解码字节（dtype={img.dtype}）——"
+            "指纹的前提没了。octo 的解码时机变了，depth_cache 的键要重新设计。")
+
     # ① 观测：带间隔的历史窗口
     obs_offsets = tf.range(-(k - 1) * stride, 1, stride)                    # (K,)
     chunk_indices = tf.broadcast_to(obs_offsets, [traj_len, k]) + tf.broadcast_to(
@@ -158,6 +173,7 @@ class KFrameBatchTransform:
         action = rlds_batch["action"][0]          # 当前动作，见 strided_chunk_act_obs ②
         frames = rlds_batch["observation"]["image_primary"]        # (K, H, W, 3)
         pad_mask = np.asarray(rlds_batch["observation"]["pad_mask"])  # (K,) bool
+        img_hash = rlds_batch["observation"].get("img_hash")           # (K,) uint64
         lang = rlds_batch["task"]["language_instruction"].decode().lower()
 
         prompt_builder = self.prompt_builder_fn("openvla")
@@ -176,9 +192,14 @@ class KFrameBatchTransform:
         pv = torch.cat([self.image_transform(Image.fromarray(np.asarray(f)))
                         for f in frames], dim=0)              # (K*6, H, W)
 
-        return dict(pixel_values=pv, input_ids=input_ids, labels=labels,
-                    frame_pad_mask=torch.from_numpy(pad_mask.astype(np.bool_)),
-                    dataset_name=dataset_name)
+        out = dict(pixel_values=pv, input_ids=input_ids, labels=labels,
+                   frame_pad_mask=torch.from_numpy(pad_mask.astype(np.bool_)),
+                   dataset_name=dataset_name)
+        if img_hash is not None:
+            # int64 载 uint64：torch 没有 uint64，查表时再转回去（见 depth_cache）
+            out["img_hash"] = torch.from_numpy(
+                np.asarray(img_hash).astype(np.int64))
+        return out
 
 
 # ---------------------------------------------------------------- collator
@@ -211,6 +232,8 @@ class PaddedCollatorKFrame:
             labels=labels,
             frame_pad_mask=torch.stack([x["frame_pad_mask"] for x in instances]),
             dataset_names=[x["dataset_name"] for x in instances],
+            **({"img_hash": torch.stack([x["img_hash"] for x in instances])}
+               if "img_hash" in instances[0] else {}),
         )
 
 
