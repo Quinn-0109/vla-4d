@@ -154,13 +154,18 @@ def align_by_state(env, states, rlds, flip: bool, stride: int = 2):
     def small(a):
         return a[::8, ::8].astype(np.int16)
 
+    # ⚠️ **不要每帧 env.reset()。** `set_init_state` 本来就设置完整状态，
+    #    reset 会把整个仿真器重新初始化 —— 280 帧就是 280 次无用的重置，
+    #    这是 --align_stride 1 "跑不出结果"的真正原因（另一半是管道块缓冲）。
+    env.reset()
     bank, dep, idxs = [], [], list(range(0, len(states), stride))
-    for t in idxs:
-        env.reset()
+    for n, t in enumerate(idxs):
         obs = env.set_init_state(states[t])
         bank.append(rgb_of(obs, flip))
         d = np.asarray(obs[f"{CAM}_depth"])
         dep.append(patch_depth(env, d[..., 0] if d.ndim == 3 else d, flip))
+        if n % 50 == 0:
+            print(f"         …渲染 {n}/{len(idxs)} 帧", flush=True)
     bank_s = np.stack([small(b) for b in bank])
     errs, matches = [], []
     for r in rlds:
@@ -277,6 +282,13 @@ def _dump(a: np.ndarray, b: np.ndarray, e_i: int, tid: int) -> None:
 
 
 def main() -> None:
+    # ⚠️ 管道输出（| grep / | tee）会让 stdout 变成块缓冲，跑十几分钟一个字
+    #    都看不到，看起来像卡死。probe_vram.py 记过这个坑，这里又漏了。
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except AttributeError:
+        pass
+
     ap = argparse.ArgumentParser()
     ap.add_argument("--suite", default="libero_10")
     ap.add_argument("--data_root", default=str(
