@@ -112,6 +112,11 @@ class Config:
     grad_checkpoint: bool = True
 
     save_steps: int = 2500
+    # ⚠️ 只有**最新**那个 checkpoint 需要优化器状态（续训用）。旧的只拿来评测，
+    #    光要 adapter 权重就够。AdamW 状态占每个 checkpoint 约 2/3（~305 MB），
+    #    30k 步存 12 个就是 3.7 GB —— 这台机器盘只剩 6 GB，写满了会把长跑断掉。
+    #    置 True 保留全部（想从中间某一步分叉续训时才需要）。
+    keep_all_optim: bool = False
     log_steps: int = 10
     resume_from: Optional[str] = None
     bench_only: bool = False
@@ -247,6 +252,16 @@ def main(cfg: Config) -> None:
         torch.save({"optimizer": optimizer.state_dict(), "step": step},
                    d / "trainer_state.pt")
         processor.save_pretrained(run_dir)
+        if not cfg.keep_all_optim:
+            # 新的存好了再删旧的 —— 顺序反过来的话，存盘中途断电就两头落空
+            freed = 0
+            for old in adapter_dir.glob("step*/trainer_state.pt"):
+                if old.parent != d:
+                    freed += old.stat().st_size
+                    old.unlink()
+            if freed:
+                print(f"  （清掉旧 checkpoint 的优化器状态，省 {freed / 2**30:.1f} GB；"
+                      f"续训只能从最新这个 step{step} 起）")
         print(f"\n[step {step}] 已存 -> {d}")
         # ⚠️ 续训**必须用同一个 --micro**：exp_id 里带 b{micro}x{accum}，
         #    换了微批就写进另一个目录，等于从头再来而且不报错。
