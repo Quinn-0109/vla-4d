@@ -34,7 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 
 
-def build(K, stride, root, name, patched: bool):
+def build(K, stride, root, name, patched: bool, legacy: bool = False):
     """在**子进程**里建一次数据集，取一个 batch，回报形状。"""
     from torch.utils.data import DataLoader
     from transformers import AutoProcessor
@@ -46,7 +46,17 @@ def build(K, stride, root, name, patched: bool):
     from data.kframe import (KFrameBatchTransform, PaddedCollatorKFrame,
                              patch_strided_chunking)
 
-    if patched:
+    if legacy:
+        # ⚠️ **复刻 2026-08 之前的补丁**：只绑 stride，K 交给官方的 window_size。
+        #    这不是"以前的写法"，而是"当时到底喂了几帧"的**直接测量** ——
+        #    G2 那 19.6 小时用的就是这一路，靠推理定案不算数。
+        from functools import partial
+
+        from prismatic.vla.datasets.rlds import traj_transforms
+
+        from data.kframe import strided_chunk_act_obs
+        traj_transforms.chunk_act_obs = partial(strided_chunk_act_obs, stride=stride)
+    elif patched:
         patch_strided_chunking(stride, K)
     proc = AutoProcessor.from_pretrained("openvla/openvla-7b", trust_remote_code=True)
     ds = RLDSDataset(
@@ -69,16 +79,22 @@ def main() -> None:
     ap.add_argument("--dataset_name", default="libero_10_no_noops")
     ap.add_argument("--no_patch", action="store_true",
                     help="不打补丁跑（对照：应当得到 K=1）")
+    ap.add_argument("--legacy_patch", action="store_true",
+                    help="复刻旧补丁（只绑 stride，K 交给官方的 window_size）——"
+                         "直接测出 G2 那一轮到底喂了几帧")
     args = ap.parse_args()
 
     pv, fm = build(args.K, args.stride, args.data_root_dir, args.dataset_name,
-                   patched=not args.no_patch)
+                   patched=not args.no_patch, legacy=args.legacy_patch)
     got = pv[1] // 6
-    tag = "未打补丁（对照）" if args.no_patch else "打了补丁"
+    tag = ("旧补丁（G2 那一轮用的）" if args.legacy_patch else
+           "未打补丁（对照）" if args.no_patch else "打了补丁")
     print(f"\n=== {tag} ===")
     print(f"  pixel_values   {pv}   → K = {got}")
     print(f"  frame_pad_mask {fm}")
-    if args.no_patch:
+    if args.legacy_patch:
+        print(f"  {'❌ G2 那 19.6 小时训的是单帧' if got == 1 else '✅ 旧补丁也拿到了 K=' + str(got)}")
+    elif args.no_patch:
         print(f"  {'✅' if got == 1 else '⚠️'} 官方原样应当是 K=1"
               f"（window_size 写死在 RLDSDataset 里）")
     elif got == args.K and fm[1] == args.K:
