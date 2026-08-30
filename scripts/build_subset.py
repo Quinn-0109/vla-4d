@@ -128,11 +128,15 @@ def depth_uncertainty(dep: np.ndarray, mj: np.ndarray) -> tuple[float, float]:
     返回 (p50, p95)，单位 cm。
     """
     if len(dep) < 2:
-        return float("nan"), float("nan")
+        return float("nan"), float("nan"), float("nan")
     dd = np.abs(np.diff(dep, axis=0)) * 100.0            # (n-1,16,16) cm
     j = np.clip(mj, 0, len(dd) - 1)
     v = dd[j].ravel()
-    return float(np.percentile(v, 50)), float(np.percentile(v, 95))
+    # ⚠️ p50 通常**恰好是 0**：桌面与背景静止，只有机械臂和物体在动。
+    #    所以 p95 量的正是"会动的那几个 patch"，也正是 G4 要用的那些。
+    #    非零占比一并报出来，免得把 p50=0 读成"深度没变化"。
+    return (float(np.percentile(v, 50)), float(np.percentile(v, 95)),
+            float((v > 0).mean()))
 
 
 def judge(d0: float, mono: float, dp95: float) -> tuple[bool, str]:
@@ -173,7 +177,10 @@ def main() -> None:
         describe_features(args.data_root, name)
         return
 
-    out = Path(args.out) / args.suite
+    # ⚠️ 续跑日志必须按 align_stride 分开。深度不确定度**直接由步长决定**
+    #    （相邻渲染帧隔 stride 个 demo 帧），换了步长重跑却跳过已完成的 episode，
+    #    两组数就混进同一份清单 —— 而混了不会报错，只会让子集的判据不一致。
+    out = Path(args.out) / f"{args.suite}_s{args.align_stride}"
     (out / "depth").mkdir(parents=True, exist_ok=True)
     log = out / "episodes.jsonl"
     done = {json.loads(l)["ep"] for l in log.open()} if log.exists() else set()
@@ -227,10 +234,10 @@ def main() -> None:
                                                  True, args.align_stride)
             good = float((errs <= TOL).mean())
             mono = float((np.diff(idxs[mj]) >= 0).mean())
-            dp50, dp95 = depth_uncertainty(dep, mj)
+            dp50, dp95, dnz = depth_uncertainty(dep, mj)
             ok, why = judge(m["best"], mono, dp95)
-            rec.update(good=good, mono=mono, dp50=dp50, dp95=dp95,
-                       ok=ok, why=why, demo=key)
+            rec.update(good=good, mono=mono, dp50=dp50, dp95=dp95, dnz=dnz,
+                       ok=ok, why=why, demo=key, stride=args.align_stride)
             if ok and not args.report_only:
                 # 对齐后每个 RLDS 帧的 patch 级深度 (T,16,16)，按帧指纹存。
                 # float16 足够：分辨率 ~1 mm，而体素箱宽约 30 cm、跳变阈值 5 cm。
@@ -238,7 +245,7 @@ def main() -> None:
                          hash=ep["hash"], depth=dep[mj].astype(np.float16))
             _append(log, rec)
             print(f"  [{i:>4}] task {tid}  d0={m['best']:.2f}  RGB≤{TOL:g} {good:.0%}  "
-                  f"单调 {mono:.0%}  深度 p50={dp50:.1f} p95={dp95:.1f} cm"
+                  f"单调 {mono:.0%}  深度 p95={dp95:.1f} cm（{dnz:.0%} 的 patch 在动）"
                   f"  → {'✅' if ok else '❌ ' + why}")
     finally:
         if env is not None:
@@ -313,7 +320,7 @@ def summarize(log: Path, out: Path, report_only: bool = True) -> None:
         print(f"{str(t):>6} {a:>4}/{n:<3} {a / n:>7.0%}")
 
     # ⚠️ 报分布，不只报通过率 —— 阈值定得合不合理，只有看见分布才判得了
-    for k in ("d0", "good", "mono", "dp50", "dp95"):
+    for k in ("d0", "good", "mono", "dp95", "dnz"):
         v = np.array([r[k] for r in recs if k in r], dtype=float)
         v = v[np.isfinite(v)]
         if len(v):
