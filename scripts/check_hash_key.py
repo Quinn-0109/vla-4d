@@ -76,7 +76,8 @@ def main() -> None:
     ap.add_argument("--stride", type=int, default=16)
     ap.add_argument("--n_batches", type=int, default=20)
     ap.add_argument("--limit_episodes", type=int, default=0,
-                    help="离线那一路只扫前 N 条（冒烟用；正式跑要扫全）")
+                    help="离线那一路只扫前 N 条。⚠️ 仅用于调脚本本身："
+                         "训练侧 shuffle files，扫一部分必然低命中，带了它不出判据")
     args = ap.parse_args()
     name = args.dataset_name
 
@@ -107,7 +108,7 @@ def main() -> None:
         proc.tokenizer.model_max_length, proc.tokenizer.pad_token_id))
 
     hit = tot = 0
-    uniq_ok = pad_ok = pad_n = 0
+    uniq_ok = pad_same = pad_n = 0
     for i, b in enumerate(loader):
         if i >= args.n_batches:
             break
@@ -123,9 +124,11 @@ def main() -> None:
             hit += sum(int(x) in ref for x in row)
             real = row[mrow]
             uniq_ok += len(np.unique(real)) == len(real)
-            if (~mrow).any():                            # 补帧位应当等于最早的真实帧
+            if (~mrow).sum() > 1:
+                # 补帧位全部 clamp 到**轨迹第 0 帧**（不是窗口里最早的真实帧），
+                # 所以它们彼此相同 —— 但与 real[0] 无关，除非 t 本身就在开头。
                 pad_n += 1
-                pad_ok += bool((row[~mrow] == real[0]).all())
+                pad_same += bool((row[~mrow] == row[~mrow][0]).all())
         if (i + 1) % 5 == 0:
             print(f"    …{i + 1}/{args.n_batches} 批  命中 {hit}/{tot}", flush=True)
 
@@ -133,8 +136,14 @@ def main() -> None:
     print(f"\n=== 结果（{n_win} 个窗口，{tot} 帧）===")
     print(f"  1. 命中率            {hit / max(tot, 1):>7.2%}  ({hit}/{tot})")
     print(f"  2. K 帧指纹互不相同  {uniq_ok / max(n_win, 1):>7.2%}")
-    print(f"  3. 补帧位指纹 = 首帧  {pad_ok / max(pad_n, 1):>7.2%}  "
-          f"（{pad_n} 个含补帧的窗口）")
+    print(f"  3. 补帧位彼此相同    {pad_same / max(pad_n, 1):>7.2%}  "
+          f"（{pad_n} 个含 ≥2 个补帧的窗口）")
+
+    if args.limit_episodes:
+        raise SystemExit(
+            f"\n⚠️ 带了 --limit_episodes {args.limit_episodes}，离线只扫了部分 episode，"
+            "而训练侧 shuffle files —— **命中率这个数没有意义，不构成判据**。\n"
+            "   去掉它重跑（只读字节不解码，全集约两分钟）。")
 
     if hit != tot:
         raise SystemExit(
@@ -146,8 +155,11 @@ def main() -> None:
             + ("\n   （--limit_episodes 只扫了部分 episode，先去掉它再看。）"
                if args.limit_episodes else ""))
     if uniq_ok != n_win:
-        raise SystemExit("\n❌ 有窗口的 K 帧指纹重复 —— 键是按 episode 而非按帧编的，"
+        raise SystemExit("\n❌ 有窗口的真实帧指纹重复 —— 键是按 episode 而非按帧编的，"
                          "深度会取错帧。")
+    if pad_n and pad_same != pad_n:
+        raise SystemExit("\n❌ 同一窗口的补帧位指纹不一致 —— 它们都该 clamp 到"
+                         "轨迹第 0 帧。指纹没跟着 gather 走。")
     print("\n✅ 三项全过：键可用，深度缓存可以按它建。")
 
 
