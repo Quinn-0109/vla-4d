@@ -84,6 +84,10 @@ from pooling.wire import WireConfig, assert_rope_active, set_batch, wire  # noqa
 # 2→8 省 16%，4→8 只再省 1.3 h 却多 1.6 GB —— 边际很小，但 24 GB 卡装得下。
 # 与 K=1 那轮"4→8 归零"的形状不同：那时每步只有 16 次视觉前向，现在是 128 次。
 #
+# ⚠️ **上表的 s/步偏高**：`--bench_only` 只跑 10 步，含数据管道预热与内核首次
+#    编译。G2 实跑的稳态是 **2.79 s/步**，30k 步 **23.3 h**（micro=8）。
+#    做预算用稳态值；上表只用来比较微批之间的相对快慢（那个比较不受影响）。
+#
 # ⚠️ **有效批必须恒为 16**，所以只让改微批，累积由它自动配平。
 EFF_BATCH = 16
 MICRO = {1: (16, 1), 8: (8, 2)}      # K=8 取 micro=8，见上表
@@ -424,7 +428,9 @@ def main(cfg: Config) -> None:
                 rec = {"step": step, "arm": cfg.arm,
                        "loss": sum(losses) / len(losses),
                        "action_accuracy": sum(accs) / len(accs),
-                       "steps_per_sec": sps, "elapsed_h": el / 3600,
+                       # ⚠️ 这是**本次进程**的墙钟，续训时 t0 重置。
+                       #    总时长要把各段相加，别把它当总数读。
+                       "steps_per_sec": sps, "session_h": el / 3600,
                        "peak_gb": torch.cuda.max_memory_allocated() / 1e9}
                 with open(metrics_path, "a") as f:
                     f.write(json.dumps(rec) + "\n")
