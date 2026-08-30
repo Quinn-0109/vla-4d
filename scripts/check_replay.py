@@ -81,6 +81,10 @@ def load_episodes(data_root: str, name: str, n: int):
     """
     import tensorflow_datasets as tfds
 
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+    from common.tf_cpu import hide_gpu_from_tf
+    hide_gpu_from_tf()          # TF 会预留整张卡，而这里一个 GPU 算子都不用
+
     b = tfds.builder(name, data_dir=data_root)
     ds = b.as_dataset(split="train", shuffle_files=False)
     out = []

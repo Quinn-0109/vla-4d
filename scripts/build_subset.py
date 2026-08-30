@@ -59,6 +59,7 @@ from libero.libero import benchmark  # noqa: E402
 
 from check_replay import (align_by_state, build_env, demo_all_states,  # noqa: E402
                           diff_profile, find_task, match_init, rgb_of)
+from common.tf_cpu import hide_gpu_from_tf  # noqa: E402
 from data.depth_cache import hash_bytes  # noqa: E402
 
 TOL = 5.0            # 平均绝对像素差：只用来判"找对 demo 没有"
@@ -74,6 +75,10 @@ def episode_stream(data_root: str, name: str):
     """
     import tensorflow as tf
     import tensorflow_datasets as tfds
+
+    # ⚠️ TF 默认预留整张卡的显存（本脚本一个 GPU 算子都不用），
+    #    同机的训练/评测会直接 OOM。EGL 渲染仍需要 GPU，所以只藏 TF 这一半。
+    hide_gpu_from_tf()
 
     # ⚠️ **必须 SkipDecoding 拿到未解码的 JPEG 字节** —— 深度缓存的键就是它的
     #    指纹（`data/depth_cache`）。训练那边在轨迹变换阶段看到的也正是这份字节，
