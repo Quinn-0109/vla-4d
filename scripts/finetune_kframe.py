@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Optional
 
 import draccus
+import numpy as np
 import torch
 import tqdm
 from torch.optim import AdamW
@@ -49,6 +50,7 @@ from prismatic.vla.datasets import RLDSDataset  # noqa: E402
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics  # noqa: E402
 
 from common.lora import lora_targets  # noqa: E402
+from data.depth_cache import DepthCache  # noqa: E402
 from data.kframe import (KFrameBatchTransform, PaddedCollatorKFrame,  # noqa: E402
                          patch_strided_chunking)
 from pooling.wire import WireConfig, assert_rope_active, set_batch, wire  # noqa: E402
@@ -117,6 +119,9 @@ class Config:
     #    30k 步存 12 个就是 3.7 GB —— 这台机器盘只剩 6 GB，写满了会把长跑断掉。
     #    置 True 保留全部（想从中间某一步分叉续训时才需要）。
     keep_all_optim: bool = False
+    # G4/M2 用：build_subset.py 的产物目录（depth_cache.npz + bbox.json）
+    subset_dir: str = "results/subset/libero_10"
+    camera_json: str = "results/tables/camera_libero.json"
     log_steps: int = 10
     resume_from: Optional[str] = None
     bench_only: bool = False
@@ -136,13 +141,36 @@ def main(cfg: Config) -> None:
     assert torch.cuda.is_available(), "需要 GPU"
     dev = "cuda"
 
-    if cfg.arm in ("G4", "M2"):
-        raise SystemExit(
-            f"{cfg.arm} 需要**训练集**的 patch 级深度，而那份缓存还没有。\n"
-            "前置：先做回放保真度验证（回放 RGB vs RLDS 训练数据 RGB，docs/06 §4.3），"
-            "对不上就说明回放发散，缓存出来的深度是另一个场景的。\n"
-            "现在能跑的是 G2 / G3（用图像网格坐标，不需要深度），"
-            "而 G2 vs G0 正是前提检验，本来就排在最前。")
+    # G4/M2 的三份前置产物，缺一不可。**在加载 7B 之前查**。
+    metric = cfg.arm in ("G4", "M2")
+    depth_cache = cameras = bbox = None
+    if metric:
+        sd = Path(cfg.subset_dir)
+        need = [sd / "depth_cache.npz", sd / "bbox.json", Path(cfg.camera_json)]
+        miss = [str(x) for x in need if not x.exists()]
+        if miss:
+            raise SystemExit(
+                f"{cfg.arm} 用度量坐标，需要这几份产物，缺了：\n  "
+                + "\n  ".join(miss)
+                + "\n\n先跑：\n"
+                "  python scripts/dump_camera.py                    # 相机参数\n"
+                "  python scripts/build_subset.py --suite libero_10 # 先看分布\n"
+                "  python scripts/build_subset.py --suite libero_10 --commit\n"
+                "⚠️ 拿不到真深度就只能得到 (t,h,w,z)，那样的\"G4\"是带深度通道的 G3。")
+        depth_cache = DepthCache.load(sd / "depth_cache.npz")
+        bb = json.loads((sd / "bbox.json").read_text())
+        bbox = torch.tensor([bb["lo"], bb["hi"]], dtype=torch.float32)
+        cams_raw = json.loads(Path(cfg.camera_json).read_text())
+        from common.camera import Camera
+        cameras = {int(k): Camera(
+            fovy=float(v["fovy"]), height=int(v["height"]), width=int(v["width"]),
+            pos=torch.tensor(v["pos"], dtype=torch.float64),
+            rot=torch.tensor(v["rot"], dtype=torch.float64).reshape(3, 3),
+            flipped=bool(v.get("flipped", True))) for k, v in cams_raw.items()}
+        print(f"深度缓存 {len(depth_cache)} 帧；相机 {len(cameras)} 台；"
+              f"包围盒 x[{bb['lo'][0]:+.2f},{bb['hi'][0]:+.2f}] "
+              f"y[{bb['lo'][1]:+.2f},{bb['hi'][1]:+.2f}] "
+              f"z[{bb['lo'][2]:+.2f},{bb['hi'][2]:+.2f}]")
 
     micro, accum = MICRO[cfg.K]
     if cfg.micro:
@@ -186,7 +214,8 @@ def main(cfg: Config) -> None:
 
     # ⚠️ 接线必须在 peft 包装**之后**：get_peft_model 会代理属性，
     #    包装前挂上去的 forward 会被代理层绕过（挂了等于没挂，且不报错）。
-    wcfg = WireConfig(arm=cfg.arm, K=cfg.K, budget=cfg.budget, n_t=cfg.n_t)
+    wcfg = WireConfig(arm=cfg.arm, K=cfg.K, budget=cfg.budget, n_t=cfg.n_t,
+                      bbox=bbox)
     state = wire(vla.base_model.model, wcfg)
     print(f"已接线: arm={cfg.arm}  K={cfg.K}  N={cfg.budget}  n_t={cfg.n_t}")
 
@@ -219,6 +248,13 @@ def main(cfg: Config) -> None:
             f"  --data_root_dir ~/autodl-tmp/datasets/modified_libero_rlds\n"
             f"没下过的话：bash scripts/prepare_finetune.sh data")
 
+    lang_to_task = None
+    if metric:
+        from libero.libero import benchmark as _bm
+        suite = _bm.get_benchmark_dict()[cfg.dataset_name.replace("_no_noops", "")]()
+        lang_to_task = {suite.get_task(i).language.strip().lower(): i
+                        for i in range(suite.n_tasks)}
+
     action_tokenizer = ActionTokenizer(processor.tokenizer)
 
     # ⚠️ 必须在构造 RLDSDataset **之前**打补丁（见 data.kframe.patch_strided_chunking）
@@ -227,7 +263,8 @@ def main(cfg: Config) -> None:
         cfg.data_root_dir, cfg.dataset_name,
         KFrameBatchTransform(action_tokenizer, processor.tokenizer,
                              image_transform=processor.image_processor.apply_transform,
-                             prompt_builder_fn=PurePromptBuilder),
+                             prompt_builder_fn=PurePromptBuilder,
+                             lang_to_task=lang_to_task),
         resize_resolution=image_sizes,
         shuffle_buffer_size=cfg.shuffle_buffer_size,
         image_aug=cfg.image_aug,
@@ -273,6 +310,19 @@ def main(cfg: Config) -> None:
     # ⚠️⚠️ **第一批就把形状钉死。** openvla 的 RLDSDataset 把 window_size=1 写死在
     #    构造函数里，K 一旦没顶进去就会静默退化成单帧：pixel_values 变成
     #    (B, 6, H, W)、序列长不变、loss 照降、acc 照升，只有拿去做 K 帧评测才露馅。
+    def batch_depth(batch):
+        """
+        (B,K) 指纹 → (B,K,256) 深度 + 每个样本的相机。**查不到硬抛**
+        （`DepthCache.lookup`）：退回零深度不会报错，只会让 G4 看一个
+        与图像无关的三维世界。
+        """
+        if not metric:
+            return None, ()
+        h = batch["img_hash"].numpy()
+        d = np.stack([depth_cache.lookup(row) for row in h])      # (B,K,16,16)
+        cams = [cameras[int(t)] for t in batch["task_id"].tolist()]
+        return torch.from_numpy(d.reshape(d.shape[0], d.shape[1], -1)), cams
+
     def check_shapes(batch) -> None:
         pv, fm = batch["pixel_values"], batch["frame_pad_mask"]
         if pv.shape[1] != cfg.K * 6 or fm.shape[1] != cfg.K:
@@ -299,8 +349,10 @@ def main(cfg: Config) -> None:
                     break
                 if i == 0:
                     check_shapes(batch)
-                set_batch(state, depth=None,
-                          frame_pad_mask=batch["frame_pad_mask"].to(dev))
+                dep, cams = batch_depth(batch)
+                set_batch(state, depth=None if dep is None else dep.to(dev),
+                          frame_pad_mask=batch["frame_pad_mask"].to(dev),
+                          cameras=cams)
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     out = vla(input_ids=batch["input_ids"].to(dev),
                               attention_mask=batch["attention_mask"].to(dev),
@@ -335,8 +387,10 @@ def main(cfg: Config) -> None:
         for micro_idx, batch in enumerate(loader):
             if micro_idx == 0:
                 check_shapes(batch)
-            set_batch(state, depth=None,
-                      frame_pad_mask=batch["frame_pad_mask"].to(dev))
+            dep, cams = batch_depth(batch)
+            set_batch(state, depth=None if dep is None else dep.to(dev),
+                      frame_pad_mask=batch["frame_pad_mask"].to(dev),
+                      cameras=cams)
             with torch.autocast("cuda", dtype=torch.bfloat16):
                 out = vla(input_ids=batch["input_ids"].to(dev),
                           attention_mask=batch["attention_mask"].to(dev),

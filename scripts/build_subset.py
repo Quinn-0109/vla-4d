@@ -247,6 +247,51 @@ def main() -> None:
     summarize(log, out, args.report_only)
 
 
+def write_bbox(recs, out: Path, parts, cam_json="results/tables/camera_libero.json"):
+    """
+    ⭐ 工作空间包围盒**从这份训练深度缓存本身算**，不沿用评测轨迹那一版。
+
+    `metric_extent` 要的是一个**跨样本固定**的常量；用哪批数据算它，就该是
+    模型真正会看到的那批。`dump_camera.py` 早先那版是从评测轨迹统计的
+    （30 条 episode），量级参考可以，但训练用的是另一批帧。
+    """
+    import torch
+
+    from common.camera import Camera
+
+    cj = Path(cam_json)
+    if not cj.exists():
+        print(f"（找不到 {cj}，跳过包围盒 —— 先跑 scripts/dump_camera.py）")
+        return
+    cams = json.loads(cj.read_text())
+    tid_of = {r["ep"]: r["task"] for r in recs if r.get("ok")}
+    xyz = []
+    for f in parts:
+        ep = int(f.stem[2:])
+        c = cams.get(str(tid_of.get(ep)))
+        if c is None:
+            continue
+        cam = Camera(fovy=float(c["fovy"]), height=int(c["height"]),
+                     width=int(c["width"]),
+                     pos=torch.tensor(c["pos"], dtype=torch.float64),
+                     rot=torch.tensor(c["rot"], dtype=torch.float64).reshape(3, 3),
+                     flipped=bool(c.get("flipped", True)))
+        d = torch.from_numpy(np.load(f)["depth"].astype(np.float64))
+        xyz.append(cam.patch_xyz(d.reshape(len(d), -1)).reshape(-1, 3).numpy())
+    if not xyz:
+        print("（没有可用的相机，跳过包围盒）")
+        return
+    v = np.concatenate(xyz)
+    lo, hi = np.percentile(v, [1, 99], axis=0)
+    (out / "bbox.json").write_text(json.dumps(
+        {"lo": lo.tolist(), "hi": hi.tolist(), "n_points": int(len(v)),
+         "note": "p1–p99，由本次训练深度缓存反投影得到；metric_extent 的常量"},
+        indent=1))
+    print("包围盒（p1–p99，米）: " + "  ".join(
+        f"{n}[{a:+.3f},{b:+.3f}]" for n, a, b in zip("xyz", lo, hi))
+        + f"  -> {out / 'bbox.json'}")
+
+
 def _append(log: Path, rec: dict) -> None:
     with log.open("a") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -304,8 +349,10 @@ def summarize(log: Path, out: Path, report_only: bool = True) -> None:
         np.savez_compressed(out / "depth_cache.npz", hash=h, depth=d)
         print(f"深度缓存 -> {out / 'depth_cache.npz'}  {len(h)} 帧，"
               f"{(out / 'depth_cache.npz').stat().st_size / 2**20:.0f} MB")
+        write_bbox(recs, out, parts)
 
     sub = out / "subset.json"
+
     sub.write_text(json.dumps({
         "criteria": {"tol": TOL, "min_good": MIN_GOOD, "min_mono": MIN_MONO},
         "n_total": len(recs), "n_ok": len(ok),

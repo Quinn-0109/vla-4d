@@ -165,6 +165,9 @@ class KFrameBatchTransform:
     image_transform: Any
     prompt_builder_fn: Type
     predict_stop_token: bool = True
+    # G4/M2 用：语言指令 → task_id。相机是**按 task 存的**（docs/05 §8.8：
+    # 不同 task 的 agentview 位姿确实不同），反投影时必须取对那一台。
+    lang_to_task: Any = None
 
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         from PIL import Image
@@ -195,6 +198,14 @@ class KFrameBatchTransform:
         out = dict(pixel_values=pv, input_ids=input_ids, labels=labels,
                    frame_pad_mask=torch.from_numpy(pad_mask.astype(np.bool_)),
                    dataset_name=dataset_name)
+        if self.lang_to_task is not None:
+            tid = self.lang_to_task.get(lang.strip())
+            if tid is None:
+                raise KeyError(
+                    f"语言指令对不上任何 task：{lang.strip()!r}。"
+                    "相机按 task 存，取错了就是用另一台相机反投影 —— 不会报错，"
+                    "只会得到一个偏移的世界。")
+            out["task_id"] = torch.tensor(int(tid))
         if img_hash is not None:
             # int64 载 uint64：torch 没有 uint64，查表时再转回去（见 depth_cache）
             out["img_hash"] = torch.from_numpy(
@@ -234,6 +245,8 @@ class PaddedCollatorKFrame:
             dataset_names=[x["dataset_name"] for x in instances],
             **({"img_hash": torch.stack([x["img_hash"] for x in instances])}
                if "img_hash" in instances[0] else {}),
+            **({"task_id": torch.stack([x["task_id"] for x in instances])}
+               if "task_id" in instances[0] else {}),
         )
 
 
