@@ -161,7 +161,9 @@ def main() -> None:
         Path("~/autodl-tmp/datasets/modified_libero_rlds").expanduser()))
     ap.add_argument("--out", default="results/subset")
     ap.add_argument("--limit", type=int, default=0, help="只处理前 N 条（冒烟用）")
-    ap.add_argument("--align_stride", type=int, default=2)
+    ap.add_argument("--align_stride", type=int, default=1,
+                    help="逐帧对齐的渲染步长。**1 是定稿值**：2 时深度不确定度"
+                         "dp95 中位 8.1 cm 过不了闸，1 时 3.9 cm（docs/05 §8.12）")
     ap.add_argument("--n_init_try", type=int, default=50)
     ap.add_argument("--demo_frames", type=int, default=40)
     ap.add_argument("--redo_failed", action="store_true",
