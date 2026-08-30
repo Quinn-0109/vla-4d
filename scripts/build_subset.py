@@ -164,6 +164,8 @@ def main() -> None:
     ap.add_argument("--align_stride", type=int, default=2)
     ap.add_argument("--n_init_try", type=int, default=50)
     ap.add_argument("--demo_frames", type=int, default=40)
+    ap.add_argument("--redo_failed", action="store_true",
+                    help="只重跑之前失败的 episode（改了 --demo_frames 之类时用）")
     ap.add_argument("--report_only", action="store_true", default=True,
                     help="只报分布、不落深度缓存与子集（缺省）")
     ap.add_argument("--commit", dest="report_only", action="store_false",
@@ -183,7 +185,17 @@ def main() -> None:
     out = Path(args.out) / f"{args.suite}_s{args.align_stride}"
     (out / "depth").mkdir(parents=True, exist_ok=True)
     log = out / "episodes.jsonl"
-    done = {json.loads(l)["ep"] for l in log.open()} if log.exists() else set()
+    recs0 = [json.loads(l) for l in log.open()] if log.exists() else []
+    # ⚠️ 只重跑失败项时，把旧的失败记录**从日志里删掉**再重来 —— 留着的话
+    #    汇总会把同一条 episode 数两次，覆盖率就是错的（而且不会报错）。
+    if args.redo_failed:
+        keep = [r for r in recs0 if r.get("ok")]
+        n_drop = len(recs0) - len(keep)
+        log.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n"
+                               for r in keep))
+        recs0 = keep
+        print(f"重跑失败项：丢掉 {n_drop} 条失败记录，保留 {len(keep)} 条已通过的")
+    done = {r["ep"] for r in recs0}
     if done:
         print(f"续跑：已完成 {len(done)} 条，跳过")
 
@@ -197,7 +209,8 @@ def main() -> None:
                 continue
             tid = find_task(bmark, ep["lang"])
             rec = {"ep": i, "task": tid, "lang": ep["lang"],
-                   "n_frames": int(len(ep["images"])), "meta": ep["meta"]}
+                   "n_frames": int(len(ep["images"])), "meta": ep["meta"],
+                   "stride": args.align_stride, "demo_frames": args.demo_frames}
             if tid is None:
                 rec.update(ok=False, why="任务描述对不上任何 task")
                 _append(log, rec)
@@ -237,7 +250,8 @@ def main() -> None:
             dp50, dp95, dnz = depth_uncertainty(dep, mj)
             ok, why = judge(m["best"], mono, dp95)
             rec.update(good=good, mono=mono, dp50=dp50, dp95=dp95, dnz=dnz,
-                       ok=ok, why=why, demo=key, stride=args.align_stride)
+                       ok=ok, why=why, demo=key, stride=args.align_stride,
+                       demo_frames=args.demo_frames)
             if ok and not args.report_only:
                 # 对齐后每个 RLDS 帧的 patch 级深度 (T,16,16)，按帧指纹存。
                 # float16 足够：分辨率 ~1 mm，而体素箱宽约 30 cm、跳变阈值 5 cm。
