@@ -160,16 +160,32 @@ def main(cfg: Config) -> None:
     log = open(os.path.join(cfg.local_log_dir, run_id + ".txt"), "w")
     print(f"日志: {log.name}")
 
-    print(f"视觉特征缓存: {'开' if cfg.vision_cache else '关'}"
-          + (f"（头 {cfg.verify_vision_cache} 步逐位对拍）"
-             if cfg.vision_cache and cfg.verify_vision_cache else ""))
+    def say(msg: str) -> None:
+        """
+        ⚠️ **配置与验证结果都要写进日志**。它们是这次测量的凭据：中心裁开没开、
+        视觉缓存与批量各自对拍过没有 —— 事后只看得到 FINAL 那一行的话，
+        无法判断这个数是在什么条件下得到的。早先它们只 print 到 stdout，
+        终端一关就没了。
+        """
+        print(msg)
+        log.write(msg + "\n")
+        log.flush()
+
+    say(f"# arm={cfg.arm} K={cfg.K} stride={cfg.stride} N={cfg.budget} "
+        f"n_t={cfg.n_t} adapter={adapter} n/task={cfg.num_trials_per_task} "
+        f"seed={cfg.seed}")
+
+    say(f"# 中心裁={'开' if cfg.center_crop else '关'} "
+        f"视觉特征缓存={'开' if cfg.vision_cache else '关'}"
+        + (f"（头 {cfg.verify_vision_cache} 步逐位对拍）"
+           if cfg.vision_cache and cfg.verify_vision_cache else ""))
     n_checked = 0
     suite = benchmark.get_benchmark_dict()[cfg.task_suite_name]()
     max_steps = MAX_STEPS[cfg.task_suite_name]
     total_ep = total_ok = 0
     checked = False
     B = max(1, cfg.eval_batch)
-    print(f"批量: {B} 局并行" + (f"（头 {cfg.verify_batch} 步与逐条 predict_action 对拍）"
+    say(f"# 批量={B} 局并行" + (f"（头 {cfg.verify_batch} 步与逐条 predict_action 对拍）"
                                 if cfg.verify_batch else ""))
     n_bchk = n_bdiff = 0
 
@@ -278,7 +294,7 @@ def main(cfg: Config) -> None:
                                     "--vision_cache False 关掉。")
                             n_checked += 1
                             if n_checked == cfg.verify_vision_cache:
-                                print(f"  ✓ 视觉特征缓存逐位对拍通过（{n_checked} 步）")
+                                say(f"# ✓ 视觉特征缓存逐位对拍通过（{n_checked} 步）")
                         fe_rows.append(fe)
                         px_rows.append(to_px(frames[-1:]))   # 占位，主干已短路
                     else:
@@ -294,8 +310,8 @@ def main(cfg: Config) -> None:
 
                 if not checked:
                     assert_arm_wiring(state, cfg.arm)
-                    print(f"  ✓ 接线正常（arm={cfg.arm}，rotary_emb "
-                          f"{state.rope_calls} 次）")
+                    say(f"# ✓ 接线正常（arm={cfg.arm}，rotary_emb "
+                        f"{state.rope_calls} 次）")
                     checked = True
 
                 # ⭐ 批量 vs 逐条：**比动作 token，不比 logits**。批量 matmul 的
@@ -322,8 +338,8 @@ def main(cfg: Config) -> None:
                                 f"❌ 批量与逐条 predict_action 在 {n_bdiff} 处不一致。"
                                 "批量改变了测量结果，不能用。--eval_batch 1 关掉，"
                                 "或先查 unnorm/gen_actions 是否与官方逐位一致。")
-                        print(f"  ✓ 批量与逐条 predict_action 逐位一致"
-                              f"（{n_bchk} 步 × {len(live)} 行）")
+                        say(f"# ✓ 批量与逐条 predict_action 逐位一致"
+                            f"（{n_bchk} 步 × {len(live)} 行）")
 
                 nxt = []
                 for r, i in enumerate(live):
