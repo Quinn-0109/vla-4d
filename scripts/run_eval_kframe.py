@@ -112,7 +112,19 @@ def _allow_batched_generation(model) -> None:
 
     ⚠️ 变长 prompt 需要 padding 时这条路**不成立**（官方那条断言多半正是为它设的）。
     本脚本同一 task 内 prompt 完全等长、无 padding，所以只在这个前提下用。
+
+    生成路径上一共**两处** batch==1 的假设，两处都在这里解开：
+
+      ① `prepare_inputs_for_generation` 开头的 `raise`
+      ② `forward` 里"带 cache 解码"那一支开头的 `assert`
+
+    ②的分支体是：`self.language_model(input_ids, attention_mask=None,
+    position_ids=None, past_key_values=..., ...)` —— `attention_mask` 与
+    `position_ids` 都交给 Llama 从 cache 长度自行推导，全批等长时对每一行都相同，
+    没有任何逐样本的硬编码。预填（多模态）那一支**本来就没有** batch 断言，
+    正是训练走的那条，已用 batch 8 验过。
     """
+    import sys
     import types
 
     def prep(self, input_ids=None, past_key_values=None, inputs_embeds=None,
@@ -130,6 +142,42 @@ def _allow_batched_generation(model) -> None:
         return model_inputs
 
     model.prepare_inputs_for_generation = types.MethodType(prep, model)
+
+    Out = sys.modules[type(model).__module__].PrismaticCausalLMOutputWithPast
+    orig_forward = model.forward
+
+    def fwd(self, input_ids=None, attention_mask=None, pixel_values=None,
+            labels=None, inputs_embeds=None, past_key_values=None,
+            use_cache=None, output_attentions=None, output_hidden_states=None,
+            output_projector_features=None, return_dict=None, **kw):
+        # 只接管"带 cache 解码"这一支，逐行照抄官方分支体、去掉 batch==1 的断言
+        if input_ids is not None and input_ids.shape[1] == 1:
+            assert past_key_values is not None, "缓存解码必须带 past_key_values"
+            assert labels is None, "缓存解码不该带 labels"
+            rd = return_dict if return_dict is not None else self.config.use_return_dict
+            o = self.language_model(
+                input_ids=input_ids, attention_mask=None, position_ids=None,
+                past_key_values=past_key_values, inputs_embeds=None, labels=None,
+                use_cache=use_cache and not self.training,
+                output_attentions=output_attentions,
+                output_hidden_states=output_hidden_states, return_dict=rd)
+            if not rd:
+                return o
+            return Out(loss=o.loss, logits=o.logits,
+                       past_key_values=o.past_key_values,
+                       hidden_states=o.hidden_states, attentions=o.attentions,
+                       projector_features=None)
+        # 其余一律交回官方实现（预填走多模态支，那支本就支持批量）
+        return orig_forward(
+            input_ids=input_ids, attention_mask=attention_mask,
+            pixel_values=pixel_values, labels=labels, inputs_embeds=inputs_embeds,
+            past_key_values=past_key_values, use_cache=use_cache,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            output_projector_features=output_projector_features,
+            return_dict=return_dict, **kw)
+
+    model.forward = types.MethodType(fwd, model)
 
 
 def build_window(hist: deque, k: int, stride: int):
