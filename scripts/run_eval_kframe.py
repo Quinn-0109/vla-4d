@@ -54,7 +54,7 @@ from experiments.robot.robot_utils import (invert_gripper_action,  # noqa: E402
 
 from common.imgproc import center_crop_resize  # noqa: E402
 from common.runs import resolve_adapter  # noqa: E402
-from pooling.wire import (WireConfig, assert_rope_active, frame_feats,  # noqa: E402
+from pooling.wire import (WireConfig, assert_arm_wiring, frame_feats,  # noqa: E402
                           set_batch, set_vision_feats, wire)
 
 MAX_STEPS = {"libero_spatial": 220, "libero_object": 280,
@@ -233,8 +233,8 @@ def main(cfg: Config) -> None:
                     act = model.predict_action(input_ids=ids, pixel_values=px,
                                                unnorm_key=unnorm, do_sample=False)
                 if not checked:
-                    assert_rope_active(state)
-                    print(f"  ✓ 4D RoPE 已生效（{state.rope_calls} 次）")
+                    assert_arm_wiring(state, cfg.arm)
+                    print(f"  ✓ 接线正常（{state.rope_calls} 次）")
                     checked = True
 
                 a = normalize_gripper_action(np.asarray(act).copy(), binarize=True)

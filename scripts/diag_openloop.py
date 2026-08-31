@@ -61,7 +61,7 @@ except ImportError:                                    # 官方改过函数名�
 from common.imgproc import center_crop_resize  # noqa: E402
 from common.runs import resolve_adapter  # noqa: E402
 from data.kframe import strided_chunk_indices  # noqa: E402
-from pooling.wire import (WireConfig, assert_rope_active, set_batch,  # noqa: E402
+from pooling.wire import (WireConfig, assert_arm_wiring, set_batch,  # noqa: E402
                           wire)
 
 DIMS = ["x", "y", "z", "roll", "pitch", "yaw", "grip"]
@@ -281,8 +281,8 @@ def main() -> None:
         base_acc = h / max(n, 1)
         print(f"\n【对照】**没加 adapter** 的底座，同样的 tf: acc {base_acc:.3f}"
               f"（{h}/{n}）—— 微调后的数字必须显著高于它")
-        assert_rope_active(state)
-        print(f"  ✓ 4D RoPE 已生效（{state.rope_calls} 次）")
+        assert_arm_wiring(state, args.arm)
+        print(f"  ✓ 接线正常（{state.rope_calls} 次）")
 
     if adapter:
         do_merge()
@@ -316,8 +316,8 @@ def main() -> None:
             pred[v].append(np.asarray(a, dtype=np.float64).reshape(-1)[:7])
         if not checked:
             # 挂点错了不会崩，只会全程用 1D RoPE —— 每次真前向后都要确认一遍
-            assert_rope_active(state)
-            print(f"  ✓ 4D RoPE 已生效（{state.rope_calls} 次）")
+            assert_arm_wiring(state, args.arm)
+            print(f"  ✓ 接线正常（{state.rope_calls} 次）")
             checked = True
 
     gt = np.stack(gt_all)

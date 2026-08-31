@@ -351,6 +351,26 @@ def assert_rope_active(state: _State) -> None:
             f"只有 {state.rope_calls}/{exp} 层用上了 4D RoPE —— 部分层走了别的路径。")
 
 
+def assert_arm_wiring(state: _State, arm: str) -> None:
+    """
+    按臂检查接线 —— **第一次 forward 之后必须调一次。**
+
+    G0 是单帧基线，`wire()` 有意不给它挂 RoPE，所以它的判据是**反的**：
+    `rope_calls` 必须是 0。早先训练循环无条件调 `assert_rope_active`，
+    G0 一开跑就被自己的闸拦下 —— 判据没有按臂分开。
+
+    两个方向都要查：G0 若被挂上了 4D RoPE，它就不再是"等于原模型"的基线，
+    而那同样不会报错。
+    """
+    if arm == "G0":
+        if state.rope_calls:
+            raise RuntimeError(
+                f"G0 是单帧基线，本该完全不接 RoPE，却被调用了 {state.rope_calls} 次 —— "
+                "它已经不是'等于原模型'的对照了。查 wire() 里的分支。")
+        return
+    assert_rope_active(state)
+
+
 def set_vision_feats(state: _State, feats) -> None:
     """
     交出**已经算好**的视觉特征 (B, K*256, D)，下一次 vision_backbone.forward
@@ -481,6 +501,17 @@ def _selftest() -> None:
         except RuntimeError:
             assert should_raise
     print("✅ 7/9 assert_rope_active：0 次和部分层都拦下，32/32 才放行")
+
+    # 判据必须按臂分开：G0 的正确状态就是 0 次，用同一条断言会把它拦下
+    st3 = _State()
+    assert_arm_wiring(st3, "G0")            # 0 次，应当放行
+    st3.rope_calls = 5
+    try:
+        assert_arm_wiring(st3, "G0")
+        raise SystemExit("    ✗ G0 被挂上 RoPE 竟然过了")
+    except RuntimeError:
+        pass
+    print("   ✅ 7b/9 按臂分派：G0 要求 rope_calls==0，挂上了反而拦下")
 
     # 回归：cos/sin 的长度必须跟着**真实序列长**走，不能在投影器里写死。
     # 初版把 n_text 写死成 0，真模型上 q 是 2068 而 cos 是 2049，

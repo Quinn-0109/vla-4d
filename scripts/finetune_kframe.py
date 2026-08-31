@@ -53,7 +53,8 @@ from common.lora import lora_targets  # noqa: E402
 from data.depth_cache import DepthCache  # noqa: E402
 from data.kframe import (KFrameBatchTransform, PaddedCollatorKFrame,  # noqa: E402
                          patch_strided_chunking)
-from pooling.wire import WireConfig, assert_rope_active, set_batch, wire  # noqa: E402
+from pooling.wire import (WireConfig, assert_arm_wiring, set_batch,  # noqa: E402
+                          wire)
 
 # 微批 × 累积，有效批恒为 16（docs/06 §4.3 的显存实测）
 #
@@ -363,8 +364,8 @@ def main(cfg: Config) -> None:
                               pixel_values=batch["pixel_values"].to(torch.bfloat16).to(dev),
                               labels=batch["labels"])
                 if not checked:
-                    assert_rope_active(state)
-                    print(f"  ✓ 4D RoPE 已生效（{state.rope_calls} 次）"
+                    assert_arm_wiring(state, cfg.arm)
+                    print(f"  ✓ 接线正常（arm={cfg.arm}，rotary_emb {state.rope_calls} 次）"
                           f"  序列长 {out.logits.shape[1]}")
                     checked = True
                 preds = out.logits[:, n_vis:-1].argmax(dim=2)
@@ -403,8 +404,8 @@ def main(cfg: Config) -> None:
             (out.loss / accum).backward()
 
             if not checked_rope:
-                assert_rope_active(state)     # 挂点错了不会崩，只会全程用 1D RoPE
-                print(f"  ✓ 4D RoPE 已生效（{state.rope_calls} 次调用）"
+                assert_arm_wiring(state, cfg.arm)   # 挂点错了不会崩，只会全程用 1D RoPE
+                print(f"  ✓ 接线正常（arm={cfg.arm}，rotary_emb {state.rope_calls} 次）"
                       f"  序列长 {out.logits.shape[1]}")
                 checked_rope = True
 
