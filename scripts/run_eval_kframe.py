@@ -83,6 +83,10 @@ class Config:
     #    实测每步 8 次主干前向是评测的成本大头（144 s/局，docs/05 §8.13）。
     vision_cache: bool = True
     verify_vision_cache: int = 0               # 头 N 步同时算两条路，torch.equal 对拍
+    # ⭐ 并行跑几局。成本大头是 LLM 的自回归解码（视觉只占约 1/4，见 docs/05 §8.13），
+    #    batch=1 时 LLM 完全没吃满。同一 task 的 prompt 相同，批起来无需 padding。
+    eval_batch: int = 8
+    verify_batch: int = 0                      # 头 N 步与逐条 predict_action 对拍
     seed: int = 7                              # 沿用阶段 0
     local_log_dir: str = "results/logs"
     run_note: str = ""
@@ -110,7 +114,7 @@ def build_window(hist: deque, k: int, stride: int):
 def main(cfg: Config) -> None:
     assert torch.cuda.is_available(), "需要 GPU"
     dev = "cuda"
-    unnorm = cfg.unnorm_key or f"{cfg.task_suite_name}_no_noops"
+    unnorm_key = cfg.unnorm_key or f"{cfg.task_suite_name}_no_noops"
     # ⚠️ 先把 checkpoint 路径查清楚再去加载 7B（见 common/runs）。
     adapter = resolve_adapter(cfg.adapter, cfg.run_root) if cfg.adapter else None
 
@@ -129,18 +133,18 @@ def main(cfg: Config) -> None:
     #    run_dir/dataset_statistics.json。官方流程用 finetuned checkpoint 绕过了
     #    这一步，我们用 LoRA adapter 就得自己接回去 —— 不接会直接抛
     #    "unnorm_key not in available dataset statistics"（好在会报错，不会静默）。
-    if unnorm not in model.norm_stats:
+    if unnorm_key not in model.norm_stats:
         sj = Path(cfg.stats_json) if cfg.stats_json else (
             adapter.parents[1] / "dataset_statistics.json" if adapter else None)
         if sj is None or not sj.exists():
             raise SystemExit(
-                f"底座里没有 `{unnorm}` 的动作统计量，也找不到 dataset_statistics.json。\n"
+                f"底座里没有 `{unnorm_key}` 的动作统计量，也找不到 dataset_statistics.json。\n"
                 f"  找过: {sj}\n"
                 f"  它由训练脚本写在 run 目录下（save_dataset_statistics）。\n"
                 f"  用 --stats_json 指过去，或确认 --adapter 指的是 "
                 f"<run_dir>/adapter/stepN。")
         d = json.loads(sj.read_text())
-        model.norm_stats[unnorm] = d.get(unnorm, d)
+        model.norm_stats[unnorm_key] = d.get(unnorm_key, d)
         print(f"已注入动作统计量: {sj}")
 
     state = wire(model, WireConfig(arm=cfg.arm, K=cfg.K, budget=cfg.budget,
@@ -164,92 +168,181 @@ def main(cfg: Config) -> None:
     max_steps = MAX_STEPS[cfg.task_suite_name]
     total_ep = total_ok = 0
     checked = False
+    B = max(1, cfg.eval_batch)
+    print(f"批量: {B} 局并行" + (f"（头 {cfg.verify_batch} 步与逐条 predict_action 对拍）"
+                                if cfg.verify_batch else ""))
+    n_bchk = n_bdiff = 0
+
+    def to_px(fr):
+        """
+        帧列表 → (1, len*6, H, W)。⚠️ **中心裁必须与训练侧的
+        `random_resized_crop(scale=0.9)` 对齐**：训练是 image_aug=True，模型只
+        见过裁过的画面；评测喂整张图不会报错，只会让它在没见过的分布上决策。
+        """
+        if cfg.center_crop:
+            fr = [center_crop_resize(f) for f in fr]
+        return torch.cat([processor.image_processor.apply_transform(
+            Image.fromarray(f)) for f in fr],
+            dim=0).unsqueeze(0).to(torch.bfloat16).to(dev)
+
+    def unnorm(tok: torch.Tensor) -> np.ndarray:
+        """
+        (B, 7) 动作 token → (B, 7) 反归一化动作。
+
+        ⚠️ 逐行照抄 `OpenVLAForActionPrediction.predict_action` 的后半段 ——
+        官方那份把 `generated_ids[0]` 写死了，只能取批里的第一条，所以批量时
+        必须自己算。**算错不会报错**，只会让动作整体偏掉，所以有
+        `--verify_batch`：头 N 步同时用官方逐条路径跑一遍，逐位比对。
+        """
+        d = model.vocab_size - tok.cpu().numpy()
+        d = np.clip(d - 1, a_min=0, a_max=model.bin_centers.shape[0] - 1)
+        z = model.bin_centers[d]
+        st = model.get_action_stats(unnorm_key)
+        hi, lo = np.array(st["q99"]), np.array(st["q01"])
+        m = np.array(st.get("mask", np.ones_like(st["q01"], dtype=bool)))
+        return np.where(m, 0.5 * (z + 1) * (hi - lo) + lo, z)
+
+    def gen_actions(ids: torch.Tensor, px: torch.Tensor) -> np.ndarray:
+        """批量生成 7 个动作 token。ids (B,L)，px (B,·,H,W)。"""
+        n = model.get_action_dim(unnorm_key)
+        # 官方 predict_action 的那句：在 "Out:" 之后补一个空 token
+        if not torch.all(ids[:, -1] == 29871):
+            pad_tok = torch.full((ids.shape[0], 1), 29871, dtype=ids.dtype,
+                                 device=ids.device)
+            ids = torch.cat([ids, pad_tok], dim=1)
+        # ⚠️ 不传 attention_mask —— 官方 predict_action 也不传，全批等长时 HF
+        #    自己补全 1。多传一个参数就多一处与官方路径的差别，而对拍要的是"同"。
+        with torch.no_grad():
+            out = model.generate(ids, pixel_values=px, max_new_tokens=n,
+                                 do_sample=False)
+        return unnorm(out[:, -n:])
 
     for task_id in tqdm.tqdm(range(suite.n_tasks), desc="tasks"):
         task = suite.get_task(task_id)
         inits = suite.get_task_init_states(task_id)
-        env, desc = get_libero_env(task, "openvla", resolution=256)
+        # ⚠️ B 个 env 并行。它们**逐步同步推进**，所以任一时刻 pad_mask 全批相同；
+        #    先结束的从活动集里摘掉，不再进 batch。
+        envs, desc = [], None
+        for _ in range(B):
+            e, desc = get_libero_env(task, "openvla", resolution=256)
+            envs.append(e)
+        prompt = f"In: What action should the robot take to {desc.lower()}?\nOut:"
+        ids1 = processor.tokenizer(prompt, return_tensors="pt").input_ids.to(dev)
         t_ep = t_ok = 0
 
-        for ep in tqdm.tqdm(range(cfg.num_trials_per_task), desc=f"task{task_id}",
-                            leave=False):
-            env.reset()
-            obs = env.set_init_state(inits[ep])
-            hist: deque = deque(maxlen=(cfg.K - 1) * cfg.stride + 1)
-            feat_hist: deque = deque(maxlen=(cfg.K - 1) * cfg.stride + 1)
-            t, done = 0, False
+        for lo_ep in tqdm.tqdm(range(0, cfg.num_trials_per_task, B),
+                               desc=f"task{task_id}", leave=False):
+            eps = list(range(lo_ep, min(lo_ep + B, cfg.num_trials_per_task)))
+            b = len(eps)
+            obs = []
+            for i, ep in enumerate(eps):
+                envs[i].reset()
+                obs.append(envs[i].set_init_state(inits[ep]))
+            mx = (cfg.K - 1) * cfg.stride + 1
+            hists = [deque(maxlen=mx) for _ in range(b)]
+            feats = [deque(maxlen=mx) for _ in range(b)]
+            live = list(range(b))
+            t = 0
 
-            while t < max_steps + cfg.num_steps_wait:
+            while t < max_steps + cfg.num_steps_wait and live:
                 if t < cfg.num_steps_wait:
-                    obs, _, done, _ = env.step(get_libero_dummy_action("openvla"))
+                    for i in live:
+                        obs[i], _, _, _ = envs[i].step(
+                            get_libero_dummy_action("openvla"))
                     t += 1
                     continue
-                img = get_libero_image(obs, 224)
-                hist.appendleft(img)
-                frames, pad = build_window(hist, cfg.K, cfg.stride)
 
-                # ⚠️ **中心裁必须与训练侧的 random_resized_crop(scale=0.9) 对齐。**
-                #    训练是 image_aug=True，模型只见过裁过的画面；评测喂整张图
-                #    不会报错，只会让模型在一个没见过的分布上做决策。
-                #    见 common/imgproc.center_crop_resize。
-                def to_px(fr):
-                    if cfg.center_crop:
-                        fr = [center_crop_resize(f) for f in fr]
-                    # (K*6, H, W)：每帧 6 通道，沿通道拼 —— 与训练侧同一约定
-                    return torch.cat([processor.image_processor.apply_transform(
-                        Image.fromarray(f)) for f in fr],
-                        dim=0).unsqueeze(0).to(torch.bfloat16).to(dev)
+                px_rows, fe_rows, pads = [], [], []
+                for i in live:
+                    img = get_libero_image(obs[i], 224)
+                    hists[i].appendleft(img)
+                    frames, pad = build_window(hists[i], cfg.K, cfg.stride)
+                    pads.append(pad)
+                    if cfg.vision_cache:
+                        # 每帧只算一次：视觉主干冻结，同一帧特征逐位相同，
+                        # 而历史窗口里的每一帧都曾是某个时刻的"当前帧"。
+                        feats[i].appendleft(frame_feats(state, model, to_px([img])))
+                        jj = [k * cfg.stride for k in range(cfg.K - 1, -1, -1)]
+                        fe = torch.cat([feats[i][min(j, len(feats[i]) - 1)]
+                                        for j in jj], dim=1)
+                        if n_checked < cfg.verify_vision_cache:
+                            ref = torch.cat([state.orig["vision"](c) for c in
+                                             torch.split(to_px(frames), 6, dim=1)],
+                                            dim=1)
+                            if not torch.equal(fe, ref):
+                                d = (fe.float() - ref.float()).abs().max().item()
+                                raise SystemExit(
+                                    f"❌ 视觉特征缓存与逐帧重算**不逐位相同**"
+                                    f"（最大差 {d:.3e}）。缓存的前提是视觉主干冻结、"
+                                    "同一帧特征恒定；前提不成立就不能用它测量。"
+                                    "--vision_cache False 关掉。")
+                            n_checked += 1
+                            if n_checked == cfg.verify_vision_cache:
+                                print(f"  ✓ 视觉特征缓存逐位对拍通过（{n_checked} 步）")
+                        fe_rows.append(fe)
+                        px_rows.append(to_px(frames[-1:]))   # 占位，主干已短路
+                    else:
+                        px_rows.append(to_px(frames))
 
+                px = torch.cat(px_rows, dim=0)
+                pm = torch.from_numpy(np.stack(pads)).to(dev)
+                ids = ids1.repeat(len(live), 1)      # expand 出来的是视图，generate 要连续
                 if cfg.vision_cache:
-                    # 只为**新到的这一帧**跑主干，其余从缓存取。窗口的第 i 帧
-                    # 对应 hist 里下标 (K-1-i)*stride，缓存与 hist 同步左推。
-                    feat_hist.appendleft(frame_feats(state, model, to_px([img])))
-                    idx = [i * cfg.stride for i in range(cfg.K - 1, -1, -1)]
-                    fe = torch.cat([feat_hist[min(j, len(feat_hist) - 1)]
-                                    for j in idx], dim=1)
-                    if n_checked < cfg.verify_vision_cache:
-                        ref = state.orig["vision"](to_px(frames)) if cfg.K == 1 else \
-                            torch.cat([state.orig["vision"](c) for c in
-                                       torch.split(to_px(frames), 6, dim=1)], dim=1)
-                        if not torch.equal(fe, ref):
-                            d = (fe.float() - ref.float()).abs().max().item()
-                            raise SystemExit(
-                                f"❌ 视觉特征缓存与逐帧重算**不逐位相同**（最大差 {d:.3e}）。"
-                                "缓存的前提是视觉主干冻结、同一帧特征恒定 —— "
-                                "这个前提没成立就不能用它测量。--vision_cache False 关掉。")
-                        n_checked += 1
-                        if n_checked == cfg.verify_vision_cache:
-                            print(f"  ✓ 视觉特征缓存逐位对拍通过（{n_checked} 步）")
-                    set_vision_feats(state, fe)
-                    px = to_px(frames[-1:])          # 占位：主干已被短路，形状无关
-                else:
-                    px = to_px(frames)
-                prompt = f"In: What action should the robot take to {desc.lower()}?\nOut:"
-                ids = processor.tokenizer(prompt, return_tensors="pt").input_ids.to(dev)
+                    set_vision_feats(state, torch.cat(fe_rows, dim=0))
+                set_batch(state, depth=None, frame_pad_mask=pm)
+                acts = gen_actions(ids, px)
 
-                set_batch(state, depth=None,
-                          frame_pad_mask=torch.from_numpy(pad).unsqueeze(0).to(dev))
-                with torch.no_grad():
-                    act = model.predict_action(input_ids=ids, pixel_values=px,
-                                               unnorm_key=unnorm, do_sample=False)
                 if not checked:
                     assert_arm_wiring(state, cfg.arm)
-                    print(f"  ✓ 接线正常（{state.rope_calls} 次）")
+                    print(f"  ✓ 接线正常（arm={cfg.arm}，rotary_emb "
+                          f"{state.rope_calls} 次）")
                     checked = True
 
-                a = normalize_gripper_action(np.asarray(act).copy(), binarize=True)
-                a = invert_gripper_action(a)
-                obs, _, done, _ = env.step(a.tolist())
-                if done:
-                    t_ok += 1
-                    total_ok += 1
-                    break
+                # ⭐ 批量 vs 逐条：**比动作 token，不比 logits**。批量 matmul 的
+                #    归约顺序与 batch=1 不同，末位可能有差；真正要保证的是
+                #    argmax 出来的 token 一致，那才是喂进仿真器的东西。
+                if n_bchk < cfg.verify_batch and len(live) > 1:
+                    for r in range(len(live)):
+                        if cfg.vision_cache:
+                            set_vision_feats(state, fe_rows[r])
+                        set_batch(state, depth=None, frame_pad_mask=pm[r:r + 1])
+                        with torch.no_grad():
+                            ref = model.predict_action(
+                                input_ids=ids1, pixel_values=px_rows[r],
+                                unnorm_key=unnorm_key, do_sample=False)
+                        if not np.array_equal(np.asarray(ref), acts[r]):
+                            n_bdiff += 1
+                            print(f"  ⚠️ 批量与逐条不一致 第{n_bchk}步 行{r}:"
+                                  f"\n     批量 {np.round(acts[r], 4)}"
+                                  f"\n     逐条 {np.round(np.asarray(ref), 4)}")
+                    n_bchk += 1
+                    if n_bchk == cfg.verify_batch:
+                        if n_bdiff:
+                            raise SystemExit(
+                                f"❌ 批量与逐条 predict_action 在 {n_bdiff} 处不一致。"
+                                "批量改变了测量结果，不能用。--eval_batch 1 关掉，"
+                                "或先查 unnorm/gen_actions 是否与官方逐位一致。")
+                        print(f"  ✓ 批量与逐条 predict_action 逐位一致"
+                              f"（{n_bchk} 步 × {len(live)} 行）")
+
+                nxt = []
+                for r, i in enumerate(live):
+                    a = normalize_gripper_action(acts[r].copy(), binarize=True)
+                    a = invert_gripper_action(a)
+                    obs[i], _, done, _ = envs[i].step(a.tolist())
+                    if done:
+                        t_ok += 1
+                        total_ok += 1
+                    else:
+                        nxt.append(i)
+                live = nxt
                 t += 1
 
-            t_ep += 1
-            total_ep += 1
+            t_ep += b
+            total_ep += b
 
-        env.close()
+        for e in envs:
+            e.close()
         line = (f"task {task_id} {desc[:40]!r}: {t_ok}/{t_ep} = "
                 f"{t_ok / max(t_ep, 1):.3f}   累计 {total_ok}/{total_ep} = "
                 f"{total_ok / max(total_ep, 1):.4f}")
