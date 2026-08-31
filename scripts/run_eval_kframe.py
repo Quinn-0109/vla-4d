@@ -409,7 +409,11 @@ def main(cfg: Config) -> None:
                 # ⭐ 批量 vs 逐条：**比动作 token，不比 logits**。批量 matmul 的
                 #    归约顺序与 batch=1 不同，末位可能有差；真正要保证的是
                 #    argmax 出来的 token 一致，那才是喂进仿真器的东西。
-                if n_bchk < cfg.verify_batch and len(live) > 1:
+                # ⚠️ 不要求 len(live) > 1：`--eval_batch 1 --verify_batch N` 正是用来
+                #    把"我重写的 gen_actions/unnorm 有没有错"从"批量的浮点差异"里
+                #    隔离出来 —— B=1 时两条路除了我的代码没有任何区别，
+                #    若仍不一致，那就是我的 bug 而非数值噪声。
+                if n_bchk < cfg.verify_batch:
                     for r in range(len(live)):
                         if cfg.vision_cache:
                             set_vision_feats(state, fe_rows[r])
