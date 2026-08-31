@@ -93,6 +93,45 @@ class Config:
     # fmt: on
 
 
+def _allow_batched_generation(model) -> None:
+    """
+    去掉 openvla 对批量生成的那条断言。
+
+    官方 `prepare_inputs_for_generation` 开头是：
+
+        raise ValueError("Generation with batch size > 1 is not currently supported!")
+
+    但函数体其余部分（`past_key_values` 时截最后一个 token、把 `pixel_values`
+    原样带下去）**全是逐样本无关的操作**，docstring 自己写的也是
+    "simplified for batch size = 1" —— 是**没做**，不是**不能做**。
+    而 `forward` 本身批量安全：训练就是 batch 8 走的同一个 forward。
+
+    ⚠️ 尽管如此，这仍是绕开上游的一道显式检查。**唯一能让它作数的是对拍**：
+    `--verify_batch N` 用官方逐条 `predict_action` 跑同样的输入，比较**动作
+    token**（不是 logits —— 批量 matmul 的归约顺序本来就不同）。不一致就退出。
+
+    ⚠️ 变长 prompt 需要 padding 时这条路**不成立**（官方那条断言多半正是为它设的）。
+    本脚本同一 task 内 prompt 完全等长、无 padding，所以只在这个前提下用。
+    """
+    import types
+
+    def prep(self, input_ids=None, past_key_values=None, inputs_embeds=None,
+             pixel_values=None, attention_mask=None, **kwargs):
+        if past_key_values is not None:
+            input_ids = input_ids[:, -1:]
+        if inputs_embeds is not None and past_key_values is None:
+            model_inputs = {"input_embeds": inputs_embeds}
+        else:
+            model_inputs = {"input_ids": input_ids}
+        model_inputs.update({"attention_mask": attention_mask,
+                             "pixel_values": pixel_values,
+                             "past_key_values": past_key_values,
+                             "use_cache": kwargs.get("use_cache")})
+        return model_inputs
+
+    model.prepare_inputs_for_generation = types.MethodType(prep, model)
+
+
 def build_window(hist: deque, k: int, stride: int):
     """
     从帧历史里取 K 帧：`t, t−s, …, t−(K−1)s`，不足则重复最早那一帧。
@@ -147,6 +186,9 @@ def main(cfg: Config) -> None:
         model.norm_stats[unnorm_key] = d.get(unnorm_key, d)
         print(f"已注入动作统计量: {sj}")
 
+    if cfg.eval_batch > 1:
+        _allow_batched_generation(model)
+
     state = wire(model, WireConfig(arm=cfg.arm, K=cfg.K, budget=cfg.budget,
                                    n_t=cfg.n_t))
     model.eval()
@@ -185,7 +227,9 @@ def main(cfg: Config) -> None:
     total_ep = total_ok = 0
     checked = False
     B = max(1, cfg.eval_batch)
-    say(f"# 批量={B} 局并行" + (f"（头 {cfg.verify_batch} 步与逐条 predict_action 对拍）"
+    say(f"# 批量={B} 局并行"
+        + ("（已覆盖 openvla 的 batch>1 断言，见 _allow_batched_generation）"
+           if B > 1 else "") + (f"（头 {cfg.verify_batch} 步与逐条 predict_action 对拍）"
                                 if cfg.verify_batch else ""))
     n_bchk = n_bdiff = 0
 
