@@ -102,6 +102,7 @@ class _State:
     def __init__(self):
         self.batch: Optional[_Batch] = None
         self.uses_left: int = 0         # 还允许被消费几次，见 set_batch(n_uses=)
+        self.vision_feats = None        # 评测用的预算特征，见 set_vision_feats
         self.rope: Optional[tuple] = None
         self.rope_calls: int = 0        # 我们的 rotary_emb 被真正调用了几次
         self.orig: dict = {}            # 原始实现，unwire 时还回去
@@ -126,11 +127,19 @@ class _State:
 
 
 # ---------------------------------------------------------------- 各挂载点
-def _patch_vision(model, k: int) -> None:
+def _patch_vision(model, k: int, state: Optional["_State"] = None) -> None:
     """(B, K*6, H, W) → (B, K*256, D)。与 `scripts/probe_vram.py` 同一套约定。"""
     orig = model.vision_backbone.forward
 
     def wrapped(pixel_values, *a, **kw):
+        # ⭐ 评测时同一帧会在连续 K 个时刻各出现一次，而**视觉主干是冻结的**
+        #    （LoRA 不含视觉），同一帧的特征逐位相同。所以评测侧每帧只算一次、
+        #    缓存复用，这里直接收下算好的。见 set_vision_feats 与
+        #    run_eval_kframe.py 的 --verify_vision_cache（逐位对拍）。
+        #    ⚠️ 只在评测用：训练要走增广，同一帧每次的像素都不同，不能缓存。
+        if state is not None and state.vision_feats is not None:
+            f, state.vision_feats = state.vision_feats, None
+            return f
         if k == 1:
             return orig(pixel_values, *a, **kw)
         return torch.cat([orig(c, *a, **kw)
@@ -300,7 +309,7 @@ def wire(model, cfg: WireConfig) -> _State:
         "rotary": [l.self_attn.rotary_emb
                    for l in model.language_model.model.layers],
     }
-    _patch_vision(model, cfg.K)
+    _patch_vision(model, cfg.K, state)
     if cfg.arm != "G0":
         _patch_projector(model, cfg, state)
         _patch_rope(model, cfg, state)
@@ -340,6 +349,24 @@ def assert_rope_active(state: _State) -> None:
     if exp and state.rope_calls < exp:
         raise RuntimeError(
             f"只有 {state.rope_calls}/{exp} 层用上了 4D RoPE —— 部分层走了别的路径。")
+
+
+def set_vision_feats(state: _State, feats) -> None:
+    """
+    交出**已经算好**的视觉特征 (B, K*256, D)，下一次 vision_backbone.forward
+    直接返回它、不再跑主干。消费一次即作废。
+
+    ⚠️ **只用于评测。** 训练开着 image_aug，同一帧每次的像素都不同，缓存就是错的。
+    """
+    state.vision_feats = feats
+
+
+def frame_feats(state: _State, model, px6) -> torch.Tensor:
+    """
+    单帧 (1, 6, H, W) → (1, 256, D)，走**未经包装的原始主干**。
+    评测侧用它逐帧填缓存。
+    """
+    return state.orig["vision"](px6)
 
 
 def set_batch(state: _State, depth=None, frame_pad_mask=None, cameras=(),

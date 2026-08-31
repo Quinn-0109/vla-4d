@@ -54,8 +54,8 @@ from experiments.robot.robot_utils import (invert_gripper_action,  # noqa: E402
 
 from common.imgproc import center_crop_resize  # noqa: E402
 from common.runs import resolve_adapter  # noqa: E402
-from pooling.wire import (WireConfig, assert_rope_active, set_batch,  # noqa: E402
-                          wire)
+from pooling.wire import (WireConfig, assert_rope_active, frame_feats,  # noqa: E402
+                          set_batch, set_vision_feats, wire)
 
 MAX_STEPS = {"libero_spatial": 220, "libero_object": 280,
              "libero_goal": 300, "libero_10": 520, "libero_90": 400}
@@ -79,6 +79,10 @@ class Config:
     stats_json: Optional[str] = None           # 默认找 <adapter>/../../dataset_statistics.json
     run_root: str = "runs"                     # --adapter 找不到时列清单用
     center_crop: bool = True                   # ⚠️ 训练开了 image_aug 就必须开，见下
+    # ⭐ 每帧的视觉特征只算一次、跨窗口复用（视觉主干冻结，同一帧特征逐位相同）。
+    #    实测每步 8 次主干前向是评测的成本大头（144 s/局，docs/05 §8.13）。
+    vision_cache: bool = True
+    verify_vision_cache: int = 0               # 头 N 步同时算两条路，torch.equal 对拍
     seed: int = 7                              # 沿用阶段 0
     local_log_dir: str = "results/logs"
     run_note: str = ""
@@ -152,6 +156,10 @@ def main(cfg: Config) -> None:
     log = open(os.path.join(cfg.local_log_dir, run_id + ".txt"), "w")
     print(f"日志: {log.name}")
 
+    print(f"视觉特征缓存: {'开' if cfg.vision_cache else '关'}"
+          + (f"（头 {cfg.verify_vision_cache} 步逐位对拍）"
+             if cfg.vision_cache and cfg.verify_vision_cache else ""))
+    n_checked = 0
     suite = benchmark.get_benchmark_dict()[cfg.task_suite_name]()
     max_steps = MAX_STEPS[cfg.task_suite_name]
     total_ep = total_ok = 0
@@ -168,6 +176,7 @@ def main(cfg: Config) -> None:
             env.reset()
             obs = env.set_init_state(inits[ep])
             hist: deque = deque(maxlen=(cfg.K - 1) * cfg.stride + 1)
+            feat_hist: deque = deque(maxlen=(cfg.K - 1) * cfg.stride + 1)
             t, done = 0, False
 
             while t < max_steps + cfg.num_steps_wait:
@@ -183,12 +192,38 @@ def main(cfg: Config) -> None:
                 #    训练是 image_aug=True，模型只见过裁过的画面；评测喂整张图
                 #    不会报错，只会让模型在一个没见过的分布上做决策。
                 #    见 common/imgproc.center_crop_resize。
-                if cfg.center_crop:
-                    frames = [center_crop_resize(f) for f in frames]
-                # (K*6, H, W)：每帧 6 通道，沿通道拼 —— 与训练侧同一约定
-                px = torch.cat([processor.image_processor.apply_transform(
-                    Image.fromarray(f)) for f in frames],
-                    dim=0).unsqueeze(0).to(torch.bfloat16).to(dev)
+                def to_px(fr):
+                    if cfg.center_crop:
+                        fr = [center_crop_resize(f) for f in fr]
+                    # (K*6, H, W)：每帧 6 通道，沿通道拼 —— 与训练侧同一约定
+                    return torch.cat([processor.image_processor.apply_transform(
+                        Image.fromarray(f)) for f in fr],
+                        dim=0).unsqueeze(0).to(torch.bfloat16).to(dev)
+
+                if cfg.vision_cache:
+                    # 只为**新到的这一帧**跑主干，其余从缓存取。窗口的第 i 帧
+                    # 对应 hist 里下标 (K-1-i)*stride，缓存与 hist 同步左推。
+                    feat_hist.appendleft(frame_feats(state, model, to_px([img])))
+                    idx = [i * cfg.stride for i in range(cfg.K - 1, -1, -1)]
+                    fe = torch.cat([feat_hist[min(j, len(feat_hist) - 1)]
+                                    for j in idx], dim=1)
+                    if n_checked < cfg.verify_vision_cache:
+                        ref = state.orig["vision"](to_px(frames)) if cfg.K == 1 else \
+                            torch.cat([state.orig["vision"](c) for c in
+                                       torch.split(to_px(frames), 6, dim=1)], dim=1)
+                        if not torch.equal(fe, ref):
+                            d = (fe.float() - ref.float()).abs().max().item()
+                            raise SystemExit(
+                                f"❌ 视觉特征缓存与逐帧重算**不逐位相同**（最大差 {d:.3e}）。"
+                                "缓存的前提是视觉主干冻结、同一帧特征恒定 —— "
+                                "这个前提没成立就不能用它测量。--vision_cache False 关掉。")
+                        n_checked += 1
+                        if n_checked == cfg.verify_vision_cache:
+                            print(f"  ✓ 视觉特征缓存逐位对拍通过（{n_checked} 步）")
+                    set_vision_feats(state, fe)
+                    px = to_px(frames[-1:])          # 占位：主干已被短路，形状无关
+                else:
+                    px = to_px(frames)
                 prompt = f"In: What action should the robot take to {desc.lower()}?\nOut:"
                 ids = processor.tokenizer(prompt, return_tensors="pt").input_ids.to(dev)
 
