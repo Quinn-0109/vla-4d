@@ -358,11 +358,16 @@ def main(cfg: Config) -> None:
                 set_batch(state, depth=None if dep is None else dep.to(dev),
                           frame_pad_mask=batch["frame_pad_mask"].to(dev),
                           cameras=cams)
+                # ⚠️ **必须显式 use_cache=False。** openvla 的 forward 里是
+                #    `use_cache = use_cache and not self.training` —— 训练时
+                #    self.training=True 把它关掉了，而只前向复核时是 eval() 模式，
+                #    于是白建一份 16×278 的 KV cache（约 2.3 GB），加上 logits
+                #    升 fp32 的两份拷贝，直接 OOM。我们不生成，用不着 cache。
                 with torch.autocast("cuda", dtype=torch.bfloat16):
                     out = vla(input_ids=batch["input_ids"].to(dev),
                               attention_mask=batch["attention_mask"].to(dev),
                               pixel_values=batch["pixel_values"].to(torch.bfloat16).to(dev),
-                              labels=batch["labels"])
+                              labels=batch["labels"], use_cache=False)
                 if not checked:
                     assert_arm_wiring(state, cfg.arm)
                     print(f"  ✓ 接线正常（arm={cfg.arm}，rotary_emb {state.rope_calls} 次）"
