@@ -217,7 +217,8 @@ def main() -> None:
             tid = find_task(bmark, ep["lang"])
             rec = {"ep": i, "task": tid, "lang": ep["lang"],
                    "n_frames": int(len(ep["images"])), "meta": ep["meta"],
-                   "stride": args.align_stride, "demo_frames": args.demo_frames}
+                   "stride": args.align_stride, "demo_frames": args.demo_frames,
+                   "stage1": args.stage1_frames}
             if tid is None:
                 rec.update(ok=False, why="任务描述对不上任何 task")
                 _append(log, rec)
@@ -234,7 +235,8 @@ def main() -> None:
                 env_tid = tid
 
             m = match_init(env, bmark, tid, ep["images"][0], args.n_init_try,
-                           args.demo_frames)
+                           args.demo_frames,
+                           tuple(int(x) for x in args.stage1_frames.split(",")))
             env.reset()
             obs = env.set_init_state(m["state"])
             prof = diff_profile(rgb_of(obs, True), ep["images"][0])

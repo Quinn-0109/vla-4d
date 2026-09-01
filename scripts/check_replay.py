@@ -213,8 +213,31 @@ def demo_states(task, n_demo: int = 60, n_frame: int = 1):
     return out
 
 
+def demo_states_at(task, n_demo: int, frames):
+    """取每条 demo 在指定帧号上的状态。`frames` 是帧号序列（越界的跳过）。"""
+    try:
+        import h5py
+
+        from libero.libero import get_libero_path
+        root = Path(get_libero_path("datasets"))
+    except Exception:
+        return []
+    hits = list(root.rglob(f"{task.name}_demo.hdf5")) or list(
+        root.rglob(f"{task.name}*.hdf5"))
+    if not hits:
+        return []
+    out = []
+    with h5py.File(hits[0], "r") as f:
+        for k in list(f["data"].keys())[:n_demo]:
+            st = f["data"][k]["states"]
+            for t in frames:
+                if t < st.shape[0]:
+                    out.append((k, t, np.asarray(st[t])))
+    return out
+
+
 def match_init(env, bmark, tid: int, ref: np.ndarray, n_try: int,
-               n_frame: int = 1):
+               n_frame: int = 1, stage1_frames=(0,)):
     """
     逐个试初始状态，找与 RLDS 第 0 帧最像的那个；同时定下翻转与否。
     返回 (init_idx, flip, 最好误差, 次好误差, 不翻的最好误差)。
@@ -225,13 +248,21 @@ def match_init(env, bmark, tid: int, ref: np.ndarray, n_try: int,
                                   问题在渲染设置（而"最像的那个"只是噪声）
     """
     evals = list(bmark.get_task_init_states(tid))[:n_try]
-    # 两段搜索：先用每条 demo 的第 0 帧挑出**哪一条 demo**（便宜），
-    # 再在这一条里扫前 n_frame 帧找**偏移量**（应对 no_noops 削掉的开头）。
-    # 直接 50 demo × 40 帧 = 2000 次渲染太慢；而场景布局在开头几帧几乎不变，
-    # 所以第一段仍能选对 demo。
-    d0 = demo_states(bmark.get_task(tid), n_try, 1)
+    # 两段搜索：先挑出**哪一条 demo**（便宜），再在这一条里扫前 n_frame 帧
+    # 找**偏移量**（应对 no_noops 削掉的开头）。直接 50 demo × 80 帧 = 4000 次
+    # 渲染太慢，所以分两段。
+    #
+    # ⚠️ **第一段不能只比每条 demo 的第 0 帧。** 实测 libero_10 有 90 条 episode
+    #    栽在初始帧上，且 d0 中位数 10.9、次好只差 0.2 —— 那是"正确的那个根本
+    #    不在候选里"的形态。成因：若 no_noops 削掉的开头很长，RLDS 的第 0 帧
+    #    实际是 demo 的第 60 帧，拿它去比 50 条 demo 的**第 0 帧**，选中的是
+    #    "哪条 demo 的起始画面最像这个中途画面"——基本是随机的。选错了 demo，
+    #    第二段的偏移搜索再准也没用（这也解释了为什么 demo_frames 40→80 只救回一条：
+    #    瓶颈不在偏移范围，在选 demo 那一步）。
+    #    `stage1_frames` 让第一段在每条 demo 的若干个帧号上都比一遍。
+    d0 = demo_states_at(bmark.get_task(tid), n_try, stage1_frames)
     cands = [("eval", str(j), st) for j, st in enumerate(evals)] + \
-            [(f"demo:{k}", "0", st) for k, _, st in d0]
+            [(f"demo:{k}", str(t), st) for k, t, st in d0]
     scores = []
     for src, j, st in cands:
         env.reset()
@@ -243,7 +274,9 @@ def match_init(env, bmark, tid: int, ref: np.ndarray, n_try: int,
     res = {"src": best[2], "idx": best[3], "state": best[4],
            "best": flipped[0], "second": flipped[1],
            "noflip": min(x[1] for x in scores),
-           "n_eval": len(evals), "n_demo": len(d0), "frame_off": 0}
+           "n_eval": len(evals), "n_demo": len(d0),
+           # 第一段若是在非 0 帧上选中的，那个帧号本身就是偏移量的起点
+           "frame_off": int(best[3]) if best[2].startswith("demo:") else 0}
 
     # 第二段：只在选中的那条 demo 里扫帧偏移
     if n_frame > 1 and best[2].startswith("demo:"):
