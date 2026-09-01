@@ -93,6 +93,16 @@ from pooling.wire import (WireConfig, assert_arm_wiring, set_batch,  # noqa: E40
 EFF_BATCH = 16
 MICRO = {1: (16, 1), 8: (8, 2)}      # K=8 取 micro=8，见上表
 
+# ⚠️ **G1 必须单列。** 它不池化，LLM 要吞 2048 个视觉 token + 文本 ≈ 2068，
+#    是其余臂（~280）的 **7 倍序列长**。而 logits 是在**全部位置**上算的，
+#    其中 2048 个是视觉位置、标签全是 IGNORE_INDEX —— 纯属白算，却真占显存：
+#
+#        micro=8：8 × 2068 × 32064 × 4 B = **2.12 GB**（仅 fp32 那一份）
+#
+#    实测 micro=8 直接 OOM 在 `logits.float()` 上。微批是吞吐参数不是实验参数，
+#    有效批仍是 16，所以单独给它一个更小的值。**具体值由 --bench_only 定。**
+MICRO_ARM = {"G1": (2, 8)}          # 暂定，开跑前必须 --bench_only 复核
+
 
 @dataclass
 class Config:
@@ -177,7 +187,7 @@ def main(cfg: Config) -> None:
               f"y[{bb['lo'][1]:+.2f},{bb['hi'][1]:+.2f}] "
               f"z[{bb['lo'][2]:+.2f},{bb['hi'][2]:+.2f}]")
 
-    micro, accum = MICRO[cfg.K]
+    micro, accum = MICRO_ARM.get(cfg.arm, MICRO[cfg.K])
     if cfg.micro:
         # ⚠️ **有效批必须恒为 16**（docs/06 §4.3）。只让改微批，累积自动配平；
         #    除不尽就直接拒绝 —— 有效批一旦跟着显存漂移，跨臂比较就作废了，
