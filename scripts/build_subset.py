@@ -170,7 +170,12 @@ def main() -> None:
                     help="逐帧对齐的渲染步长。**1 是定稿值**：2 时深度不确定度"
                          "dp95 中位 8.1 cm 过不了闸，1 时 3.9 cm（docs/05 §8.12）")
     ap.add_argument("--n_init_try", type=int, default=50)
-    ap.add_argument("--demo_frames", type=int, default=40)
+    ap.add_argument("--stage1_frames", default="0,20,40,60",
+                    help="选 demo 时在每条 demo 的哪几个帧号上比对。只比第 0 帧时，"
+                         "no_noops 削掉长开头的 episode 会选错 demo —— 全量实测 90 条"
+                         "栽在初始帧上，d0 中位 10.9 而次好只差 0.2（docs/05 §8.16）")
+    ap.add_argument("--demo_frames", type=int, default=80,
+                    help="在选中的那条 demo 里往后扫多少帧找偏移（no_noops 用）")
     ap.add_argument("--redo_failed", action="store_true",
                     help="只重跑之前失败的 episode（改了 --demo_frames 之类时用）")
     ap.add_argument("--report_only", action="store_true", default=True,
