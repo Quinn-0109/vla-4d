@@ -514,12 +514,19 @@ def main(cfg: Config) -> None:
 
             t_ep += b
             total_ep += b
+            # ⚠️ **碎片，不是泄漏。** `live` 随着 episode 陆续成功而缩小，
+            #    batch 形状一路 8→7→…→1，每种形状都让缓存分配器切出不同大小的块；
+            #    跑满 200 局后 `1.07 GiB reserved but unallocated` 却申请不到
+            #    连续的 20 MiB —— 这就是第一次满量在 task 4 崩掉的原因。
+            #    每批（8 局）回收一次，相对于一批几分钟的耗时可以忽略。
+            torch.cuda.empty_cache()
 
-        # ⚠️ 每个 task 新建 B 个 env、结束时 close。但 close 本身会抛 EGL 错
-        #    （见退出时那一串 `Exception ignored in __del__`），**close 抛了就等于
-        #    没释放**，渲染上下文逐 task 累积。所以：逐个 close 且不让异常打断，
-        #    然后丢引用 + gc + empty_cache，把释放做实。
-        #    起因：第一次满量跑到 task 4 时在 KV cache 的 torch.cat 处崩了。
+        # ⚠️ close 本身会抛 EGL 错（退出时那一串 `Exception ignored in __del__`），
+        #    抛了就等于没释放，所以逐个 close 且不让异常打断。
+        #    ⚠️ **但 OOM 不是它造成的**：报错里 PyTorch 自己占 20.66 GiB /
+        #    进程总共 22.68 GiB，non-PyTorch（EGL 渲染上下文）只有约 1 GB，
+        #    没在涨。真正的成因是**碎片**，见下面 episode 批结束处的 empty_cache。
+        #    我最初把它归到 env 泄漏上，是先有猜想再看数——记在这里。
         for e in envs:
             try:
                 e.close()
