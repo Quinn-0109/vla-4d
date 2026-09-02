@@ -213,8 +213,19 @@ def main(cfg: Config) -> None:
             "所以这里硬拦。要评底座请**完全不传** --adapter。")
     adapter = resolve_adapter(cfg.adapter, cfg.run_root) if cfg.adapter else None
     if adapter is None:
-        print("⚠️ 未指定 adapter，评测的是**未微调的底座模型** —— "
-              "这个数不能与各臂比较。")
+        # ⚠️ 不传 adapter 有两种情形，别混为一谈：
+        #   ① --vla_path 还是底座 openvla-7b → 真的是未微调模型，这个数没有意义
+        #   ② --vla_path 指向官方已微调 checkpoint（openvla-7b-finetuned-libero-*）
+        #      → 这是**路径交叉验证**的正确用法：官方权重 + 我们的评测链路，
+        #        与阶段 0 用 run_libero_eval_traj.py 测出的数直接对比（docs/05 §3）。
+        # 早先这里无条件喊"未微调的底座模型"。**假警报和漏报一样有害** ——
+        # 它教人忽略警告，下次真的漏传 adapter 时那行字就不起作用了。
+        if "finetuned" in str(cfg.vla_path):
+            print(f"ℹ️ 未传 --adapter，直接评测 {cfg.vla_path} —— "
+                  "官方已微调权重，用于评测链路的交叉验证。")
+        else:
+            print("⚠️ 未指定 adapter，评测的是**未微调的底座模型** —— "
+                  "这个数不能与各臂比较。")
 
     processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
     model = AutoModelForVision2Seq.from_pretrained(
@@ -231,6 +242,15 @@ def main(cfg: Config) -> None:
     #    run_dir/dataset_statistics.json。官方流程用 finetuned checkpoint 绕过了
     #    这一步，我们用 LoRA adapter 就得自己接回去 —— 不接会直接抛
     #    "unnorm_key not in available dataset statistics"（好在会报错，不会静默）。
+    # 官方已微调 checkpoint 自带 norm_stats，键名可能是 `libero_10_no_noops`
+    # 也可能是 `libero_10`（run_libero_eval_traj.py 里就有这条回退）。
+    # ⚠️ 只在**用户没显式指定** --unnorm_key 时回退，且只认模型自带的键；
+    #    评各臂 adapter 时两个键都不在底座里，行为与从前逐字相同（走注入）。
+    if cfg.unnorm_key is None and unnorm_key not in model.norm_stats \
+            and cfg.task_suite_name in model.norm_stats:
+        unnorm_key = cfg.task_suite_name
+        print(f"已回退到 checkpoint 自带的动作统计量键: {unnorm_key}")
+
     if unnorm_key not in model.norm_stats:
         sj = Path(cfg.stats_json) if cfg.stats_json else (
             adapter.parents[1] / "dataset_statistics.json" if adapter else None)
