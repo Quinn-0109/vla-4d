@@ -178,6 +178,10 @@ def main() -> None:
                     help="在选中的那条 demo 里往后扫多少帧找偏移（no_noops 用）")
     ap.add_argument("--redo_failed", action="store_true",
                     help="只重跑之前失败的 episode（改了 --demo_frames 之类时用）")
+    ap.add_argument("--only_task", type=int, default=-1,
+                    help="只处理这一个 task。失败是按 task 聚集的（交叉表见 §8.19），"
+                         "针对某个 task 调搜索参数时，不必把别的 task 的失败项"
+                         "一起重渲染。⚠️ 它**只缩小重跑范围，不碰任何判据**")
     ap.add_argument("--report_only", action="store_true", default=True,
                     help="只报分布、不落深度缓存与子集（缺省）")
     ap.add_argument("--commit", dest="report_only", action="store_false",
@@ -201,7 +205,9 @@ def main() -> None:
     # ⚠️ 只重跑失败项时，把旧的失败记录**从日志里删掉**再重来 —— 留着的话
     #    汇总会把同一条 episode 数两次，覆盖率就是错的（而且不会报错）。
     if args.redo_failed:
-        keep = [r for r in recs0 if r.get("ok")]
+        # --only_task 时只丢该 task 的失败记录，别的 task 的失败保持原样
+        keep = [r for r in recs0 if r.get("ok")
+                or (args.only_task >= 0 and r.get("task") != args.only_task)]
         n_drop = len(recs0) - len(keep)
         log.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n"
                                for r in keep))
@@ -220,6 +226,8 @@ def main() -> None:
             if i in done:
                 continue
             tid = find_task(bmark, ep["lang"])
+            if args.only_task >= 0 and tid != args.only_task:
+                continue
             rec = {"ep": i, "task": tid, "lang": ep["lang"],
                    "n_frames": int(len(ep["images"])), "meta": ep["meta"],
                    "stride": args.align_stride, "demo_frames": args.demo_frames,
