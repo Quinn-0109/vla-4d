@@ -355,12 +355,53 @@ def summarize(log: Path, out: Path, report_only: bool = True) -> None:
             print(f"  {k:>5} 分位 p10={np.percentile(v, 10):.3f} "
                   f"p50={np.median(v):.3f} p90={np.percentile(v, 90):.3f} "
                   f"max={v.max():.3f}")
-    why: dict = {}
+    # ⚠️ `why` 里带着具体数值（"匹配下标单调性 92.4% < 95%"），直接当 key 计数
+    #    等于每条自成一类，打出来是一面看不懂的墙 —— 而**真正要回答的问题是
+    #    "某个 task 死在哪道闸上"**：若失败在各 task 间均匀，那是判据整体偏紧；
+    #    若集中在一两个 task，那是那几个 task 有具体毛病，两者处置完全不同。
+    #    所以：把原因归成三桶，并且**按 task 交叉**。
+    def bucket(w: str) -> str:
+        if "初始帧" in w:
+            return "初始帧对不上"
+        if "单调性" in w:
+            return "对齐单调性"
+        if "深度不确定度" in w:
+            return "深度不确定度"
+        return "其他"
+
+    buckets = ("初始帧对不上", "对齐单调性", "深度不确定度", "其他")
+    cross: dict = {}
     for r in recs:
         if not r.get("ok"):
-            why[r.get("why", "?")] = why.get(r.get("why", "?"), 0) + 1
-    if why:
-        print("  失败原因：" + "  ".join(f"{k} ×{v}" for k, v in why.items()))
+            c = cross.setdefault(r.get("task"), dict.fromkeys(buckets, 0))
+            c[bucket(r.get("why", "?"))] += 1
+    if cross:
+        tot = dict.fromkeys(buckets, 0)
+        print(f"\n  失败原因 × task（首个触发的闸）")
+        print(f"  {'task':>6} " + " ".join(f"{b:>12}" for b in buckets) + f" {'小计':>6}")
+        for t in sorted(cross, key=lambda x: (x is None, x)):
+            c = cross[t]
+            for b in buckets:
+                tot[b] += c[b]
+            print(f"  {str(t):>6} " + " ".join(f"{c[b]:>12}" for b in buckets)
+                  + f" {sum(c.values()):>6}")
+        print(f"  {'合计':>6} " + " ".join(f"{tot[b]:>12}" for b in buckets)
+              + f" {sum(tot.values()):>6}")
+
+    # ⚠️ 每道闸**单独**的淘汰率（不是"首个触发"）。上表是短路求值的结果，
+    #    排在前面的闸会掩盖后面的；要判某道闸是不是定得太紧，得看它单独淘汰多少。
+    gates = (("初始帧对不上", "d0", lambda v: v > TOL),
+             ("对齐单调性", "mono", lambda v: v < MIN_MONO),
+             ("深度不确定度", "dp95", lambda v: v >= MAX_DEPTH_P95))
+    print("\n  每道闸单独的淘汰率（互不掩盖）")
+    surv = np.ones(len(recs), dtype=bool)
+    for name, key, bad in gates:
+        v = np.array([r.get(key, np.nan) for r in recs], dtype=float)
+        f = np.isfinite(v) & bad(v)
+        surv &= ~f
+        print(f"  {name:>12}: {f.sum():>3}/{len(recs)} = {f.mean():>5.1%} 淘汰")
+    print(f"  {'三闸同时通过':>12}: {surv.sum()}/{len(recs)} = {surv.mean():.1%}"
+          f"  ← 三个各淘汰约一成的闸叠起来就是这个数")
 
     if report_only:
         print("\n（--report_only：没有落深度缓存，也没有写子集清单。"
