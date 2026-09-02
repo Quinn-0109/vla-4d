@@ -203,7 +203,18 @@ def main(cfg: Config) -> None:
     dev = "cuda"
     unnorm_key = cfg.unnorm_key or f"{cfg.task_suite_name}_no_noops"
     # ⚠️ 先把 checkpoint 路径查清楚再去加载 7B（见 common/runs）。
+    #    **空串要单独拦。** shell 变量没展开时 `--adapter ""` 会落到这里，
+    #    而空串是 falsy —— 于是静默地变成"评测底座模型"，照样跑完 500 局、
+    #    照样给出一个成功率。这类"参数没传到但一切正常"是本项目最常见的错。
+    if cfg.adapter is not None and not str(cfg.adapter).strip():
+        raise SystemExit(
+            "--adapter 是空串。多半是 shell 变量没展开（比如在新的 tmux 里 "
+            "$G0 未定义）。空串会被当成'不加 adapter'，静默评测底座模型 —— "
+            "所以这里硬拦。要评底座请**完全不传** --adapter。")
     adapter = resolve_adapter(cfg.adapter, cfg.run_root) if cfg.adapter else None
+    if adapter is None:
+        print("⚠️ 未指定 adapter，评测的是**未微调的底座模型** —— "
+              "这个数不能与各臂比较。")
 
     processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
     model = AutoModelForVision2Seq.from_pretrained(
