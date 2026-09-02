@@ -22,6 +22,7 @@ G0 仍然用它评；这份只加 K 帧历史窗口 + 接线。**评测协议其
 #    `dataclasses.fields()` 随即抛 "must be called with a dataclass type or instance"。
 #    `finetune_single.py` 的文件头记过这个坑，我写这份时照样踩了 —— 所以再记一次。
 
+import gc
 import json
 import os
 import sys
@@ -88,6 +89,12 @@ class Config:
     eval_batch: int = 8
     # ⚠️ 只在 --eval_batch 1 时可用（B>1 的逐位对拍已知过不了，见下方硬拦与 §8.14）
     verify_batch: int = 0                      # 头 N 步与逐条 predict_action 对拍
+    # ⭐ 只跑 [start_task, end_task) 这一段。评测**逐 task 独立**（每个 task 自己
+    #    的初始状态表、贪心解码、无跨 task 状态），所以分段跑再把成功数相加，
+    #    与一次跑完逐位等价 —— 这是"接着跑"而不是"重跑"的依据。
+    #    ⚠️ 分段的数**必须凑满 10 个 task 才是判据数**；缺 task 的合计不作判定。
+    start_task: int = 0
+    end_task: int = -1                         # -1 = 到最后一个
     seed: int = 7                              # 沿用阶段 0
     local_log_dir: str = "results/logs"
     run_note: str = ""
@@ -290,8 +297,12 @@ def main(cfg: Config) -> None:
 
     print(f"中心裁: {'开' if cfg.center_crop else '**关**'}"
           f"（训练用 image_aug=True，关掉就是训练/评测不一致）")
+    # ⚠️ 分段跑必须落到**不同的**日志文件：log 是 "w" 模式打开的，
+    #    段号不进 run_id 的话，接着跑 task 4-9 会把 task 0-3 的记录直接覆盖掉。
+    _seg = (f"-t{cfg.start_task}_{cfg.end_task}"
+            if (cfg.start_task or cfg.end_task >= 0) else "")
     run_id = (f"EVAL-{cfg.task_suite_name}-{cfg.arm}-K{cfg.K}s{cfg.stride}"
-              f"-seed{cfg.seed}{'' if cfg.center_crop else '-nocrop'}"
+              f"-seed{cfg.seed}{'' if cfg.center_crop else '-nocrop'}{_seg}"
               + (f"--{cfg.run_note}" if cfg.run_note else ""))
     Path(cfg.local_log_dir).mkdir(parents=True, exist_ok=True)
     log = open(os.path.join(cfg.local_log_dir, run_id + ".txt"), "w")
@@ -372,7 +383,11 @@ def main(cfg: Config) -> None:
                                  do_sample=False)
         return unnorm(out[:, -n:])
 
-    for task_id in tqdm.tqdm(range(suite.n_tasks), desc="tasks"):
+    t_end = suite.n_tasks if cfg.end_task < 0 else min(cfg.end_task, suite.n_tasks)
+    if cfg.start_task or t_end != suite.n_tasks:
+        say(f"# ⚠️ 只跑 task [{cfg.start_task}, {t_end})，共 {suite.n_tasks} 个 —— "
+            f"**这不是判据数**，要凑满 10 个 task 才能对判据")
+    for task_id in tqdm.tqdm(range(cfg.start_task, t_end), desc="tasks"):
         task = suite.get_task(task_id)
         inits = suite.get_task_init_states(task_id)
         # ⚠️ B 个 env 并行。它们**逐步同步推进**，所以任一时刻 pad_mask 全批相同；
@@ -500,16 +515,36 @@ def main(cfg: Config) -> None:
             t_ep += b
             total_ep += b
 
+        # ⚠️ 每个 task 新建 B 个 env、结束时 close。但 close 本身会抛 EGL 错
+        #    （见退出时那一串 `Exception ignored in __del__`），**close 抛了就等于
+        #    没释放**，渲染上下文逐 task 累积。所以：逐个 close 且不让异常打断，
+        #    然后丢引用 + gc + empty_cache，把释放做实。
+        #    起因：第一次满量跑到 task 4 时在 KV cache 的 torch.cat 处崩了。
         for e in envs:
-            e.close()
+            try:
+                e.close()
+            except Exception as err:            # noqa: BLE001
+                print(f"  (env.close 抛了，已忽略: {type(err).__name__})")
+        envs = []
+        gc.collect()
+        torch.cuda.empty_cache()
+
         line = (f"task {task_id} {desc[:40]!r}: {t_ok}/{t_ep} = "
                 f"{t_ok / max(t_ep, 1):.3f}   累计 {total_ok}/{total_ep} = "
-                f"{total_ok / max(total_ep, 1):.4f}")
+                f"{total_ok / max(total_ep, 1):.4f}   "
+                f"显存 {torch.cuda.memory_reserved() / 2**30:.1f} GB")
         print(line)
         log.write(line + "\n")
         log.flush()
 
-    final = f"FINAL success_rate={total_ok / max(total_ep, 1):.4f} ({total_ok}/{total_ep})"
+    if cfg.start_task == 0 and t_end == suite.n_tasks:
+        final = f"FINAL success_rate={total_ok / max(total_ep, 1):.4f} ({total_ok}/{total_ep})"
+    else:
+        # ⚠️ **残缺的合计不叫 FINAL。** 判据认的是满 10 task 的数；
+        #    打上 FINAL 就等于给了一个能被当成判据用的数字，而它不是。
+        final = (f"PARTIAL task[{cfg.start_task},{t_end}) "
+                 f"{total_ok}/{total_ep} = {total_ok / max(total_ep, 1):.4f}"
+                 f"   —— 不是判据数；把各段的成功数相加、总局数相加才是")
     print(final)
     log.write(final + "\n")
     log.close()
