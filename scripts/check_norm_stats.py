@@ -37,26 +37,41 @@ os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 KEYS = ("q01", "q99", "mean", "std", "min", "max")
 
 
-def official(repo: str, key: str) -> dict:
+def _pick(ns, want: str, where: str) -> str:
+    """
+    ⚠️ **两边的键名本来就不同**：官方 finetuned checkpoint 存的是 `libero_10`，
+    我们训练时写的是 `libero_10_no_noops`（数据集带 _no_noops 后缀）。
+    `run_libero_eval_traj.py` 里那条回退正是为此。所以两边各自解析，
+    不能拿一个键去查两处 —— 那只会得到"键不存在"，看不见真正要比的东西。
+    """
+    for k in (want, f"{want}_no_noops", want.replace("_no_noops", "")):
+        if k in ns:
+            return k
+    raise SystemExit(f"{where} 里找不到 `{want}`（也试过加/去 _no_noops）；"
+                     f"有的是：{list(ns)}")
+
+
+def official(repo: str, key: str) -> tuple:
     """从 config 里取 norm_stats —— 不下载权重。"""
     from transformers import AutoConfig
     cfg = AutoConfig.from_pretrained(repo, trust_remote_code=True)
     ns = getattr(cfg, "norm_stats", None)
     if ns is None:
         raise SystemExit(f"{repo} 的 config 里没有 norm_stats")
-    if key not in ns:
-        raise SystemExit(f"{repo} 的 norm_stats 里没有 `{key}`；有的是：{list(ns)}")
-    return ns[key]["action"]
+    k = _pick(ns, key, repo)
+    return ns[k]["action"], k
 
 
-def ours(path: Path, key: str) -> dict:
+def ours(path: Path, key: str) -> tuple:
     d = json.loads(path.read_text())
     # 训练脚本写的是 {key: {"action": {...}, "proprio": {...}}}；
     # 也见过直接就是 {"action": {...}} 的，两种都收
-    d = d.get(key, d)
-    if "action" not in d:
-        raise SystemExit(f"{path} 里找不到 action 统计量；顶层键：{list(d)}")
-    return d["action"]
+    if "action" in d:
+        return d["action"], "(顶层)"
+    k = _pick(d, key, str(path))
+    if "action" not in d[k]:
+        raise SystemExit(f"{path} 的 `{k}` 下找不到 action；有的是：{list(d[k])}")
+    return d[k]["action"], k
 
 
 def main() -> None:
@@ -66,11 +81,14 @@ def main() -> None:
     ap.add_argument("--key", default="libero_10_no_noops")
     args = ap.parse_args()
 
-    o = official(args.repo, args.key)
-    m = ours(Path(args.ours).expanduser(), args.key)
+    o, ko = official(args.repo, args.key)
+    m, km = ours(Path(args.ours).expanduser(), args.key)
 
-    print(f"官方: {args.repo}  键 `{args.key}`")
-    print(f"我们: {args.ours}\n")
+    print(f"官方: {args.repo}  键 `{ko}`")
+    print(f"我们: {args.ours}  键 `{km}`\n")
+    if ko != km:
+        print(f"  ℹ️ 两边键名不同（`{ko}` vs `{km}`）—— 这本身正常，"
+              f"数据集带 _no_noops 后缀而官方 checkpoint 不带。要比的是**值**。\n")
 
     worst = 0.0
     for k in KEYS:
