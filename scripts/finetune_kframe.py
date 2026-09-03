@@ -351,9 +351,21 @@ def main(cfg: Config) -> None:
               f"frame_pad_mask {tuple(fm.shape)}  → K={pv.shape[1] // 6}")
 
     if cfg.eval_only:
+        # ⚠️ 不传 adapter 有两种情形，别混为一谈（与 run_eval_kframe.py 同一条规矩）：
+        #   ① --vla_path 还是底座 openvla-7b → 复核的是没微调过的模型，没有意义
+        #   ② --vla_path 指向官方已微调 checkpoint → 这是**对照**：官方权重走
+        #      我们这条训练侧路径，量它的动作 token 准确率，好与各臂的数直接比。
+        #      peft 的 LoRA 初始化 B=0，套上去的模型与加载进来的权重数值上等同，
+        #      所以这样量到的就是该 checkpoint 本身。
         if not cfg.resume_from:
-            raise SystemExit("--eval_only 要配 --resume_from <adapter 目录>，"
-                             "否则复核的是没微调过的底座")
+            if "finetuned" in str(cfg.vla_path):
+                print(f"ℹ️ 无 --resume_from，直接复核 {cfg.vla_path}（官方已微调权重，"
+                      "作为各臂的对照锚点）。LoRA 初始 B=0，不改变数值。")
+            else:
+                raise SystemExit("--eval_only 要配 --resume_from <adapter 目录>，"
+                                 "否则复核的是没微调过的底座。"
+                                 "（要拿官方已微调 checkpoint 做对照，"
+                                 "请用 --vla_path openvla/openvla-7b-finetuned-libero-10）")
         vla.eval()
         hit = tot = 0
         loss_sum = 0.0
