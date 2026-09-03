@@ -18,7 +18,7 @@
 
     ① 初始帧误差 ≤ 5.0（平均绝对像素差 0–255）—— 找对了 demo 没有
     ② 匹配下标单调性 ≥ 95%              —— 对齐正确必然接近 100%，噪声不会
-    ③ **深度不确定度 p95 < 5 cm**       —— G4 真正消费的量，尺度取自 §8.6
+    ③ **深度不确定度 p95 < 5 cm**       —— G4 真正消费的量，尺度取自 §9.2
 
 ⚠️ **③ 是第二版，第一版用 RGB 逐帧误差当闸，错了。** 首次冒烟 0/3 全栽在
    「≤5.0 的帧占 ≥90%」上（实测 87% 与 64%），而 d0 是 2.1–2.7、单调性 98–99% ——
@@ -27,7 +27,7 @@
    才是该问的。我却把已知是代理的量拿来当硬闸。
 
    改判据是在看到它失败之后做的，这本身就危险。所以：换的是**代理量 → 目标量**，
-   而目标量的尺度（跳变阈值 5 cm、体素箱宽 ~30 cm）在 §8.6 就定死了、不是现在
+   而目标量的尺度（跳变阈值 5 cm、体素箱宽 ~30 cm）在 §9.2 就定死了、不是现在
    挑的；且 `--report_only`（缺省）先只报分布不落子集，看过分布再解开。
    RGB 那两个数照样报，只是不再当闸。
 
@@ -64,7 +64,7 @@ from data.depth_cache import hash_bytes  # noqa: E402
 
 TOL = 5.0            # 平均绝对像素差：只用来判"找对 demo 没有"
 MIN_MONO = 0.95      # 匹配下标单调性
-MAX_DEPTH_P95 = 5.0  # cm。深度不确定度，尺度取自 docs/05 §8.6（箱宽 ~30 cm）
+MAX_DEPTH_P95 = 5.0  # cm。深度不确定度，尺度取自 docs/05 §9.2（箱宽 ~30 cm）
 
 
 def episode_stream(data_root: str, name: str):
@@ -168,18 +168,18 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=0, help="只处理前 N 条（冒烟用）")
     ap.add_argument("--align_stride", type=int, default=1,
                     help="逐帧对齐的渲染步长。**1 是定稿值**：2 时深度不确定度"
-                         "dp95 中位 8.1 cm 过不了闸，1 时 3.9 cm（docs/05 §8.12）")
+                         "dp95 中位 8.1 cm 过不了闸，1 时 3.9 cm（docs/05 §12.1）")
     ap.add_argument("--n_init_try", type=int, default=50)
     ap.add_argument("--stage1_frames", default="0,20,40,60",
                     help="选 demo 时在每条 demo 的哪几个帧号上比对。只比第 0 帧时，"
                          "no_noops 削掉长开头的 episode 会选错 demo —— 全量实测 90 条"
-                         "栽在初始帧上，d0 中位 10.9 而次好只差 0.2（docs/05 §8.16）")
+                         "栽在初始帧上，d0 中位 10.9 而次好只差 0.2（docs/05 §12.2）")
     ap.add_argument("--demo_frames", type=int, default=80,
                     help="在选中的那条 demo 里往后扫多少帧找偏移（no_noops 用）")
     ap.add_argument("--redo_failed", action="store_true",
                     help="只重跑之前失败的 episode（改了 --demo_frames 之类时用）")
     ap.add_argument("--only_task", type=int, default=-1,
-                    help="只处理这一个 task。失败是按 task 聚集的（交叉表见 §8.19），"
+                    help="只处理这一个 task。失败是按 task 聚集的（交叉表见 §12.3），"
                          "针对某个 task 调搜索参数时，不必把别的 task 的失败项"
                          "一起重渲染。⚠️ 它**只缩小重跑范围，不碰任何判据**")
     ap.add_argument("--report_only", action="store_true", default=True,

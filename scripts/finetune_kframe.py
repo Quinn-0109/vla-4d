@@ -8,12 +8,12 @@ K 帧微调 —— 六组对照共用这一个脚本，差别只在 `--arm`。
 这一份加了 K 帧数据流、坐标池化与 4D RoPE。两者的 LoRA 配置、优化器、
 断点续训、checkpoint 分步保存**完全一致**——不一致就没法比。
 
-**有效批固定为 16**（`docs/06` §4.3）。微批按显存实测取：
+**有效批固定为 16**（`docs/06` §4.4）。微批按显存实测取：
 K=1 用 16×1，K=8 各臂用 2×8。微批不同、有效批相同，数值上等价；
 **但有效批一旦跟着显存漂移，G0 vs G1 的比较就作废了。**
 
 ⚠️ **G4 / M2 现在还跑不了**：它们要按 (task, episode, timestep) 取训练集的
-patch 级深度，而那份缓存的前提是"回放能复现 RLDS 的画面"（`docs/06` §4.3
+patch 级深度，而那份缓存的前提是"回放能复现 RLDS 的画面"（`docs/06` §4.4
 的回放保真度验证）还没做。脚本会直接拒绝，不会拿假深度凑合。
 G2 / G3 不需要深度，现在就能跑，而 **G2 vs G0 正是前提检验**，本来就排在最前。
 """
@@ -56,9 +56,9 @@ from data.kframe import (KFrameBatchTransform, PaddedCollatorKFrame,  # noqa: E4
 from pooling.wire import (WireConfig, assert_arm_wiring, set_batch,  # noqa: E402
                           wire)
 
-# 微批 × 累积，有效批恒为 16（docs/06 §4.3 的显存实测）
+# 微批 × 累积，有效批恒为 16（docs/06 §4.4 的显存实测）
 #
-# ⚠️⚠️ **K=8 的微批表已作废，下面这组数实测于 K=1**（docs/05 §8.10）：
+# ⚠️⚠️ **K=8 的微批表已作废，下面这组数实测于 K=1**（docs/05 §10.1）：
 #
 #     micro=2  2.7 s/步  16.3 GB      ← 这三行是数据侧 K 退化成 1 时测的，
 #     micro=4  2.4 s/步  16.9 GB      ← 当时的结论"4×4 最优""30k 步 19.7 h"
@@ -109,7 +109,7 @@ class Config:
     # fmt: off
     arm: str = "G2"
     K: int = 8
-    stride: int = 16                           # docs/05 §8.7 定稿
+    stride: int = 16                           # docs/05 §9.3 定稿
     budget: int = 256                          # docs/06 §3.0：N=256，所有组同预算
     n_t: int = 2
 
@@ -189,7 +189,7 @@ def main(cfg: Config) -> None:
 
     micro, accum = MICRO_ARM.get(cfg.arm, MICRO[cfg.K])
     if cfg.micro:
-        # ⚠️ **有效批必须恒为 16**（docs/06 §4.3）。只让改微批，累积自动配平；
+        # ⚠️ **有效批必须恒为 16**（docs/06 §4.4）。只让改微批，累积自动配平；
         #    除不尽就直接拒绝 —— 有效批一旦跟着显存漂移，跨臂比较就作废了，
         #    而那种漂移不会有任何提示。
         if EFF_BATCH % cfg.micro:

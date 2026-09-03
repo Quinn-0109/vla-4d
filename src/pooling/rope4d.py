@@ -300,7 +300,7 @@ if __name__ == "__main__":
            torch.allclose(sin[:, tx][..., d4all], torch.zeros(1))
     print("    ✓ cos=1, sin=0")
 
-    print("\n[3] ⭐ q·k 只依赖坐标之差 —— §1.2② 全部压在这条上")
+    print("\n[3] ⭐ q·k 只依赖坐标之差 —— §1.3② 全部压在这条上")
     q, kk = torch.randn(1, 1, HEAD_DIM), torch.randn(1, 1, HEAD_DIM)
     p1 = torch.tensor([[[2.0, 3.0, 4.0, 5.0]]])
     p2 = torch.tensor([[[6.0, 1.0, 9.0, 2.0]]])
@@ -342,7 +342,7 @@ if __name__ == "__main__":
     print("\n[6] M2 错配臂：池化侧与 G4 相同，PE 侧改吃 (t,h,w) 质心")
     m2 = coord_bin_pool(feat, mc, N, mlo, mhi, n_t=N_T_DEFAULT)
     assert torch.equal(m2.feat, g4.feat), "M2 的池化侧必须与 G4 逐位相同"
-    # PE 侧：用同一批箱，但坐标取 (t,h,w) 的箱内均值 —— 同一套平均逻辑（§3.0.5 ①）
+    # PE 侧：用同一批箱，但坐标取 (t,h,w) 的箱内均值 —— 同一套平均逻辑（§3.0.4 ①）
     m2_grid = coord_bin_pool(gc, mc, N, mlo, mhi, n_t=N_T_DEFAULT).feat[..., :3]
     pm, cm, im = assemble(normalize(m2_grid, glo, ghi, K),
                           seq_centroid(m2.assign, N), m2.mask, NTXT, K)

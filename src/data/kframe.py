@@ -165,7 +165,7 @@ class KFrameBatchTransform:
     image_transform: Any
     prompt_builder_fn: Type
     predict_stop_token: bool = True
-    # G4/M2 用：语言指令 → task_id。相机是**按 task 存的**（docs/05 §8.8：
+    # G4/M2 用：语言指令 → task_id。相机是**按 task 存的**（docs/05 §9.4：
     # 不同 task 的 agentview 位姿确实不同），反投影时必须取对那一台。
     lang_to_task: Any = None
 
@@ -222,7 +222,7 @@ class PaddedCollatorKFrame:
     ⚠️ **`frame_pad_mask` 必须一路传到池化算子**。episode 开头的窗口会把第 0 帧
     重复若干次（官方 clamp 行为），不屏蔽的话：K 份完全相同的内容落在 K 个不同的
     t 箱里，白占 token 预算，而"跨帧合并率"这个断言反而被这些假跨帧撑高——
-    §3.0.5 ③ 那道闸门会失效。
+    §3.0.4 ③ 那道闸门会失效。
     """
     model_max_length: int
     pad_token_id: int

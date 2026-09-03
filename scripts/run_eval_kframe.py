@@ -81,13 +81,13 @@ class Config:
     run_root: str = "runs"                     # --adapter 找不到时列清单用
     center_crop: bool = True                   # ⚠️ 训练开了 image_aug 就必须开，见下
     # ⭐ 每帧的视觉特征只算一次、跨窗口复用（视觉主干冻结，同一帧特征逐位相同）。
-    #    实测每步 8 次主干前向是评测的成本大头（144 s/局，docs/05 §8.13）。
+    #    实测每步 8 次主干前向是评测的成本大头（144 s/局，docs/05 §11.1）。
     vision_cache: bool = True
     verify_vision_cache: int = 0               # 头 N 步同时算两条路，torch.equal 对拍
-    # ⭐ 并行跑几局。成本大头是 LLM 的自回归解码（视觉只占约 1/4，见 docs/05 §8.13），
+    # ⭐ 并行跑几局。成本大头是 LLM 的自回归解码（视觉只占约 1/4，见 docs/05 §11.1），
     #    batch=1 时 LLM 完全没吃满。同一 task 的 prompt 相同，批起来无需 padding。
     eval_batch: int = 8
-    # ⚠️ 只在 --eval_batch 1 时可用（B>1 的逐位对拍已知过不了，见下方硬拦与 §8.14）
+    # ⚠️ 只在 --eval_batch 1 时可用（B>1 的逐位对拍已知过不了，见下方硬拦与 §11.2）
     verify_batch: int = 0                      # 头 N 步与逐条 predict_action 对拍
     # ⭐ 只跑 [start_task, end_task) 这一段。评测**逐 task 独立**（每个 task 自己
     #    的初始状态表、贪心解码、无跨 task 状态），所以分段跑再把成功数相加，
@@ -274,7 +274,7 @@ def main(cfg: Config) -> None:
         print(f"已注入动作统计量: {sj}")
 
     # ⚠️ `--verify_batch` 配 `--eval_batch > 1` 是一道**已知过不了**的闸，硬拦。
-    #    docs/05 §8.14：与官方逐条 predict_action 240 次比较差 9 次（3.75%），
+    #    docs/05 §11.2：与官方逐条 predict_action 240 次比较差 9 次（3.75%），
     #    成因已定位为**批量 matmul 的归约顺序**（分箱分辨率、我重写的
     #    gen_actions/unnorm 都已逐一排除）。动作分布双峰，logits 末位一点差
     #    就跳模式，所以幅度不是相邻一格。当时的处置是**弃用逐位对拍**、
@@ -283,7 +283,7 @@ def main(cfg: Config) -> None:
     if cfg.verify_batch and cfg.eval_batch > 1:
         raise SystemExit(
             "--verify_batch 不能与 --eval_batch > 1 同用：这道逐位对拍**已知过不了**，"
-            "成因是批量 matmul 的归约顺序（docs/05 §8.14 已定位并弃用该判据）。\n"
+            "成因是批量 matmul 的归约顺序（docs/05 §11.2 已定位并弃用该判据）。\n"
             "  · 要判批量能否用 → 同一 checkpoint 各跑一次满量 b1 与 b8，比成功率\n"
             "  · 要查 gen_actions/unnorm 有没有写错 → "
             "`--eval_batch 1 --verify_batch N`（B=1 时两条路除了我的代码没有区别）")

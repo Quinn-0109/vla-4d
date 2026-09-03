@@ -186,7 +186,7 @@ def _pool_and_coords(emb: torch.Tensor, cfg: WireConfig, bt: _Batch):
                          enforce_n=cfg.enforce_n, valid=valid, **kw)
 
     # PE 侧坐标：G3/G4 就用池化出来的质心；**M2 的错配在这里** ——
-    # 池化侧是度量质心，PE 侧另取箱内 patch 的 (t,h,w) 算术均值（docs/06 §3.0.5 ①）
+    # 池化侧是度量质心，PE 侧另取箱内 patch 的 (t,h,w) 算术均值（docs/06 §3.0.4 ①）
     if cfg.arm == "M2":
         coord_pe = _grid_centroid(out.assign, gc, cfg.enforce_n or cfg.budget)
     elif cfg.metric:
