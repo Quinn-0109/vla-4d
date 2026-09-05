@@ -1,7 +1,7 @@
 """
 模型侧接线 —— 把 K 帧输入、坐标池化、4D RoPE 挂进 OpenVLA。
 
-**六组对照全部由这一份代码产生**，差别只在 `WireConfig.arm`：
+**七组对照全部由这一份代码产生**，差别只在 `WireConfig.arm`：
 
     G0  K=1，不池化，1D RoPE                        （单帧基线，等于原模型）
     G1  K=8，不池化（2048 token），1D RoPE          （上限参考）
@@ -9,6 +9,7 @@
     G3  K=8，跨帧池化，池化坐标 (t,h,w)，PE 也是 (t,h,w)      ← 一致
     G4  K=8，跨帧池化，池化坐标 (t,x,y,z)，PE 也是 (t,x,y,z)  ← 一致，本方案
     M2  K=8，跨帧池化，池化坐标 (t,x,y,z)，PE 却用 (t,h,w)    ← 错配臂
+    M3  K=8，跨帧池化，池化坐标 (t,h,w)，PE 却用 (t,x,y,z)    ← 错配臂（M2 的镜像）
 
 四个挂载点（transformers 4.40.1，见 `_patch_rope` 的版本约定）：
 
@@ -99,6 +100,26 @@ class WireConfig:
     def pe_axes(self) -> int:
         """PE 侧坐标的轴数。错配就体现在这里：M2 池化 4 轴 / PE 3 轴，M3 反过来。"""
         return 4 if self.pe_metric else 3
+
+    def pool_extent(self, device=None):
+        """**池化侧**的量程，跟着 `metric` 走。"""
+        if self.metric:
+            return metric_extent(self.K, self.bbox.to(device), device=device)
+        return grid_extent(self.K, device=device)
+
+    def pe_extent(self, device=None):
+        """
+        **PE 侧**的量程，跟着 `pe_metric` 走 —— 与 `pool_extent` 是两个东西。
+
+        ⚠️ 这里曾经写成「`arm == "G4"` 才用度量量程」，于是 M3（网格池化 +
+        度量 PE）拿 3 轴的网格量程去归一化 4 轴的度量质心。**幸好它当场报维度
+        不匹配**：这是本轮少见的不静默的错，冒烟测试五分钟就抓到了。真正危险的
+        是它的镜像——M2 若拿度量量程去归一化 3 轴网格质心，广播恰好合法，
+        坐标会被静静地压扁。所以量程只准从这两个函数取，别在调用点各判一次。
+        """
+        if self.pe_metric:
+            return metric_extent(self.K, self.bbox.to(device), device=device)
+        return grid_extent(self.K, device=device)
 
 
 @dataclass
@@ -199,11 +220,8 @@ def _pool_and_coords(emb: torch.Tensor, cfg: WireConfig, bt: _Batch):
             [metric_coords(bt.depth[i:i + 1].to(dev), k, bt.cameras[i])
              for i in range(b)], dim=0).float()
 
-    if cfg.metric:
-        pc = pc_metric
-        lo, hi = metric_extent(k, cfg.bbox.to(dev), device=dev)
-    else:
-        pc, (lo, hi) = gc, grid_extent(k, device=dev)
+    pc = pc_metric if cfg.metric else gc
+    lo, hi = cfg.pool_extent(dev)
 
     kw = dict(group_axes=(0,), n_group=(k,)) if cfg.arm == "G2" else dict(n_t=cfg.n_t)
     out = coord_bin_pool(emb, pc, cfg.budget, lo, hi,
@@ -251,9 +269,11 @@ def _patch_projector(model, cfg: WireConfig, state: _State) -> None:
         #    `n_text=0`，于是 cos 只有 1+2048 长而 q 是 1+2048+19，
         #    直接在 apply_rotary_pos_emb 里维度对不上。**幸好它会报错** ——
         #    这是本轮少见的一个不静默的错。
-        lo, hi = (metric_extent(cfg.K, cfg.bbox.to(emb.device), device=emb.device)
-                  if cfg.arm == "G4"
-                  else grid_extent(cfg.K, device=emb.device))
+        lo, hi = cfg.pe_extent(emb.device)         # ⚠️ PE 侧量程，不是池化侧
+        if coord_pe.shape[-1] != lo.numel():
+            raise RuntimeError(
+                f"{cfg.arm}：PE 坐标 {coord_pe.shape[-1]} 轴，量程 {lo.numel()} 轴。"
+                "两者必须同时由 pe_metric 决定。")
         state.rope = (normalize(coord_pe.float(), lo, hi, cfg.K), pos1d)
         return emb
 
@@ -490,6 +510,25 @@ def _selftest() -> None:
     print("✅ 3c/9 M3 与 G3 的池化输出逐位相同（只有 PE 侧不同）")
     print("      → 两个错配臂走同一份 _grid_centroid（它对任意坐标张量通用），"
           "实现彼此镜像，\n         不存在\"哪一臂被特殊照顾\"")
+
+    # ---- 缺的正是这条不变量：PE 坐标的轴数必须与 PE 量程的轴数一致 ----
+    #      M3 曾经拿池化侧（3 轴网格）的量程去归一化 4 轴度量质心，当场维度不匹配；
+    #      它的镜像（M2 拿 4 轴量程压 3 轴坐标）却会广播成功、静静地算错。
+    #      所以这里逐臂对拍，并且**真的调一次 normalize**，不只比形状。
+    for arm in ("G0", "G1", "G2", "G3", "G4", "M2", "M3"):
+        kk = 1 if arm == "G0" else K
+        _probe = WireConfig(arm=arm, K=kk, bbox=bbox)
+        cfg_a = WireConfig(arm=arm, K=kk,
+                           bbox=bbox if _probe.needs_depth else None)
+        bt_a = _Batch(depth=depth[:, :kk], frame_pad_mask=None, cameras=[cam] * B)
+        _, _, c_a, _ = _pool_and_coords(emb[:, :kk * N_PATCH], cfg_a, bt_a)
+        lo_a, hi_a = cfg_a.pe_extent(c_a.device)
+        assert c_a.shape[-1] == lo_a.numel() == cfg_a.pe_axes, (
+            arm, c_a.shape, lo_a.numel(), cfg_a.pe_axes)
+        q = normalize(c_a.float(), lo_a, hi_a, cfg_a.K)
+        assert q.shape == c_a.shape and torch.isfinite(q).all(), arm
+    print("✅ 3d/9 七臂逐一对拍：PE 坐标轴数 == pe_extent 轴数 == pe_axes，"
+          "且 normalize 真跑得通")
 
     pad = torch.ones(B, K, dtype=torch.bool)
     pad[:, :3] = False                       # 前 3 帧是补帧
