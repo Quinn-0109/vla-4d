@@ -320,11 +320,21 @@ def main() -> None:
             rec.update(good=good, mono=mono, dp50=dp50, dp95=dp95, dnz=dnz,
                        ok=ok, why=why, demo=key, stride=args.align_stride,
                        demo_frames=args.demo_frames)
-            if ok and not args.report_only:
-                # 对齐后每个 RLDS 帧的 patch 级深度 (T,16,16)，按帧指纹存。
-                # float16 足够：分辨率 ~1 mm，而体素箱宽约 30 cm、跳变阈值 5 cm。
-                np.savez(out / "depth" / f"ep{i:04d}.npz",
-                         hash=ep["hash"], depth=dep[mj].astype(np.float16))
+            # ⭐ **深度一律落盘，不管 report_only、也不管这条过没过闸。**
+            #    它是**中间缓存**，不是产物；产物（subset.json / depth_cache.npz /
+            #    bbox.json）仍然只在 --commit 时写。
+            #
+            #    原先写成 `ok and not report_only`，后果是：--report_only 是缺省值，
+            #    于是流程跑了三轮、深度一次都没存；等到加 --commit 时 379 条全在
+            #    done 里被跳过，**产出为空**，而且直到最后一步才发现。
+            #    深度是 align_by_state 那一趟顺带算出来的，**不存纯属浪费**。
+            #
+            #    代价极小：250 帧 × 16×16 × fp16 = 128 KB/条，379 条约 **48 MB**。
+            #    换来的是：换判据重跑时**不必重新渲染**（那是 8–9 小时）。
+            #    没过闸的也存，正是为了"判据变了还能重算"——这个流程已经换过
+            #    一次判据（§12.1 RGB 代理 → 深度不确定度）。
+            np.savez(out / "depth" / f"ep{i:04d}.npz",
+                     hash=ep["hash"], depth=dep[mj].astype(np.float16))
             _append(log, rec)
             print(f"  [{i:>4}] task {tid}  d0={m['best']:.2f}  RGB≤{TOL:g} {good:.0%}  "
                   f"单调 {mono:.0%}  深度 p95={dp95:.1f} cm（{dnz:.0%} 的 patch 在动）"
@@ -463,7 +473,16 @@ def summarize(log: Path, out: Path, report_only: bool = True) -> None:
         return
 
     # 合并成一张表，训练侧只读这一个文件（DepthCache.load）
-    parts = sorted((out / "depth").glob("ep*.npz"))
+    # ⚠️ **只合并过闸的那些。** depth/ 下现在存着全部 episode 的中间缓存
+    #    （包括没过闸的，为的是换判据时不用重渲染），而 depth_cache.npz 是
+    #    **产物**，必须与 subset.json 的清单严格一致 —— 混进没过闸的帧，
+    #    G4 就会在不该有深度的样本上拿到深度，而这不会报错。
+    ok_eps = {r["ep"] for r in recs if r.get("ok")}
+    parts = [f for f in sorted((out / "depth").glob("ep*.npz"))
+             if int(f.stem[2:]) in ok_eps]
+    n_skip = len(list((out / "depth").glob("ep*.npz"))) - len(parts)
+    if n_skip:
+        print(f"  （depth/ 下有 {n_skip} 条未过闸的中间缓存，不并入产物）")
     if parts:
         hs, ds_ = [], []
         for f in parts:
