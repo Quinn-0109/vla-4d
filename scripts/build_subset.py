@@ -189,6 +189,12 @@ def main() -> None:
                     help="在选中的那条 demo 里往后扫多少帧找偏移（no_noops 用）")
     ap.add_argument("--redo_failed", action="store_true",
                     help="只重跑之前失败的 episode（改了 --demo_frames 之类时用）")
+    ap.add_argument("--depth_only", action="store_true",
+                    help="⭐ 只给**已判定通过**的 episode 补落深度缓存，跳过选 demo 与"
+                         "偏移搜索（那 560 次候选渲染的答案已经记在 episodes.jsonl 的 "
+                         "demo/frame_off 里，不必重做）。用于 --report_only 跑完之后"
+                         "才想起要落盘的情形 —— 逐帧对齐的约 250 次渲染躲不掉，"
+                         "深度就是从那一趟出来的。已有 depth/epNNNN.npz 的会跳过，可续跑。")
     ap.add_argument("--only_task", type=int, default=-1,
                     help="只处理这一个 task。失败是按 task 聚集的（交叉表见 §12.3），"
                          "针对某个 task 调搜索参数时，不必把别的 task 的失败项"
@@ -231,7 +237,16 @@ def main() -> None:
     bmark = benchmark.get_benchmark_dict()[args.suite]()
     env, env_tid, cand_cache = None, None, {}
     try:
-        want_i = (lambda i: i not in done) if done else None
+        if args.depth_only:
+            # 只补已通过、且深度还没落盘的那些
+            need = {r["ep"] for r in recs0 if r.get("ok")
+                    and not (out / "depth" / f"ep{r['ep']:04d}.npz").exists()}
+            demo_of = {r["ep"]: r.get("demo") for r in recs0 if r.get("ok")}
+            print(f"补深度缓存：{len(need)} 条待落盘"
+                  f"（已通过 {sum(1 for r in recs0 if r.get('ok'))} 条）")
+            want_i = lambda i: i in need
+        else:
+            want_i = (lambda i: i not in done) if done else None
         want_l = (None if args.only_task < 0
                   else (lambda lg: find_task(bmark, lg) == args.only_task))
         for i, ep in episode_stream(args.data_root, name, want_i, want_l):
@@ -259,6 +274,23 @@ def main() -> None:
                 # ⚠️ 换 task 必须换缓存：候选画面是按 task 的，串了不会报错，
                 #    只会拿另一个 task 的画面去匹配。
                 cand_cache = {}
+
+            if args.depth_only:
+                # ⭐ 跳过选 demo 与偏移搜索：答案已在日志里。**不重判**，
+                #    只把深度补落盘 —— 重判会用当前参数重算，与清单不一致。
+                key = demo_of.get(i)
+                st_all = (demo_all_states(bmark.get_task(tid), key)
+                          if key else None)
+                if st_all is None:
+                    print(f"  [{i:>4}] ⚠️ 取不到 demo {key!r} 的全帧状态，跳过")
+                    continue
+                _, mj, _, dep = align_by_state(env, st_all, ep["images"],
+                                               True, args.align_stride)
+                np.savez(out / "depth" / f"ep{i:04d}.npz",
+                         hash=ep["hash"], depth=dep[mj].astype(np.float16))
+                print(f"  [{i:>4}] task {tid}  深度已落盘 "
+                      f"({len(ep['hash'])} 帧, demo={key})")
+                continue
 
             m = match_init(env, bmark, tid, ep["images"][0], args.n_init_try,
                            args.demo_frames,
@@ -301,7 +333,7 @@ def main() -> None:
         if env is not None:
             env.close()
 
-    summarize(log, out, args.report_only)
+    summarize(log, out, args.report_only and not args.depth_only)
 
 
 def write_bbox(recs, out: Path, parts, cam_json="results/tables/camera_libero.json"):
