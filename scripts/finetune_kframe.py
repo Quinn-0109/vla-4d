@@ -444,8 +444,9 @@ def main(cfg: Config) -> None:
                               labels=batch["labels"], use_cache=False)
                 if not checked:
                     assert_arm_wiring(state, cfg.arm)
-                    print(f"  ✓ 接线正常（arm={cfg.arm}，rotary_emb {state.rope_calls} 次）"
-                          f"  序列长 {out.logits.shape[1]}")
+                    print(f"  ✓ 接线正常（arm={cfg.arm}，rotary_emb {state.rope_calls} 次，"
+                          f"PE {state.pe_axes_seen} 轴）  序列长 {out.logits.shape[1]}"
+                          f"（= 1+{n_vis}+文本，**随批抖动，不是判据**）")
                     checked = True
                 preds = out.logits[:, n_vis:-1].argmax(dim=2)
                 gt = batch["labels"][:, 1:].to(preds.device)
@@ -484,8 +485,9 @@ def main(cfg: Config) -> None:
 
             if not checked_rope:
                 assert_arm_wiring(state, cfg.arm)   # 挂点错了不会崩，只会全程用 1D RoPE
-                print(f"  ✓ 接线正常（arm={cfg.arm}，rotary_emb {state.rope_calls} 次）"
-                      f"  序列长 {out.logits.shape[1]}")
+                print(f"  ✓ 接线正常（arm={cfg.arm}，rotary_emb {state.rope_calls} 次，"
+                      f"PE {state.pe_axes_seen} 轴）  序列长 {out.logits.shape[1]}"
+                      f"（= 1+{n_vis}+文本，**随批抖动，不是判据**）")
                 checked_rope = True
 
             preds = out.logits[:, n_vis:-1].argmax(dim=2)

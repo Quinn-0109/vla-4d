@@ -144,6 +144,8 @@ class _State:
         self.vision_feats = None        # 评测用的预算特征，见 set_vision_feats
         self.rope: Optional[tuple] = None
         self.rope_calls: int = 0        # 我们的 rotary_emb 被真正调用了几次
+        self.cfg = None                 # wire() 时存下，assert_arm_wiring 要按臂判
+        self.pe_axes_seen: int = 0      # 上一次 forward 里 PE 坐标真的是几轴
         self.orig: dict = {}            # 原始实现，unwire 时还回去
         # 32 层用的是同一条序列，cos/sin 只算一次（build_rope 不便宜）
         self.rope_cache = None
@@ -274,6 +276,7 @@ def _patch_projector(model, cfg: WireConfig, state: _State) -> None:
             raise RuntimeError(
                 f"{cfg.arm}：PE 坐标 {coord_pe.shape[-1]} 轴，量程 {lo.numel()} 轴。"
                 "两者必须同时由 pe_metric 决定。")
+        state.pe_axes_seen = int(coord_pe.shape[-1])
         state.rope = (normalize(coord_pe.float(), lo, hi, cfg.K), pos1d)
         return emb
 
@@ -349,6 +352,7 @@ def _patch_rope(model, cfg: WireConfig, state: _State) -> None:
 def wire(model, cfg: WireConfig) -> _State:
     """挂上四个点，返回 state。训练循环每步调 `set_batch(state, ...)`。"""
     state = _State()
+    state.cfg = cfg
     state.orig = {
         "vision": model.vision_backbone.forward,
         "projector": model.projector.forward,
@@ -407,6 +411,13 @@ def assert_arm_wiring(state: _State, arm: str) -> None:
 
     两个方向都要查：G0 若被挂上了 4D RoPE，它就不再是"等于原模型"的基线，
     而那同样不会报错。
+
+    ⚠️ **PE 轴数也在这里查。** 错配臂与它的同池化伙伴（M3↔G3、M2↔G4）在日志里
+    长得一模一样：token 数一样、rope_calls 一样、序列长一样（序列长 = 1+N+文本，
+    只随批里的语言指令抖动，**与臂无关** —— 别拿它当判据，我拿它当过一次）。
+    真正的区别只有 PE 坐标是 3 轴还是 4 轴，而 `pe_metric` 若判错，
+    M3 会安静地退化成 G3：loss 正常、acc 正常、跑满 30k 步，然后 2×2 里
+    有一格是假的。所以这条要在第一次 forward 之后当场对拍。
     """
     if arm == "G0":
         if state.rope_calls:
@@ -415,6 +426,12 @@ def assert_arm_wiring(state: _State, arm: str) -> None:
                 "它已经不是'等于原模型'的对照了。查 wire() 里的分支。")
         return
     assert_rope_active(state)
+    cfg = state.cfg
+    if cfg is not None and cfg.pools:
+        if state.pe_axes_seen != cfg.pe_axes:
+            raise RuntimeError(
+                f"{arm} 的 PE 坐标实际是 {state.pe_axes_seen} 轴，应为 {cfg.pe_axes} 轴。"
+                f"{arm} 已经退化成它的同池化伙伴，而这不会有任何别的症状。")
 
 
 def set_vision_feats(state: _State, feats) -> None:
@@ -599,6 +616,25 @@ def _selftest() -> None:
     except RuntimeError:
         pass
     print("   ✅ 7b/9 按臂分派：G0 要求 rope_calls==0，挂上了反而拦下")
+
+    # 错配臂在日志里与它的同池化伙伴长得完全一样（token 数、rope_calls、
+    # 序列长都相同 —— 序列长只随语言指令抖动，**与臂无关**）。唯一的区别是
+    # PE 轴数，所以判据只能是它。这条要能拦下"M3 安静地退化成 G3"。
+    for arm, wrong in (("M3", 3), ("G4", 3), ("M2", 4), ("G3", 4)):
+        st4 = _State()
+        st4.cfg = WireConfig(arm=arm, K=K,
+                             bbox=bbox if arm in ("G4", "M2", "M3") else None)
+        st4.rope_calls = st4.n_layers = 32
+        st4.pe_axes_seen = st4.cfg.pe_axes
+        assert_arm_wiring(st4, arm)          # 正确轴数，放行
+        st4.pe_axes_seen = wrong
+        try:
+            assert_arm_wiring(st4, arm)
+            raise SystemExit(f"    ✗ {arm} 的 PE 退化成 {wrong} 轴竟然过了")
+        except RuntimeError:
+            pass
+    print("   ✅ 7c/9 PE 轴数按臂对拍：M3/G4 必须 4 轴、G3/M2 必须 3 轴，"
+          "退化成同池化伙伴当场拦下")
 
     # 回归：cos/sin 的长度必须跟着**真实序列长**走，不能在投影器里写死。
     # 初版把 n_text 写死成 0，真模型上 q 是 2068 而 cos 是 2049，
