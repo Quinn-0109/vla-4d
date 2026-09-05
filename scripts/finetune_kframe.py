@@ -141,7 +141,10 @@ class Config:
     keep_last: int = 2
     keep_every: int = 10_000
     # G4/M2 用：build_subset.py 的产物目录（depth_cache.npz + bbox.json）
-    subset_dir: str = "results/subset/libero_10"
+    # ⭐ 固定子集：2×2 四格（G3/M3/M2/G4）**必须**用它，G3 也不例外 ——
+    #    四格看同样的数据是纪律 1b 在 2×2 内部的全部意义（docs/06 §8.5b 方案 A′）。
+    #    留空时对这四个臂直接拒绝启动，见下面的硬拦。
+    subset_dir: str = "results/subset/libero_10_s1"
     camera_json: str = "results/tables/camera_libero.json"
     log_steps: int = 10
     resume_from: Optional[str] = None
@@ -192,6 +195,22 @@ def main(cfg: Config) -> None:
               f"包围盒 x[{bb['lo'][0]:+.2f},{bb['hi'][0]:+.2f}] "
               f"y[{bb['lo'][1]:+.2f},{bb['hi'][1]:+.2f}] "
               f"z[{bb['lo'][2]:+.2f},{bb['hi'][2]:+.2f}]")
+
+    # ⚠️⚠️ **2×2 四格必须套子集过滤，G3 也要。** 漏了不会报错：四格数据量不同，
+    #    `G4 vs G3` 的差里就混进"谁的训练数据多"，而那与坐标系无关。
+    #    所以在这里硬拦，而不是靠人记得传参数。
+    ARMS_2X2 = ("G3", "G4", "M2", "M3")
+    sub_cache = None
+    if cfg.arm in ARMS_2X2:
+        sp = Path(cfg.subset_dir) / "depth_cache.npz"
+        if not sp.exists():
+            raise SystemExit(
+                f"{cfg.arm} 属于 2×2 四格，必须用固定子集训练，但找不到\n  {sp}\n"
+                "先跑：python scripts/build_subset.py --commit\n"
+                "（G3 用不到深度，但**必须和另外三格看同样的数据** —— "
+                "纪律 1b，docs/06 §8.5b）")
+        sub_cache = DepthCache.load(sp)
+        print(f"固定子集：{len(sub_cache.idx)} 帧（{sp}）")
 
     micro, accum = MICRO_ARM.get(cfg.arm, MICRO[cfg.K])
     if cfg.micro:
@@ -291,6 +310,10 @@ def main(cfg: Config) -> None:
         image_aug=cfg.image_aug,
     )
     save_dataset_statistics(dataset.dataset_statistics, run_dir)
+    if sub_cache is not None:
+        from data.subset_filter import SubsetFiltered
+        dataset = SubsetFiltered(dataset, sub_cache)
+
     loader = DataLoader(
         dataset, batch_size=micro, sampler=None,
         collate_fn=PaddedCollatorKFrame(processor.tokenizer.model_max_length,
