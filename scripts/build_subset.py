@@ -452,7 +452,11 @@ def summarize(log: Path, out: Path, report_only: bool = True) -> None:
     sub = out / "subset.json"
 
     sub.write_text(json.dumps({
-        "criteria": {"tol": TOL, "min_good": MIN_GOOD, "min_mono": MIN_MONO},
+        # ⚠️ 这里要记**当前真正生效的三道闸**。原先写的 min_good 是第一版
+        #    RGB 代理闸的阈值，§12.1 换成深度不确定度之后常量就删了，
+        #    这一行没跟着改 —— 好在是 NameError 直接崩，没有静默写下一份错的判据记录。
+        "criteria": {"tol": TOL, "min_mono": MIN_MONO,
+                     "max_depth_p95": MAX_DEPTH_P95},
         "n_total": len(recs), "n_ok": len(ok),
         "episodes": [{"ep": r["ep"], "task": r["task"], "demo": r.get("demo")}
                      for r in ok],
