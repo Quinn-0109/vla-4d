@@ -58,6 +58,10 @@ def main() -> None:
     ap.add_argument("--camera", default="results/tables/camera_libero.json",
                     help="dump_camera.py 的产物；给了就跑世界系那一节")
     ap.add_argument("--budget", type=int, default=256)
+    ap.add_argument("--bbox", default="results/subset/libero_10_s1/bbox.json",
+                    help="**冻结的**包围盒（build_subset 的产物）。留空则用本次窗口"
+                         "自拟合的 p1–p99 —— 那样量到的利用率是乐观的，"
+                         "因为分箱量程正好贴着被分箱的那批点。训练用的是冻结值。")
     ap.add_argument("--win_per_ep", type=int, default=5,
                     help="每条 episode 抽几个窗口进池化算子")
     args = ap.parse_args()
@@ -181,13 +185,22 @@ def world_section(files, args) -> None:
         print("\n（没有窗口能对上相机参数，跳过世界系一节）")
         return
 
-    pts = torch.cat([cams[tid].patch_xyz(torch.from_numpy(w).double()).reshape(-1, 3)
-                     for tid, w in wins])
-    lo3 = torch.quantile(pts, 0.01, dim=0)
-    hi3 = torch.quantile(pts, 0.99, dim=0)
-    bbox = torch.stack([lo3, hi3])
     print(f"\n{'='*64}\n=== 世界系：真正的池化算子（{len(wins)} 个窗口）===")
-    print("包围盒 p1–p99 (m): " + "  ".join(
+    if args.bbox and os.path.exists(args.bbox):
+        j = json.loads(Path(args.bbox).read_text())
+        lo3 = torch.tensor(j["lo"], dtype=torch.float32)
+        hi3 = torch.tensor(j["hi"], dtype=torch.float32)
+        src = f"冻结值 {args.bbox}（训练用的就是它）"
+    else:
+        # ⚠️ 自拟合的量程贴着被分箱的那批点，利用率会偏乐观 —— 只在没有冻结值时用
+        pts = torch.cat([cams[tid].patch_xyz(torch.from_numpy(w).double()).reshape(-1, 3)
+                         for tid, w in wins])
+        lo3 = torch.quantile(pts, 0.01, dim=0).float()
+        hi3 = torch.quantile(pts, 0.99, dim=0).float()
+        src = "本次窗口自拟合 p1–p99（**偏乐观**，训练其实用冻结值）"
+    bbox = torch.stack([lo3, hi3])
+    print(f"包围盒来源: {src}")
+    print("包围盒 (m): " + "  ".join(
         f"{ax}[{float(lo3[i]):+.2f},{float(hi3[i]):+.2f}]" for i, ax in enumerate("xyz")))
 
     glo, ghi = grid_extent(K)
@@ -201,12 +214,24 @@ def world_section(files, args) -> None:
                              for c in range(GRID * GRID)])
 
     extra, use_g3, use_g4 = [], [], []
+    use_vox = {"G3": [], "G4": []}          # 旧的均匀体素，用来跟等量分箱对照
+    grid_same = True                        # 网格坐标上两种分箱是否逐位相同
     for tid, w in wins[:200]:
         dep = torch.from_numpy(w).double().unsqueeze(0)                   # (1,K,256)
         feat = torch.zeros(1, K * GRID * GRID, 8)                         # 分箱不看特征
         mc = metric_coords(dep, K, cams[tid]).float()
         g3 = coord_bin_pool(feat, gc, args.budget, glo, ghi, n_t=N_T_DEFAULT)
         g4 = coord_bin_pool(feat, mc, args.budget, mlo, mhi, n_t=N_T_DEFAULT)
+        # 同一批窗口上再跑一遍旧算子。**63/256 那个数是它量出来的**，
+        # 等量分箱到底补回多少，只有并排跑才说得清。
+        g3v = coord_bin_pool(feat, gc, args.budget, glo, ghi,
+                             n_t=N_T_DEFAULT, partition="voxel")
+        g4v = coord_bin_pool(feat, mc, args.budget, mlo, mhi,
+                             n_t=N_T_DEFAULT, partition="voxel")
+        use_vox["G3"].append(int(g3v.n_used[0]))
+        use_vox["G4"].append(int(g4v.n_used[0]))
+        # 网格坐标上等量分箱必须逐位退化成均匀体素（合成数据上已验，这里在真数据上复核）
+        grid_same &= bool(torch.equal(g3.assign, g3v.assign))
         # ⚠️ **必须配对比较。** 直接看"落进多于一个槽的比例"量到的是**时间轴**：
         #    n_t=2 时同一 (h,w) 光靠时间就必然进 ≥2 个槽，G3 也报 100%。
         #    G3 的空间箱由 (h,w) 决定、与内容无关，所以 n_slot_G3 就是"只有时间
@@ -217,8 +242,17 @@ def world_section(files, args) -> None:
     print(f"\n同一 (h,w) 的 K 帧 patch，**G4 比 G3 分得更开**的格子占比")
     print(f"  {np.mean(extra):>6.1%}   ← 度量坐标相对图像网格的机制余量"
           f"（已扣掉时间轴，G3 作配对参照）")
-    print(f"\n槽位利用率（预算 {args.budget}）  G3 {np.mean(use_g3):.0f}   "
-          f"G4 {np.mean(use_g4):.0f}")
+    print(f"\n槽位利用率（预算 {args.budget}，真值深度）")
+    print(f"{'':14}{'均匀体素':>10}{'等量分箱':>10}   ← 后者是现在的默认")
+    for name, q, v in (("G3 (t,h,w)", use_g3, use_vox["G3"]),
+                       ("G4 (t,x,y,z)", use_g4, use_vox["G4"])):
+        print(f"  {name:<12}{np.mean(v):>10.0f}{np.mean(q):>10.0f}")
+    if grid_same:
+        print("\n  ✅ 网格坐标上两种分箱逐位相同 —— 等量分箱对 G3 是恒等的，"
+              "G4−G3 里没混进算子效应")
+    else:
+        print("\n  ❌ 网格坐标上两种分箱不同。等量分箱在格点阵上本该恒等，"
+              "不同就说明 G3 也被算子改了，\n     G4−G3 不再只反映坐标系。**停下来查。**")
     d = float(np.mean(extra))
     print(f"\n=== 判读 ===")
     if d >= 0.10:
