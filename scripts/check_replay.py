@@ -237,7 +237,7 @@ def demo_states_at(task, n_demo: int, frames):
 
 
 def match_init(env, bmark, tid: int, ref: np.ndarray, n_try: int,
-               n_frame: int = 1, stage1_frames=(0,)):
+               n_frame: int = 1, stage1_frames=(0,), cache=None):
     """
     逐个试初始状态，找与 RLDS 第 0 帧最像的那个；同时定下翻转与否。
     返回 (init_idx, flip, 最好误差, 次好误差, 不翻的最好误差)。
@@ -263,12 +263,24 @@ def match_init(env, bmark, tid: int, ref: np.ndarray, n_try: int,
     d0 = demo_states_at(bmark.get_task(tid), n_try, stage1_frames)
     cands = [("eval", str(j), st) for j, st in enumerate(evals)] + \
             [(f"demo:{k}", str(t), st) for k, t, st in d0]
+    # ⭐ **候选的渲染与 ref 无关** —— `env.reset() + set_init_state(st)` 只取决于
+    #    状态本身，只有最后的 `diff(..., ref)` 才用到当前 episode。同一个 task 的
+    #    每条 episode 面对的是**同一批候选**，不缓存就是把 400 次渲染 + 400 次
+    #    MuJoCo reset 重复几十遍（task 3 的 27 条 = 10800 次，其中 10400 次是白做的）。
+    #    传一个 dict 进来即可跨 episode 复用；**切换 task 时必须换一个新 dict**，
+    #    否则会拿另一个 task 的画面去比 —— 那不会报错，只会给出错误的匹配。
     scores = []
     for src, j, st in cands:
-        env.reset()
-        obs = env.set_init_state(st)
-        scores.append((diff(rgb_of(obs, True), ref),
-                       diff(rgb_of(obs, False), ref), src, j, st))
+        key = (src, j)
+        if cache is not None and key in cache:
+            rgb_t, rgb_f = cache[key]
+        else:
+            env.reset()
+            obs = env.set_init_state(st)
+            rgb_t, rgb_f = rgb_of(obs, True), rgb_of(obs, False)
+            if cache is not None:
+                cache[key] = (rgb_t, rgb_f)
+        scores.append((diff(rgb_t, ref), diff(rgb_f, ref), src, j, st))
     flipped = sorted(x[0] for x in scores)
     best = min(scores, key=lambda x: x[0])
     res = {"src": best[2], "idx": best[3], "state": best[4],

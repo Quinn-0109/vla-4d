@@ -67,7 +67,7 @@ MIN_MONO = 0.95      # 匹配下标单调性
 MAX_DEPTH_P95 = 5.0  # cm。深度不确定度，尺度取自 docs/05 §9.2（箱宽 ~30 cm）
 
 
-def episode_stream(data_root: str, name: str):
+def episode_stream(data_root: str, name: str, want_index=None, want_lang=None):
     """
     逐条产出 episode（**不能一次全读进内存**：libero_10 约 380 条 × 250 帧 ×
     256² × 3 ≈ 18 GB）。同时把 episode 级的元数据一并带出来 —— 训练时要靠它
@@ -87,6 +87,17 @@ def episode_stream(data_root: str, name: str):
     ds = b.as_dataset(split="train", shuffle_files=False, decoders={
         "steps": {"observation": {"image": tfds.decode.SkipDecoding()}}})
     for i, ep in enumerate(ds):
+        # ⭐ **先判要不要，再解码。** 下面那两行把 episode 的每一帧都
+        #    decode_image + 哈希（约 250 帧/条）；续跑或 --only_task 时绝大多数
+        #    episode 立刻就被丢掉，那些解码全是白做的。
+        #    want_index 只看下标（最便宜），want_lang 看语言指令（仍不碰图像）。
+        if want_index is not None and not want_index(i):
+            continue
+        if want_lang is not None:
+            _lang = next(iter(ep["steps"]))["language_instruction"] \
+                .numpy().decode().strip().lower()
+            if not want_lang(_lang):
+                continue
         raw = [s["observation"]["image"] for s in ep["steps"]]
         yield i, {
             "meta": {k: v.numpy().decode() if v.dtype == tf.string else v.numpy()
@@ -218,16 +229,15 @@ def main() -> None:
         print(f"续跑：已完成 {len(done)} 条，跳过")
 
     bmark = benchmark.get_benchmark_dict()[args.suite]()
-    env, env_tid = None, None
+    env, env_tid, cand_cache = None, None, {}
     try:
-        for i, ep in episode_stream(args.data_root, name):
+        want_i = (lambda i: i not in done) if done else None
+        want_l = (None if args.only_task < 0
+                  else (lambda lg: find_task(bmark, lg) == args.only_task))
+        for i, ep in episode_stream(args.data_root, name, want_i, want_l):
             if args.limit and i >= args.limit:
                 break
-            if i in done:
-                continue
             tid = find_task(bmark, ep["lang"])
-            if args.only_task >= 0 and tid != args.only_task:
-                continue
             rec = {"ep": i, "task": tid, "lang": ep["lang"],
                    "n_frames": int(len(ep["images"])), "meta": ep["meta"],
                    "stride": args.align_stride, "demo_frames": args.demo_frames,
@@ -246,10 +256,14 @@ def main() -> None:
                 env = build_env(bmark.get_task(tid))
                 env.seed(0)
                 env_tid = tid
+                # ⚠️ 换 task 必须换缓存：候选画面是按 task 的，串了不会报错，
+                #    只会拿另一个 task 的画面去匹配。
+                cand_cache = {}
 
             m = match_init(env, bmark, tid, ep["images"][0], args.n_init_try,
                            args.demo_frames,
-                           tuple(int(x) for x in args.stage1_frames.split(",")))
+                           tuple(int(x) for x in args.stage1_frames.split(",")),
+                           cache=cand_cache)
             env.reset()
             obs = env.set_init_state(m["state"])
             prof = diff_profile(rgb_of(obs, True), ep["images"][0])
