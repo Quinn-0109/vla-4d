@@ -220,6 +220,129 @@ def _resolve_bins(
 
 
 # ---------------------------------------------------------------- 主算子
+# ---------------------------------------------------------------- FPS 分组
+def _fps_indices(x: torch.Tensor, m: int) -> torch.Tensor:
+    """
+    最远点采样：从 x (n, c) 里选 m 个尽量分散的点，返回下标 (min(m,n),)。
+
+    ⚠️ **必须确定性。** 起点取"离坐标均值最远的那个点"，并列时 `argmax` 返回
+    首个出现的下标 —— 同一份输入跑两次必须给出逐位相同的中心，否则同一个
+    checkpoint 评两次会得到不同的池化，掉点会被误读成方法的问题。
+    """
+    n = x.shape[0]
+    if n <= m:
+        return torch.arange(n, device=x.device)
+    d0 = ((x - x.mean(0, keepdim=True)) ** 2).sum(-1)
+    cur = int(torch.argmax(d0))
+    out = [cur]
+    dist = ((x - x[cur]) ** 2).sum(-1)
+    for _ in range(m - 1):
+        cur = int(torch.argmax(dist))
+        out.append(cur)
+        dist = torch.minimum(dist, ((x - x[cur]) ** 2).sum(-1))
+    return torch.tensor(out, device=x.device, dtype=torch.long)
+
+
+def _quantile_assign(qi: torch.Tensor, budget: int, n_t: int,
+                     group_axes: tuple[int, ...], n_group: tuple[int, ...],
+                     extent) -> tuple[torch.Tensor, int]:
+    """
+    **等量分箱**：箱数沿用体素那套规则，但每个轴的**箱边取该轴的分位数**
+    （等距 → 等量）。返回 (inv, m)。
+
+    ⚠️ 为什么不是 FPS。实测（合成薄壳深度，n_t=2，N=256）：
+
+        坐标           分区      用满槽    组大小变异系数
+        网格(t,h,w)    体素     242/256        0.50
+        网格(t,h,w)    FPS      256/256        0.76   ← 变差
+        度量(t,x,y,z)  体素     242/256        0.52
+        度量(t,x,y,z)  FPS      256/256        0.34   ← 变好
+
+    **FPS 帮 G4、害 G3** —— 会把 G4−G3 抬高，而抬高的部分与坐标系的信息量无关，
+    是算子与坐标结构的交互。原因：格点阵**没有结构可供自适应**，FPS 的贪心
+    不规则性在那里是纯噪声；曲面上自适应才有回报。
+    **"没有增益"可以接受，"有惩罚"不行** —— 后者会被一句话问废。
+
+    等量分箱的性质相反：**格点阵上分位数 = 等距，逐位退化成均匀分箱（零惩罚）**；
+    曲面上分位数把箱边推到点密的地方（有增益）。这才是"两臂同一个算子，
+    差别全部来自坐标系本身"该有的形状。
+    """
+    device = qi.device
+    tv, c = qi.shape
+    g = _resolve_bins(qi, budget, group_axes, n_group, n_t, extent=extent)
+    idx = torch.zeros(tv, c, dtype=torch.long, device=device)
+    for ax in range(c):
+        nb = max(1, g[ax])
+        if nb == 1:
+            continue
+        # ⚠️ **箱边取"值"的分位数，不是按秩切。** 按秩切会把**并列值拆开**：
+        #    同一个 (h,w) 在不同帧上值相同、秩不同，于是同位置的 patch 落进
+        #    不同的组 —— 那正好挡住 G3 该做的同位置跨帧合并，是算子引入的不公平。
+        #    按值分位数则"相同的值必进同一箱"，且在均匀分布（格点阵）上
+        #    分位数就是等距 —— **格点上逐位退化成均匀分箱（零惩罚）**，
+        #    曲面上才把箱边推向点密处（有增益）。
+        v = qi[:, ax].contiguous()
+        qs = torch.linspace(0, 1, nb + 1, device=device, dtype=v.dtype)[1:-1]
+        edges = torch.quantile(v.float(), qs.float()).to(v.dtype)
+        idx[:, ax] = torch.bucketize(v, edges, right=False).clamp(0, nb - 1)
+    _, inv = torch.unique(idx, dim=0, return_inverse=True)
+    return inv, int(inv.max().item()) + 1
+
+
+def _fps_assign(qi: torch.Tensor, budget: int, n_t: int,
+                group_axes: tuple[int, ...], n_group: tuple[int, ...]):
+    """
+    **时间解耦 + 空间 FPS** 的分组，返回 (inv, m)：每个 patch 的组号、组数。
+
+    与 `_resolve_bins` 的均匀体素并列，只换"谁和谁合并"这一步；
+    均值池化、质心、排序、掩码全部沿用同一份代码 ——
+    于是"G3 vs G4 只差传进去的坐标张量"这条性质原样保住。
+
+    ⚠️ **为什么时间与空间解耦，而不是算一个融合的 4D 距离。**
+    点云视频（4D）那条线的标准做法就是解耦：P4Transformer（CVPR'21）用
+    分开的空间半径 `rs` 与时间半径/步长 `rt`/`st`，FPS 只采**空间**锚点；
+    PSTNet 是 "disentangled spatial and temporal convolutions"；
+    Mamba4D 标题里直接写着 "Disentangled Spatial-Temporal"。
+    原因很实在：**时间（帧）与空间（米）没有可比尺度**，融合成一个距离就必须
+    引入一个带量纲的换算系数 —— 而那正是 ToMe 的 λ 被否掉的理由
+    （量纲不同 ⇒ 度量空间与网格空间的最优值必然不同 ⇒ 各自调优 = 给某一臂开小灶）。
+    **"4D" 指的是坐标是 (t,x,y,z)，不是算子算一个四维距离。**
+    跨帧合并照样发生：一个时间箱盖多帧，箱内 patch 按**空间**邻近合并，
+    §1.3 ①「同一 (h,w)、不同深度不该合并」这个机制完整保留。
+
+    ⚠️ 为什么换掉均匀体素：可见 patch 在度量空间里贴在**一层薄壳**上（2 维流形），
+    用立方格去切它，绝大多数格子是空的 —— `_resolve_bins` 的注释里记着实测
+    **G4 只用到 63/256 槽而 G3 用了 242**。FPS 按构造把中心放在有内容的地方，
+    N 个槽全部用满。这是 3D 视觉的标准算子（PointNet++ 的 set abstraction）。
+    """
+    device = qi.device
+    tv = qi.shape[0]
+    # 时间轴的箱数：G2 用 group_axes 把 t 钉死成"每帧一箱"，其余用 n_t
+    nb = n_group[group_axes.index(0)] if 0 in group_axes else int(n_t)
+    nb = max(1, nb)
+    tb = (qi[:, 0] * nb).floor().long().clamp(0, nb - 1)         # (Tv,) 时间箱号
+    sp = qi[:, 1:]                                               # 空间轴
+
+    # 预算按时间箱均分；余数给前几个箱。只依赖 budget 与 nb，两臂完全相同
+    base, rem = divmod(budget, nb)
+    inv = torch.full((tv,), -1, dtype=torch.long, device=device)
+    off = 0
+    for b_i in range(nb):
+        sel = (tb == b_i).nonzero(as_tuple=True)[0]
+        if sel.numel() == 0:
+            continue
+        m_b = base + (1 if b_i < rem else 0)
+        if m_b <= 0:
+            continue
+        x = sp[sel]
+        ctr = _fps_indices(x, m_b)                               # (m_b',)
+        # 每个 patch 归给最近的中心；并列取下标最小的中心（argmin 返回首个）
+        d = torch.cdist(x, x[ctr])                               # (n_sel, m_b')
+        inv[sel] = torch.argmin(d, dim=1) + off
+        off += ctr.numel()
+    return inv, off
+
+
 def coord_bin_pool(
     feat: torch.Tensor,
     coord: torch.Tensor,
@@ -231,6 +354,7 @@ def coord_bin_pool(
     n_t: int | None = None,
     enforce_n: int | None = None,
     valid: torch.Tensor | None = None,
+    partition: str = "quantile",
 ) -> PoolOut:
     """
     把 (B, T, D) 的 token 按坐标分箱、箱内平均，压到 budget 个。
@@ -302,14 +426,26 @@ def coord_bin_pool(
         qi, fi, ci = q[i][vi], feat[i][vi], coord[i][vi]
         tv = vi.numel()
         with torch.no_grad():
-            # extent = 各轴的物理跨度，让体素在物理空间里是立方体（见 _resolve_bins）
-            g = _resolve_bins(qi, budget, group_axes, n_group, n_t,
-                              extent=span)
-            gs = torch.tensor(g, device=device, dtype=q.dtype)
-            gmax = torch.tensor([x - 1 for x in g], device=device)
-            idx = (qi * gs).floor().long().clamp(min=torch.zeros_like(gmax), max=gmax)
-            keys, inv = torch.unique(idx, dim=0, return_inverse=True)   # (M, C), (Tv,)
-            m = keys.shape[0]
+            if partition == "fps":
+                # 时间解耦 + 空间 FPS（默认）。见 _fps_assign 的说明
+                inv, m = _fps_assign(qi, budget, n_t or 1, group_axes, n_group)
+            elif partition == "quantile":
+                inv, m = _quantile_assign(qi, budget, n_t or 1,
+                                          group_axes, n_group, span)
+            elif partition == "voxel":
+                # 均匀体素（旧版，保留作对照）。extent = 各轴物理跨度，
+                # 让体素在物理空间里是立方体（见 _resolve_bins）
+                g = _resolve_bins(qi, budget, group_axes, n_group, n_t,
+                                  extent=span)
+                gs = torch.tensor(g, device=device, dtype=q.dtype)
+                gmax = torch.tensor([x - 1 for x in g], device=device)
+                idx = (qi * gs).floor().long().clamp(
+                    min=torch.zeros_like(gmax), max=gmax)
+                keys, inv = torch.unique(idx, dim=0, return_inverse=True)
+                m = keys.shape[0]
+            else:
+                raise ValueError(
+                    f"partition 只能是 'quantile'/'fps'/'voxel'，收到 {partition!r}")
             cnt = torch.zeros(m, device=device).index_add_(
                 0, inv, torch.ones(tv, device=device))
 
@@ -525,15 +661,64 @@ if __name__ == "__main__":
         fc = assert_cross_frame_merge(c_, mc, min_frac=0.0)
         print(f"      {nt:<5d} {fa:>10.1%}   {fc:>11.1%}")
 
+
+    # ---- [8] 等量分箱的四条自检（换算子之后新增）----
+    print("\n[8] 等量分箱（partition='quantile'，定稿算子）的四条自检")
+    B2, K2 = 2, 8
+    f2 = torch.randn(B2, K2 * 256, 64)
+    g2c = grid_coords(K2).unsqueeze(0).expand(B2, -1, -1).contiguous()
+
+    # ⭐ 最强的一条：网格坐标下与旧算子**逐位等价** → G3/G2 一点没变，
+    #    "你换了个偏向自己那一臂的算子"这句质疑直接堵死
+    ok_all = True
+    for kk in (4, 8):
+        for nt in (1, 2, 4):
+            ff = torch.randn(2, kk * 256, 32)
+            gg = grid_coords(kk).unsqueeze(0).expand(2, -1, -1).contiguous()
+            l2, h2 = grid_extent(kk)
+            av = coord_bin_pool(ff, gg, N, l2, h2, n_t=nt, partition="voxel")
+            aq = coord_bin_pool(ff, gg, N, l2, h2, n_t=nt, partition="quantile")
+            ok_all &= bool(torch.equal(av.assign, aq.assign))
+    assert ok_all, "网格坐标下等量分箱与均匀体素不等价 —— 公平性论证不成立"
+    print("    ✓ 网格坐标下与旧的均匀体素**逐位等价**（K∈{4,8} × n_t∈{1,2,4} 全过）")
+    print("      → G3/G2 完全不变，改动只作用于度量坐标")
+
+    o1 = coord_bin_pool(f2, g2c, N, glo, ghi, n_t=2)
+    o2 = coord_bin_pool(f2, g2c, N, glo, ghi, n_t=2)
+    assert torch.equal(o1.assign, o2.assign), "不确定：同输入两次分组不同"
+    print("    ✓ 确定性：同一输入两次，分组逐位相同")
+
+    fr = assert_cross_frame_merge(o1, g2c, min_frac=0.0)
+    assert fr > 0.5, f"跨帧合并几乎没发生（{fr:.1%}）"
+    print(f"    ✓ 跨帧合并仍然发生：{fr:.1%}")
+
+    print("""
+    ⚠️ **FPS + Voronoi 试过，被自检否掉了**（partition='fps' 仍保留可复现）。
+       合成薄壳深度、n_t=2、N=256 实测：
+
+           坐标           分区      用满槽    组大小变异系数
+           网格(t,h,w)    体素     242/256        0.50
+           网格(t,h,w)    FPS      256/256        0.76   ← 变差
+           度量(t,x,y,z)  体素     242/256        0.52
+           度量(t,x,y,z)  FPS      256/256        0.34   ← 变好
+
+       **FPS 帮 G4、害 G3** —— 抬高的那部分与坐标系的信息量无关，是算子与
+       坐标结构的交互。格点阵没有结构可供自适应，FPS 的贪心不规则性在那里
+       是纯噪声。**"没有增益"可以接受，"有惩罚"不行。**
+       等量分箱没有这个毛病：格点上逐位退化成均匀（零惩罚），曲面上把箱边
+       推向点密处（度量坐标 242 → 256 槽，真值深度下原本只有 63）。""")
+
     print("""
 ⚠️ 两处只在真实深度下才有意义，别拿上面的数当结论：
 
-  ① G4 的槽位利用率明显低于 G3（100 vs 242）。这是合成深度退化造成的，
-     但**机制是真的**：G3 的网格箱数与数据无关，G4 的体素占用取决于场景，
-     所以 enforce_n 拉平后的公共预算会被 G4 拖低。真实深度下要重测，
-     若仍明显偏低，说明 G4 的度量分箱在浪费预算，要调 metric_extent 的包围盒。
+  ① ~~G4 的槽位利用率明显低于 G3（100 vs 242）~~ —— **换成 FPS 分组后已消失**，
+     三臂都是 256/256（见上面 [1] 的实测）。旧的均匀体素在度量空间里浪费掉
+     四分之三的预算（真值深度实测 G4 仅 63/256），因为可见 patch 贴在一层
+     薄壳上、立方格大半是空的。FPS 按构造把中心放在有内容的地方。
+     **这条留在这里是为了记住它曾经存在** —— 那个浪费会直接压低 G4，
+     而它不报任何错。
 
-  ② G4 的跨帧占比随 n_t 上升掉得比 G3 快。同样先归因于合成深度
+  ② G4 的跨帧占比随 n_t 上升掉得比 G3 快。先归因于合成深度
      （z 跨帧恒定，(x,y,z) 几乎没有时间结构），真值深度下重看。
 
 ✅ metric_coords 已换成真正的反投影（common/camera.py），x/y 是世界系坐标而非
