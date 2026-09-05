@@ -105,20 +105,40 @@ def find_task(bmark, lang: str) -> int | None:
     return None
 
 
+# ⚠️ **HDF5 路径要缓存。** 下面三个函数原先各自做 `root.rglob(...)` ——
+#    递归遍历整个 LIBERO 数据集目录，而它们**每条 episode 都会被调用**
+#    （demo_states_at 一次、demo_states 一次、demo_all_states 一次）。
+#    目录里是几十 GB 的 HDF5，三次全盘扫描 × 每条 episode，是 build_subset
+#    "每条都要等很久"的一部分。按 task.name 缓存，进程内只扫一次。
+_H5_CACHE: dict = {}
+
+
+def _demo_h5(task):
+    """某个 task 的 demo HDF5 路径（进程内缓存）。找不到返回 None。"""
+    if task.name in _H5_CACHE:
+        return _H5_CACHE[task.name]
+    try:
+        from libero.libero import get_libero_path
+        root = Path(get_libero_path("datasets"))
+    except Exception:
+        _H5_CACHE[task.name] = None
+        return None
+    hits = list(root.rglob(f"{task.name}_demo.hdf5")) or list(
+        root.rglob(f"{task.name}*.hdf5"))
+    _H5_CACHE[task.name] = hits[0] if hits else None
+    return _H5_CACHE[task.name]
+
+
 def demo_all_states(task, demo_key: str):
     """取某条 demo 的**全部帧**的完整仿真状态 (T, state_dim)。"""
     try:
         import h5py
-
-        from libero.libero import get_libero_path
-        root = Path(get_libero_path("datasets"))
     except Exception:
         return None
-    hits = list(root.rglob(f"{task.name}_demo.hdf5")) or list(
-        root.rglob(f"{task.name}*.hdf5"))
-    if not hits:
+    h5 = _demo_h5(task)
+    if h5 is None:
         return None
-    with h5py.File(hits[0], "r") as f:
+    with h5py.File(h5, "r") as f:
         return np.asarray(f["data"][demo_key]["states"])
 
 
@@ -195,17 +215,13 @@ def demo_states(task, n_demo: int = 60, n_frame: int = 1):
     """
     try:
         import h5py
-
-        from libero.libero import get_libero_path
-        root = Path(get_libero_path("datasets"))
     except Exception:
         return []
-    hits = list(root.rglob(f"{task.name}_demo.hdf5")) or list(
-        root.rglob(f"{task.name}*.hdf5"))
-    if not hits:
+    h5 = _demo_h5(task)
+    if h5 is None:
         return []
     out = []
-    with h5py.File(hits[0], "r") as f:
+    with h5py.File(h5, "r") as f:
         for k in list(f["data"].keys())[:n_demo]:
             st = f["data"][k]["states"]
             for t in range(min(n_frame, st.shape[0])):
@@ -217,17 +233,13 @@ def demo_states_at(task, n_demo: int, frames):
     """取每条 demo 在指定帧号上的状态。`frames` 是帧号序列（越界的跳过）。"""
     try:
         import h5py
-
-        from libero.libero import get_libero_path
-        root = Path(get_libero_path("datasets"))
     except Exception:
         return []
-    hits = list(root.rglob(f"{task.name}_demo.hdf5")) or list(
-        root.rglob(f"{task.name}*.hdf5"))
-    if not hits:
+    h5 = _demo_h5(task)
+    if h5 is None:
         return []
     out = []
-    with h5py.File(hits[0], "r") as f:
+    with h5py.File(h5, "r") as f:
         for k in list(f["data"].keys())[:n_demo]:
             st = f["data"][k]["states"]
             for t in frames:
