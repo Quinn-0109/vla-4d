@@ -45,7 +45,7 @@ from pooling.coord_pool import (GRID, N_T_DEFAULT, coord_bin_pool, grid_coords,
 from pooling.rope4d import assemble, build_rope, channel_plan, normalize, seq_centroid
 
 N_PATCH = GRID * GRID          # 256
-ARMS = ("G0", "G1", "G2", "G3", "G4", "M2")
+ARMS = ("G0", "G1", "G2", "G3", "G4", "M2", "M3")
 
 
 @dataclass
@@ -63,24 +63,42 @@ class WireConfig:
             raise ValueError(f"arm 必须是 {ARMS} 之一，收到 {self.arm!r}")
         if self.arm == "G0" and self.K != 1:
             raise ValueError("G0 是单帧基线，K 必须为 1")
-        if self.arm in ("G4", "M2") and self.bbox is None:
+        if self.needs_depth and self.bbox is None:
             raise ValueError(
                 f"{self.arm} 用度量坐标，必须给 bbox（scripts/dump_camera.py 的产物）。"
                 "缺了它 metric_extent 无从归一化。")
 
     @property
     def pools(self) -> bool:
-        return self.arm in ("G2", "G3", "G4", "M2")
+        return self.arm in ("G2", "G3", "G4", "M2", "M3")
 
     @property
     def metric(self) -> bool:
-        """池化侧是否用度量坐标。"""
+        """**池化侧**是否用度量坐标。"""
         return self.arm in ("G4", "M2")
 
     @property
+    def pe_metric(self) -> bool:
+        """**PE 侧**是否用度量坐标。与 `metric` 分开，2×2 的四格就是这两个的组合：
+
+            池化\PE      (t,h,w)      (t,x,y,z)
+            (t,h,w)        G3            M3        ← M3 ≈「SpatialVLA 的 PE 装在池化模型上」
+            (t,x,y,z)      M2            G4
+
+        **没有 M3，标题句可以被整个重新解释成「就是 Ego3D PE 有用」**，
+        而那个解释有一篇发表论文和 +27.3 点撑着（docs/06 §1.3）。
+        """
+        return self.arm in ("G4", "M3")
+
+    @property
+    def needs_depth(self) -> bool:
+        """哪一侧用度量坐标都要深度与包围盒。"""
+        return self.metric or self.pe_metric
+
+    @property
     def pe_axes(self) -> int:
-        """PE 侧坐标的轴数。M2 的错配就在这里：池化 4 轴、PE 3 轴。"""
-        return 4 if self.arm == "G4" else 3
+        """PE 侧坐标的轴数。错配就体现在这里：M2 池化 4 轴 / PE 3 轴，M3 反过来。"""
+        return 4 if self.pe_metric else 3
 
 
 @dataclass
@@ -167,7 +185,9 @@ def _pool_and_coords(emb: torch.Tensor, cfg: WireConfig, bt: _Batch):
         pos1d = torch.arange(k * N_PATCH, device=dev).float().expand(b, -1)
         return emb, pos1d, gc, None
 
-    if cfg.metric:
+    # 度量坐标：**池化侧或 PE 侧任一需要就得算**（M3 只有 PE 侧要）
+    pc_metric = None
+    if cfg.needs_depth:
         if not bt.cameras:
             raise RuntimeError(f"{cfg.arm} 需要每个样本的相机，set_batch 里没给。")
         # ⚠️ **坐标必须留在 fp32**，不能跟着 emb 转成 bf16。
@@ -175,8 +195,12 @@ def _pool_and_coords(emb: torch.Tensor, cfg: WireConfig, bt: _Batch):
         #    正好把 G4 要分辨的尺度磨掉，而且**不报任何错**：
         #    分箱照跑、训练照收敛，只是度量坐标退化成了厘米级的量化网格。
         #    特征走 bf16，坐标走 fp32，两者本来就不必同精度。
-        pc = torch.cat([metric_coords(bt.depth[i:i + 1].to(dev), k, bt.cameras[i])
-                        for i in range(b)], dim=0).float()
+        pc_metric = torch.cat(
+            [metric_coords(bt.depth[i:i + 1].to(dev), k, bt.cameras[i])
+             for i in range(b)], dim=0).float()
+
+    if cfg.metric:
+        pc = pc_metric
         lo, hi = metric_extent(k, cfg.bbox.to(dev), device=dev)
     else:
         pc, (lo, hi) = gc, grid_extent(k, device=dev)
@@ -185,13 +209,15 @@ def _pool_and_coords(emb: torch.Tensor, cfg: WireConfig, bt: _Batch):
     out = coord_bin_pool(emb, pc, cfg.budget, lo, hi,
                          enforce_n=cfg.enforce_n, valid=valid, **kw)
 
-    # PE 侧坐标：G3/G4 就用池化出来的质心；**M2 的错配在这里** ——
-    # 池化侧是度量质心，PE 侧另取箱内 patch 的 (t,h,w) 算术均值（docs/06 §3.0.4 ①）
-    if cfg.arm == "M2":
-        coord_pe = _grid_centroid(out.assign, gc, cfg.enforce_n or cfg.budget)
-    elif cfg.metric:
-        coord_pe = out.coord
-    else:
+    # PE 侧坐标 —— 2×2 的四格在这里分开。**两个错配臂都是"另取一套坐标算质心"**，
+    # 走的是同一份 `_grid_centroid`（它对任意坐标张量通用），
+    # 所以 M2 与 M3 的实现是彼此镜像的，不存在"哪一臂被特殊照顾"。
+    n_slots = cfg.enforce_n or cfg.budget
+    if cfg.metric and not cfg.pe_metric:        # M2：度量池化 + 网格 PE
+        coord_pe = _grid_centroid(out.assign, gc, n_slots)
+    elif cfg.pe_metric and not cfg.metric:      # M3：网格池化 + 度量 PE
+        coord_pe = _grid_centroid(out.assign, pc_metric, n_slots)
+    else:                                        # G3 / G4：两侧一致，直接用池化质心
         coord_pe = out.coord
 
     pos1d = seq_centroid(out.assign, cfg.enforce_n or cfg.budget)
@@ -421,17 +447,22 @@ def _selftest() -> None:
     emb = torch.randn(B, K * N_PATCH, D)
 
     def run(arm, pad=None):
-        cfg = WireConfig(arm=arm, K=K, bbox=bbox if arm in ("G4", "M2") else None)
+        # ⚠️ 用 needs_depth 判，不要写死臂名 —— 加 M3 时正是这里先炸的，
+        #    而 __post_init__ 的那条校验把它拦下了（该拦）。
+        _probe = WireConfig(arm=arm, K=1 if arm == "G0" else K,
+                            bbox=bbox)          # 先给 bbox 只为读属性
+        cfg = WireConfig(arm=arm, K=K,
+                         bbox=bbox if _probe.needs_depth else None)
         bt = _Batch(depth=depth, frame_pad_mask=pad, cameras=[cam] * B)
         return _pool_and_coords(emb, cfg, bt)
 
     e1, _, _, _ = run("G1")
     assert e1.shape[1] == K * N_PATCH
-    for arm in ("G2", "G3", "G4", "M2"):
+    for arm in ("G2", "G3", "G4", "M2", "M3"):
         e, p, c, _ = run(arm)
         assert e.shape == (B, N_PATCH, D), (arm, e.shape)
         assert p.shape == (B, N_PATCH) and c.shape[-1] in (3, 4)
-    print("✅ 1/9 token 数：G1 保持 2048，四个池化臂都压到 256")
+    print("✅ 1/9 token 数：G1 保持 2048，五个池化臂都压到 256")
 
     _, _, c4, _ = run("G4")
     _, _, cm, _ = run("M2")
@@ -442,6 +473,23 @@ def _selftest() -> None:
     e2, _, _, _ = run("M2")
     assert torch.equal(e4, e2), "M2 的池化侧必须与 G4 逐位相同"
     print("✅ 3/9 M2 与 G4 的池化输出逐位相同（只有 PE 侧不同）")
+
+    # ---- M3：M2 的镜像。2×2 的四格靠这两条不变量钉死 ----
+    #      池化\PE     (t,h,w)   (t,x,y,z)
+    #      (t,h,w)       G3        M3      ← 与 G3 同池化
+    #      (t,x,y,z)     M2        G4      ← M2 与 G4 同池化
+    _, _, c3, _ = run("G3")
+    _, _, cm3, _ = run("M3")
+    assert c3.shape[-1] == 3 and cm3.shape[-1] == 4, (c3.shape, cm3.shape)
+    print("✅ 3b/9 M3 的错配（M2 的镜像）：池化侧与 G3 同为网格坐标，"
+          "PE 侧是 4 轴 (t,x,y,z)")
+
+    e3, _, _, _ = run("G3")
+    em3, _, _, _ = run("M3")
+    assert torch.equal(e3, em3), "M3 的池化侧必须与 G3 逐位相同"
+    print("✅ 3c/9 M3 与 G3 的池化输出逐位相同（只有 PE 侧不同）")
+    print("      → 两个错配臂走同一份 _grid_centroid（它对任意坐标张量通用），"
+          "实现彼此镜像，\n         不存在\"哪一臂被特殊照顾\"")
 
     pad = torch.ones(B, K, dtype=torch.bool)
     pad[:, :3] = False                       # 前 3 帧是补帧

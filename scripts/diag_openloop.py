@@ -65,7 +65,7 @@ from pooling.wire import (WireConfig, assert_arm_wiring, set_batch,  # noqa: E40
                           wire)
 
 DIMS = ["x", "y", "z", "roll", "pitch", "yaw", "grip"]
-POOLED = ("G2", "G3", "G4", "M2")
+POOLED = ("G2", "G3", "G4", "M2", "M3")
 VARIANTS = ("tf", "gen", "gen_nocache", "nocrop", "shuffled")
 
 

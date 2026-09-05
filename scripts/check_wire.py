@@ -137,7 +137,7 @@ def main() -> None:
 
     def run(arm, dep):
         cfg = WireConfig(arm=arm, K=K,
-                         bbox=bbox if arm in ("G4", "M2") else None)
+                         bbox=bbox)   # needs_depth 的臂都要，别列臂名
         st = wire(model, cfg)
         try:
             set_batch(st, depth=dep, frame_pad_mask=torch.ones(B, K, dtype=torch.bool),

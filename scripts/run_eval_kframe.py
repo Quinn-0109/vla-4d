@@ -53,10 +53,15 @@ from experiments.robot.libero.libero_utils import (  # noqa: E402
 from experiments.robot.robot_utils import (invert_gripper_action,  # noqa: E402
                                            normalize_gripper_action)
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+from check_replay import patch_depth  # noqa: E402
+
 from common.imgproc import center_crop_resize  # noqa: E402
 from common.runs import resolve_adapter  # noqa: E402
 from pooling.wire import (WireConfig, assert_arm_wiring, frame_feats,  # noqa: E402
                           set_batch, set_vision_feats, wire)
+
+CAM_NAME = "agentview"   # 与 check_replay / dump_camera 同一台相机
 
 MAX_STEPS = {"libero_spatial": 220, "libero_object": 280,
              "libero_goal": 300, "libero_10": 520, "libero_90": 400}
@@ -79,6 +84,12 @@ class Config:
     unnorm_key: Optional[str] = None           # 默认取 task_suite_name + "_no_noops"
     stats_json: Optional[str] = None           # 默认找 <adapter>/../../dataset_statistics.json
     run_root: str = "runs"                     # --adapter 找不到时列清单用
+    # G4/M2/M3 用：包围盒（build_subset 的产物）与逐 task 相机（dump_camera 的产物）
+    subset_dir: str = "results/subset/libero_10_s1"
+    camera_json: str = "results/tables/camera_libero.json"
+    # ⚠️ 度量臂要开深度渲染。**必须验证它不改变 RGB** —— 若改变，度量臂与网格臂
+    #    看到的画面就不同，那是个致命混淆。头 N 个初始状态逐位对拍。
+    verify_env: int = 3
     center_crop: bool = True                   # ⚠️ 训练开了 image_aug 就必须开，见下
     # ⭐ 每帧的视觉特征只算一次、跨窗口复用（视觉主干冻结，同一帧特征逐位相同）。
     #    实测每步 8 次主干前向是评测的成本大头（144 s/局，docs/05 §11.1）。
@@ -235,6 +246,33 @@ def main(cfg: Config) -> None:
             print("⚠️ 未指定 adapter，评测的是**未微调的底座模型** —— "
                   "这个数不能与各臂比较。")
 
+    # ⚠️ **在加载 7B 之前**把 WireConfig 建出来并查齐前置产物（本项目的惯例）：
+    #    度量臂缺 bbox 会在 WireConfig 的 __post_init__ 就抛，但那时 7B 已经装进显存了。
+    _probe = WireConfig(arm=cfg.arm, K=cfg.K, bbox=torch.zeros(2, 3))
+    bbox = cameras = None
+    if _probe.needs_depth:
+        bp = Path(cfg.subset_dir) / "bbox.json"
+        cp = Path(cfg.camera_json)
+        miss = [str(x) for x in (bp, cp) if not x.exists()]
+        if miss:
+            raise SystemExit(
+                f"{cfg.arm} 用度量坐标，需要这两份产物，缺了：\n  "
+                + "\n  ".join(miss)
+                + "\n\n  python scripts/dump_camera.py"
+                  "\n  python scripts/build_subset.py --commit")
+        bb = json.loads(bp.read_text())
+        bbox = torch.tensor([bb["lo"], bb["hi"]], dtype=torch.float32)
+        from common.camera import Camera
+        cams_raw = json.loads(cp.read_text())
+        cameras = {int(k): Camera(
+            fovy=float(v["fovy"]), height=int(v["height"]), width=int(v["width"]),
+            pos=torch.tensor(v["pos"], dtype=torch.float64),
+            rot=torch.tensor(v["rot"], dtype=torch.float64).reshape(3, 3),
+            flipped=bool(v.get("flipped", True))) for k, v in cams_raw.items()}
+        print(f"度量坐标：包围盒 {bp}，相机 {len(cameras)} 台")
+    wcfg = WireConfig(arm=cfg.arm, K=cfg.K, budget=cfg.budget, n_t=cfg.n_t,
+                      bbox=bbox)
+
     processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
     model = AutoModelForVision2Seq.from_pretrained(
         cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True,
@@ -291,8 +329,7 @@ def main(cfg: Config) -> None:
     if cfg.eval_batch > 1:
         _allow_batched_generation(model)
 
-    state = wire(model, WireConfig(arm=cfg.arm, K=cfg.K, budget=cfg.budget,
-                                   n_t=cfg.n_t))
+    state = wire(model, wcfg)
     model.eval()
 
     print(f"中心裁: {'开' if cfg.center_crop else '**关**'}"
@@ -393,9 +430,38 @@ def main(cfg: Config) -> None:
         # ⚠️ B 个 env 并行。它们**逐步同步推进**，所以任一时刻 pad_mask 全批相同；
         #    先结束的从活动集里摘掉，不再进 batch。
         envs, desc = [], None
-        for _ in range(B):
-            e, desc = get_libero_env(task, "openvla", resolution=256)
-            envs.append(e)
+        if wcfg.needs_depth:
+            # ⚠️ 度量臂要深度缓冲，openvla 的 get_libero_env 不开 camera_depths，
+            #    只能自己建。**两者必须给出逐位相同的 RGB** —— 否则度量臂与网格臂
+            #    看到的画面不同，那是个致命混淆（而且不会报错）。见下面的对拍。
+            from libero.libero import get_libero_path
+            from libero.libero.envs import OffScreenRenderEnv
+            bddl = os.path.join(get_libero_path("bddl_files"),
+                                task.problem_folder, task.bddl_file)
+            for _ in range(B):
+                envs.append(OffScreenRenderEnv(
+                    bddl_file_name=bddl, camera_heights=256,
+                    camera_widths=256, camera_depths=True))
+            _, desc = get_libero_env(task, "openvla", resolution=256)
+            if task_id == 0 and cfg.verify_env:
+                ref, _ = get_libero_env(task, "openvla", resolution=256)
+                bad = 0
+                for j in range(cfg.verify_env):
+                    ref.reset(); envs[0].reset()
+                    a = get_libero_image(ref.set_init_state(inits[j]), 224)
+                    b = get_libero_image(envs[0].set_init_state(inits[j]), 224)
+                    bad += int(not np.array_equal(a, b))
+                ref.close()
+                if bad:
+                    raise SystemExit(
+                        f"❌ 开深度渲染改变了 RGB（{bad}/{cfg.verify_env} 个初始状态不一致）。"
+                        "度量臂与网格臂将看到不同的画面 —— 这个混淆与坐标系无关，"
+                        "必须先解决再测。")
+                say(f"# ✓ 开深度渲染不改变 RGB（{cfg.verify_env} 个初始状态逐位一致）")
+        else:
+            for _ in range(B):
+                e, desc = get_libero_env(task, "openvla", resolution=256)
+                envs.append(e)
         prompt = f"In: What action should the robot take to {desc.lower()}?\nOut:"
         ids1 = processor.tokenizer(prompt, return_tensors="pt").input_ids.to(dev)
         t_ep = t_ok = 0
@@ -411,6 +477,7 @@ def main(cfg: Config) -> None:
             mx = (cfg.K - 1) * cfg.stride + 1
             hists = [deque(maxlen=mx) for _ in range(b)]
             feats = [deque(maxlen=mx) for _ in range(b)]
+            dhists = [deque(maxlen=mx) for _ in range(b)]   # 逐帧 patch 深度 (16,16)
             live = list(range(b))
             t = 0
 
@@ -426,6 +493,12 @@ def main(cfg: Config) -> None:
                 for i in live:
                     img = get_libero_image(obs[i], 224)
                     hists[i].appendleft(img)
+                    if wcfg.needs_depth:
+                        # 与训练侧同一套换算与翻转（check_replay.patch_depth），
+                        # 且都是**仿真器真值深度** —— 训练与评测的深度来源一致
+                        dhists[i].appendleft(patch_depth(
+                            envs[i], np.asarray(obs[i][f"{CAM_NAME}_depth"])[..., 0],
+                            True))
                     frames, pad = build_window(hists[i], cfg.K, cfg.stride)
                     pads.append(pad)
                     if cfg.vision_cache:
@@ -459,7 +532,16 @@ def main(cfg: Config) -> None:
                 ids = ids1.repeat(len(live), 1)      # expand 出来的是视图，generate 要连续
                 if cfg.vision_cache:
                     set_vision_feats(state, torch.cat(fe_rows, dim=0))
-                set_batch(state, depth=None, frame_pad_mask=pm)
+                dep = cams = None
+                if wcfg.needs_depth:
+                    # 与 build_window 用同一条取帧规则，两边必须一致
+                    jj = [k * cfg.stride for k in range(cfg.K - 1, -1, -1)]
+                    dep = torch.tensor(np.stack([
+                        np.stack([dhists[i][min(j, len(dhists[i]) - 1)].reshape(-1)
+                                  for j in jj]) for i in live]),
+                        dtype=torch.float32, device=dev)       # (b, K, 256)
+                    cams = [cameras[task_id]] * len(live)
+                set_batch(state, depth=dep, frame_pad_mask=pm, cameras=cams)
                 acts = gen_actions(ids, px)
 
                 if not checked:
@@ -479,7 +561,9 @@ def main(cfg: Config) -> None:
                     for r in range(len(live)):
                         if cfg.vision_cache:
                             set_vision_feats(state, fe_rows[r])
-                        set_batch(state, depth=None, frame_pad_mask=pm[r:r + 1])
+                        set_batch(state, frame_pad_mask=pm[r:r + 1],
+                                  depth=None if dep is None else dep[r:r + 1],
+                                  cameras=None if cams is None else cams[r:r + 1])
                         with torch.no_grad():
                             ref = model.predict_action(
                                 input_ids=ids1, pixel_values=px_rows[r],

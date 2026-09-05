@@ -166,7 +166,9 @@ def main(cfg: Config) -> None:
     dev = "cuda"
 
     # G4/M2 的三份前置产物，缺一不可。**在加载 7B 之前查**。
-    metric = cfg.arm in ("G4", "M2")
+    # ⚠️ M3 只有 PE 侧用度量坐标，但同样要深度与包围盒 —— 用 needs_depth 判，
+    #    别写死臂名（wire.py 的自测就是在这里先炸的）。
+    metric = cfg.arm in ("G4", "M2", "M3")
     depth_cache = cameras = bbox = None
     if metric:
         sd = Path(cfg.subset_dir)
@@ -325,7 +327,9 @@ def main(cfg: Config) -> None:
     t0 = time.time()
     # 视觉块的长度：池化臂是 budget，G1 是 K*256。动作准确率要从这之后切，
     # 切错了 acc 全是噪声 —— 而 loss 一切正常，是个纯静默的指标错。
-    n_vis = cfg.budget if cfg.arm in ("G2", "G3", "G4", "M2") else cfg.K * 256
+    # ⚠️ 用 WireConfig.pools 判，别列臂名 —— 加一臂就漏一处，而这是形状断言，
+    #    漏了会把新臂直接拦在门外（这次加 M3 就撞了三处写死的臂名）。
+    n_vis = cfg.budget if wcfg.pools else cfg.K * 256
 
     def save(step: int) -> None:
         d = adapter_dir / f"step{step}"
