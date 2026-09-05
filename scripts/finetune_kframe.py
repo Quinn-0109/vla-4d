@@ -134,6 +134,12 @@ class Config:
     #    30k 步存 12 个就是 3.7 GB —— 这台机器盘只剩 6 GB，写满了会把长跑断掉。
     #    置 True 保留全部（想从中间某一步分叉续训时才需要）。
     keep_all_optim: bool = False
+    # ⚠️ 中间 checkpoint 的**权重**也会堆盘：30k 步存 12 个 × 155 MB = 1.9 GB/臂，
+    #    四臂就是 7.4 GB。它们的用途只有"崩溃后续训"，而那只需要最近的一两个。
+    #    留最近 keep_last 个 + 每 keep_every 步一个（后者是为了万一要做步数扫描）。
+    #    0 = 全留（旧行为）。⚠️ 只删**中间**点，最新的永远保留。
+    keep_last: int = 2
+    keep_every: int = 10_000
     # G4/M2 用：build_subset.py 的产物目录（depth_cache.npz + bbox.json）
     subset_dir: str = "results/subset/libero_10"
     camera_json: str = "results/tables/camera_libero.json"
@@ -304,6 +310,25 @@ def main(cfg: Config) -> None:
         torch.save({"optimizer": optimizer.state_dict(), "step": step},
                    d / "trainer_state.pt")
         processor.save_pretrained(run_dir)
+        # ⚠️ 权重的清理：本项目已经因为盘满断过一次长跑（G2 停在 32500）。
+        #    **删之前先确认新的已经存好**——顺序反了就是两头落空。
+        if cfg.keep_last:
+            steps = sorted(int(x.name[4:]) for x in adapter_dir.glob("step*")
+                           if x.name[4:].isdigit())
+            keep = set(steps[-cfg.keep_last:])
+            keep |= {x for x in steps if cfg.keep_every and x % cfg.keep_every == 0}
+            keep.add(step)
+            gone = 0
+            for x in steps:
+                if x not in keep:
+                    d_old = adapter_dir / f"step{x}"
+                    gone += sum(f.stat().st_size for f in d_old.rglob("*") if f.is_file())
+                    import shutil
+                    shutil.rmtree(d_old)
+            if gone:
+                print(f"  （清掉中间 checkpoint 权重，省 {gone / 2**30:.1f} GB；"
+                      f"保留 {sorted(keep)}。全留用 --keep_last 0）", flush=True)
+
         if not cfg.keep_all_optim:
             # 新的存好了再删旧的 —— 顺序反过来的话，存盘中途断电就两头落空
             freed = 0
