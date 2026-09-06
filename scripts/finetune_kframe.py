@@ -161,19 +161,51 @@ class Config:
 
 
 def _host_mem() -> dict:
-    """宿主机内存快照，只读 /proc，不引第三方依赖。读不到就返回空。"""
+    """
+    内存快照，只读 /proc 与 /sys，不引第三方依赖。读不到的键就不出现。
+
+    ⚠️ **容器里必须读 cgroup，不能读 /proc/meminfo。** 这台机器 `free` 报
+    1007 GB 总量、958 GB 可用 —— 那是**宿主机**的数，跟我们的配额无关。
+    真正会杀掉进程的是 cgroup 限额，两者能差两个数量级，而拿错了不会报错，
+    只会得到一条永远很健康的曲线。
+    """
     out = {}
     try:
         for line in open("/proc/self/status"):
             if line.startswith("VmRSS:"):
                 out["rss_gb"] = int(line.split()[1]) / 1e6
                 break
-        for line in open("/proc/meminfo"):
-            if line.startswith("MemAvailable:"):
-                out["host_avail_gb"] = int(line.split()[1]) / 1e6
-                break
     except OSError:
         pass
+
+    def _num(path):
+        try:
+            v = open(path).read().strip()
+            return None if v in ("max", "") else int(v)
+        except (OSError, ValueError):
+            return None
+
+    # cgroup v2 → v1 → 都没有才退回 /proc/meminfo（裸机上那才是对的）
+    cur = _num("/sys/fs/cgroup/memory.current")
+    lim = _num("/sys/fs/cgroup/memory.max")
+    if cur is None:
+        cur = _num("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+        lim = _num("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+        if lim is not None and lim > (1 << 50):     # v1 无限额时是个天文数字
+            lim = None
+    if cur is not None:
+        out["cg_used_gb"] = cur / 1e9
+        if lim is not None:
+            out["cg_limit_gb"] = lim / 1e9
+            out["cg_free_gb"] = (lim - cur) / 1e9
+    else:
+        try:
+            for line in open("/proc/meminfo"):
+                if line.startswith("MemAvailable:"):
+                    out["host_avail_gb"] = int(line.split()[1]) / 1e6
+                    break
+        except OSError:
+            pass
     return out
 
 
@@ -534,8 +566,8 @@ def main(cfg: Config) -> None:
                        # ⚠️ **宿主机内存**。G3 在 26970/30000 步被内核 SIGKILL
                        #    （裸 "Killed"，没有 traceback —— CUDA OOM 不长这样），
                        #    而当时只记了显存，事后无从判断是不是 RSS 在爬。
-                       #    两个数都要：rss 是我们自己占的，avail 是整机还剩的
-                       #    （别人的进程、页缓存也会把我们挤掉）。
+                       #    两个数都要：rss 是我们自己占的，cg_* 是**容器配额**
+                       #    （页缓存也算进 cgroup，只看自己的 RSS 会漏掉那一类）。
                        **_host_mem()}
                 with open(metrics_path, "a") as f:
                     f.write(json.dumps(rec) + "\n")
