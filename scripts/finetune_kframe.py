@@ -147,6 +147,8 @@ class Config:
     subset_dir: str = "results/subset/libero_10_s1"
     camera_json: str = "results/tables/camera_libero.json"
     log_steps: int = 10
+    # "auto" = 自己挑本运行目录下最新的、**带优化器状态**的 checkpoint。
+    # 容器重启后重跑同一条命令即可接上，不用人工拼路径。
     resume_from: Optional[str] = None
     bench_only: bool = False
     # ⚠️ 只前向、不更新，用来**复核某个 checkpoint 的 acc**。与 --resume_from 配合：
@@ -317,6 +319,27 @@ def main(cfg: Config) -> None:
         from peft import set_peft_model_state_dict
         from safetensors.torch import load_file
         src = Path(cfg.resume_from)
+        if cfg.resume_from == "auto":
+            # ⚠️ 容器重启会把训练进程一并带走（G3 死在 26970/30000 就是这样：
+            #    cgroup oom_kill=0、磁盘没满，PID 1 的启动时刻正好对上）。
+            #    重启后人工拼路径要挑"最新且**优化器状态还在**"的那个 ——
+            #    `keep_all_optim=False` 只给最新的存 trainer_state.pt，
+            #    上次 G2 就是照着步数挑、挑中一个没有优化器的，当场 FileNotFound。
+            #    所以这里按"有 trainer_state.pt"筛，不是按步数最大。
+            cand = sorted(
+                (int(d.name[4:]) for d in adapter_dir.glob("step*")
+                 if d.name[4:].isdigit() and (d / "trainer_state.pt").exists()),
+                reverse=True)
+            if not cand:
+                have = sorted(d.name for d in adapter_dir.glob("step*"))
+                raise SystemExit(
+                    f"--resume_from auto：{adapter_dir} 下没有带优化器状态的 checkpoint。\n"
+                    f"  现有: {have or '（空）'}\n"
+                    "  （只有最新的那个存 trainer_state.pt；要保留全部就加 "
+                    "--keep_all_optim True）")
+            src = adapter_dir / f"step{cand[0]}"
+            print(f"--resume_from auto → 选中 {src}"
+                  + (f"（跳过了 {cand[1:]}，它们没有优化器状态）" if len(cand) > 1 else ""))
         set_peft_model_state_dict(vla, load_file(src / "adapter_model.safetensors"))
         ck = torch.load(src / "trainer_state.pt", map_location="cpu")
         optimizer.load_state_dict(ck["optimizer"])
