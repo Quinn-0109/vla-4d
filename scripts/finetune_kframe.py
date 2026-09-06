@@ -160,6 +160,23 @@ class Config:
     # fmt: on
 
 
+def _host_mem() -> dict:
+    """宿主机内存快照，只读 /proc，不引第三方依赖。读不到就返回空。"""
+    out = {}
+    try:
+        for line in open("/proc/self/status"):
+            if line.startswith("VmRSS:"):
+                out["rss_gb"] = int(line.split()[1]) / 1e6
+                break
+        for line in open("/proc/meminfo"):
+            if line.startswith("MemAvailable:"):
+                out["host_avail_gb"] = int(line.split()[1]) / 1e6
+                break
+    except OSError:
+        pass
+    return out
+
+
 @draccus.wrap()
 def main(cfg: Config) -> None:
     assert torch.cuda.is_available(), "需要 GPU"
@@ -513,7 +530,13 @@ def main(cfg: Config) -> None:
                        # ⚠️ 这是**本次进程**的墙钟，续训时 t0 重置。
                        #    总时长要把各段相加，别把它当总数读。
                        "steps_per_sec": sps, "session_h": el / 3600,
-                       "peak_gb": torch.cuda.max_memory_allocated() / 1e9}
+                       "peak_gb": torch.cuda.max_memory_allocated() / 1e9,
+                       # ⚠️ **宿主机内存**。G3 在 26970/30000 步被内核 SIGKILL
+                       #    （裸 "Killed"，没有 traceback —— CUDA OOM 不长这样），
+                       #    而当时只记了显存，事后无从判断是不是 RSS 在爬。
+                       #    两个数都要：rss 是我们自己占的，avail 是整机还剩的
+                       #    （别人的进程、页缓存也会把我们挤掉）。
+                       **_host_mem()}
                 with open(metrics_path, "a") as f:
                     f.write(json.dumps(rec) + "\n")
                 bar.set_postfix(loss=f"{rec['loss']:.3f}",
