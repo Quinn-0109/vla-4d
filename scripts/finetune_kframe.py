@@ -200,6 +200,21 @@ def _host_mem() -> dict:
         if lim is not None:
             out["cg_limit_gb"] = lim / 1e9
             out["cg_free_gb"] = (lim - cur) / 1e9
+        # ⚠️ **`memory.current` 会贴着限额，而那多半无害。** 它把页缓存也算进去，
+        #    读 TFRecord 会把 cache 填满；page cache 可回收，不触发 OOM。
+        #    实测 M2 在 step27650 报 126/129 GB，而同一份代码的 G3 在早期只有 26 —
+        #    差的全是 cache。**会杀死进程的是 anon**（我们自己分配的那部分），
+        #    所以两者必须分开记，否则这条曲线永远在报警、等于没报。
+        for path, keys in (("/sys/fs/cgroup/memory.stat", ("anon", "file")),
+                           ("/sys/fs/cgroup/memory/memory.stat", ("rss", "cache"))):
+            try:
+                st = dict(l.split()[:2] for l in open(path) if len(l.split()) >= 2)
+            except OSError:
+                continue
+            if keys[0] in st:
+                out["cg_anon_gb"] = int(st[keys[0]]) / 1e9
+                out["cg_cache_gb"] = int(st[keys[1]]) / 1e9
+                break
     else:
         try:
             for line in open("/proc/meminfo"):
