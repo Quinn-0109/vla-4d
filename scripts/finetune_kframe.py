@@ -1,5 +1,6 @@
 """
-K 帧微调 —— 六组对照共用这一个脚本，差别只在 `--arm`。
+K 帧微调 —— **七组**对照共用这一个脚本，差别只在 `--arm`。
+（G0/G1/G2 + 2×2 的四格 G3/M3/M2/G4）
 
     python scripts/finetune_kframe.py --arm G2 --bench_only True   # 先测吞吐
     python scripts/finetune_kframe.py --arm G2 --max_steps 30000
@@ -621,7 +622,7 @@ def main(cfg: Config) -> None:
                 for tgt in (5_000, 30_000):
                     h = tgt * el / step / 3600
                     print(f"  跑 {tgt:>6} 步需要 {h:>5.1f} 小时（约 ¥{h * 2:.0f}）")
-                print("\n五组主线加起来是这个数的五倍，先看清楚再开长跑。")
+                print("\n2×2 四格加起来是这个数的四倍，先看清楚再开长跑。")
                 return
 
             if step > start_step and step % cfg.save_steps == 0:

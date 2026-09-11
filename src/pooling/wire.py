@@ -11,19 +11,26 @@
     M2  K=8，跨帧池化，池化坐标 (t,x,y,z)，PE 却用 (t,h,w)    ← 错配臂
     M3  K=8，跨帧池化，池化坐标 (t,h,w)，PE 却用 (t,x,y,z)    ← 错配臂（M2 的镜像）
 
-四个挂载点（transformers 4.40.1，见 `_patch_rope` 的版本约定）：
+**三个**挂载点（transformers 4.40.1，见 `_patch_rope` 的版本约定）：
 
     vision_backbone.forward   (B, K*6, H, W) → (B, K*256, D_vis)
     projector.forward         投影后池化到 N 个 token，并算出 PE 要用的坐标
     每层 attention.rotary_emb 换成我们的 (cos, sin)
-    language_model.forward    补上 position_ids —— 官方传的是 None
+
+⚠️ 早先的注释里还有第四个「`language_model.forward` 补上 position_ids」——
+   **那个挂点不存在，从来没有实现过**。4.40.1 的 `LlamaAttention.forward` 会把
+   `position_ids` 直接传给 `rotary_emb`，所以由 `_Rope.forward` 自己收下就够了
+   （见那里的 KV cache 分支）。指着一个不存在的挂点去读代码，只会得出
+   "这段逻辑丢了"的错误结论。
 
 ⚠️ **`set_batch()` 必须在每次 forward 前调用**，把这一批的深度、补帧掩码、
    task_id 交进来（它们不在 `pixel_values` 里，也进不了 `forward` 的签名）。
    忘了调 = 拿上一批的深度算这一批的坐标，**不会报错**。所以 state 是一次性的：
    消费掉就作废，下一次 forward 拿不到就抛异常。
 
-`python src/pooling/wire.py` 跑 9 项自检（桩模型，不加载 7B）。
+`python src/pooling/wire.py` 跑 **9 组、共 14 项**自检（桩模型，不加载 7B）。
+编号带字母的是同一组里补上的（3b/3c/3d 是 2×2 的四格与轴数不变量，
+7b/7c 是按臂分派的判据），所以 "n/9" 里的 9 指组数不是项数。
 """
 
 from __future__ import annotations
@@ -193,7 +200,8 @@ def _pool_and_coords(emb: torch.Tensor, cfg: WireConfig, bt: _Batch):
     """
     投影后的 (B, K*256, D) → 池化后的 (B, N, D) + PE 侧要用的东西。
 
-    返回 (emb_out, pos1d, coord_pe, is_visual_len)。
+    返回 `(emb_out, pos1d, coord_pe, mask)` —— 第四项是 `coord_bin_pool` 的
+    槽有效掩码（G0/G1 不池化时为 None），**不是**早先注释里写的 `is_visual_len`。
     """
     b, _, _ = emb.shape
     k, dev = cfg.K, emb.device
@@ -245,7 +253,11 @@ def _pool_and_coords(emb: torch.Tensor, cfg: WireConfig, bt: _Batch):
 
 
 def _grid_centroid(assign: torch.Tensor, gc: torch.Tensor, n_slots: int) -> torch.Tensor:
-    """每个输出槽里成分 patch 的 (t,h,w) 算术均值。M2 的 PE 侧坐标。"""
+    """
+    每个输出槽里成分 patch 坐标的算术均值。**两个错配臂共用它**：
+    M2 传网格坐标（PE 侧要 (t,h,w)），M3 传度量坐标（PE 侧要 (t,x,y,z)）。
+    函数本身对坐标张量的轴数通用，所以两臂不存在"谁被特殊照顾"。
+    """
     b, t = assign.shape
     out = gc.new_zeros(b, n_slots, gc.shape[-1])
     for i in range(b):
@@ -350,7 +362,7 @@ def _patch_rope(model, cfg: WireConfig, state: _State) -> None:
 
 
 def wire(model, cfg: WireConfig) -> _State:
-    """挂上四个点，返回 state。训练循环每步调 `set_batch(state, ...)`。"""
+    """挂上三个点，返回 state。训练循环每步调 `set_batch(state, ...)`。"""
     state = _State()
     state.cfg = cfg
     state.orig = {

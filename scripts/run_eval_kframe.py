@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 """
-K 帧评测 —— 六组对照共用，差别只在 `--arm`。
+K 帧评测 —— **七组**对照共用，差别只在 `--arm`。
+（G0/G1/G2 + 2×2 的四格 G3/M3/M2/G4；M3 是 2026-09 补的，见 `docs/06` §1.3）
 
     python scripts/run_eval_kframe.py --arm G2 \
         --adapter runs/G2+.../adapter/step30000 --num_trials_per_task 50
