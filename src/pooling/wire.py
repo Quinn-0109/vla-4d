@@ -371,6 +371,21 @@ def wire(model, cfg: WireConfig) -> _State:
         "rotary": [l.self_attn.rotary_emb
                    for l in model.language_model.model.layers],
     }
+    if cfg.arm == "G1":
+        # ⚠️ **G1 的定义在本文件内部自相矛盾，跑之前必须先定。**
+        #   · 模块 docstring 的表写「G1 … 不池化，**1D RoPE**」
+        #   · 而 `_pool_and_coords` 的非池化分支注释写「G1 用 (t,h,w)」，
+        #     且 `wire()` 只排除 G0 —— 实际跑出来 G1 是 **3 轴 RoPE**，不是 1D
+        #   两种定义回答的是不同问题：1D 的 G1 = 「OpenVLA 喂 8 倍 token」的
+        #   纯上限参考；3 轴的 G1 = 「不池化 + 时空 PE」，那已经是另一个方法。
+        #   G1 目前被搁置（137 h，用 K=2 不池化臂替代，`docs/06` §5），
+        #   所以这里直接拦下，而不是替它选一个 —— **选错了不会报错**，
+        #   只会得到一个名字叫"上限参考"、实际在测别的东西的对照。
+        raise NotImplementedError(
+            "G1 的 PE 定义未决：文档说 1D，代码给的是 3 轴 (t,h,w)。\n"
+            "  想要纯上限参考（OpenVLA + 8 倍 token）→ 让它走 G0 那条不挂 rope 的分支；\n"
+            "  想要『不池化 + 时空 PE』→ 保留现状，但它不再是『上限参考』，\n"
+            "  表里的角色和 README 都要改。先在 docs/06 里定下来再放开这里。")
     _patch_vision(model, cfg.K, state)
     if cfg.arm != "G0":
         _patch_projector(model, cfg, state)

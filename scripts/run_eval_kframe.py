@@ -344,6 +344,8 @@ def main(cfg: Config) -> None:
               + (f"--{cfg.run_note}" if cfg.run_note else ""))
     Path(cfg.local_log_dir).mkdir(parents=True, exist_ok=True)
     log = open(os.path.join(cfg.local_log_dir, run_id + ".txt"), "w")
+    # 逐局结果：配对检验的唯一输入。与主日志同名、扩展名不同，分段跑各写各的。
+    per_ep = open(os.path.join(cfg.local_log_dir, run_id + ".episodes.jsonl"), "w")
     print(f"日志: {log.name}")
 
     def say(msg: str) -> None:
@@ -466,6 +468,10 @@ def main(cfg: Config) -> None:
         prompt = f"In: What action should the robot take to {desc.lower()}?\nOut:"
         ids1 = processor.tokenizer(prompt, return_tensors="pt").input_ids.to(dev)
         t_ep = t_ok = 0
+        # ⭐ **逐局结果必须落盘。** 配对检验（McNemar）要的是"同一初始状态上
+        #    四臂各自成没成功"，只有 task 级的成功数**恢复不出**配对表 ——
+        #    聚合之后 b/c 两个不一致格就永远拿不回来了。
+        #    四臂跑同一批确定性初始状态，(task_id, episode_idx) 就是配对键。
 
         for lo_ep in tqdm.tqdm(range(0, cfg.num_trials_per_task, B),
                                desc=f"task{task_id}", leave=False):
@@ -475,6 +481,7 @@ def main(cfg: Config) -> None:
             for i, ep in enumerate(eps):
                 envs[i].reset()
                 obs.append(envs[i].set_init_state(inits[ep]))
+            ok_eps = set()                    # 本批里成功的 episode 下标
             mx = (cfg.K - 1) * cfg.stride + 1
             hists = [deque(maxlen=mx) for _ in range(b)]
             feats = [deque(maxlen=mx) for _ in range(b)]
@@ -542,7 +549,12 @@ def main(cfg: Config) -> None:
                                   for j in jj]) for i in live]),
                         dtype=torch.float32, device=dev)       # (b, K, 256)
                     cams = [cameras[task_id]] * len(live)
-                set_batch(state, depth=dep, frame_pad_mask=pm, cameras=cams)
+                # ⚠️ `cameras` 必须是可迭代的：`set_batch` 里是 `list(cameras)`，
+                #    传 None 会抛 TypeError。无深度臂（G0/G1/G2/G3）走到这里
+                #    `cams` 就是 None —— **这条路径此前从未被端到端跑到过**，
+                #    四格评测的第一臂 G3 会当场崩。用 () 而不是把 set_batch 改宽松：
+                #    "没给相机" 和 "给了 None" 是两回事，后者该报错。
+                set_batch(state, depth=dep, frame_pad_mask=pm, cameras=cams or ())
                 acts = gen_actions(ids, px)
 
                 if not checked:
@@ -592,6 +604,7 @@ def main(cfg: Config) -> None:
                     if done:
                         t_ok += 1
                         total_ok += 1
+                        ok_eps.add(eps[i])
                     else:
                         nxt.append(i)
                 live = nxt
@@ -599,6 +612,11 @@ def main(cfg: Config) -> None:
 
             t_ep += b
             total_ep += b
+            for ep in eps:
+                per_ep.write(json.dumps({"arm": cfg.arm, "task_id": int(task_id),
+                                         "episode": int(ep),
+                                         "success": int(ep in ok_eps)}) + "\n")
+            per_ep.flush()
             # ⚠️ **碎片，不是泄漏。** `live` 随着 episode 陆续成功而缩小，
             #    batch 形状一路 8→7→…→1，每种形状都让缓存分配器切出不同大小的块；
             #    跑满 200 局后 `1.07 GiB reserved but unallocated` 却申请不到
@@ -639,6 +657,9 @@ def main(cfg: Config) -> None:
                  f"   —— 不是判据数；把各段的成功数相加、总局数相加才是")
     print(final)
     log.write(final + "\n")
+    per_ep.close()
+    print(f"逐局结果 -> {os.path.join(cfg.local_log_dir, run_id + '.episodes.jsonl')}"
+          f"（{cfg.arm}，配对检验用）")
     log.close()
     print(json.dumps({"arm": cfg.arm, "suite": cfg.task_suite_name,
                       "n": total_ep, "success": total_ok}))
