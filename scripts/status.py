@@ -97,7 +97,7 @@ def main() -> None:
 
     print()
     if done_all:
-        print("四格全部训完 → 下一步是四臂满量评测（各 2.6 h）与配对分析。")
+        eval_status()
         return
 
     # 下一步该动哪一臂：先补断掉的（丢的步数最少），再开没起过的
@@ -123,6 +123,57 @@ def main() -> None:
         print(f"  起来后确认：grep -E '✓ 形状|PE |留存率' results/logs/{todo}.log")
         print(f"  {todo} 必须打出 **PE {PE_AXES[todo]} 轴** —— "
               "错配臂与它的同池化伙伴在日志里其余部分完全一样。")
+
+
+def eval_status() -> None:
+    """
+    训练全绿之后看评测。日志是 `results/logs/EVAL-<suite>-<arm>-...txt`，
+    每个 task 一行、结尾一行 FINAL 或 PARTIAL。
+
+    ⚠️ **PARTIAL 不是判据数**（脚本自己也这么写）：它是只跑了部分 task 的合计，
+       判据认的是满 10 task。这里照原样显示，不把它当成绩。
+    """
+    live_eval = None
+    try:
+        ps = subprocess.run(["ps", "-eo", "pid=,args="], capture_output=True,
+                            text=True, timeout=10).stdout
+        for line in ps.splitlines():
+            if "run_eval_kframe" in line and "ps -eo" not in line:
+                parts = line.split()
+                a = parts[parts.index("--arm") + 1] if "--arm" in parts else "?"
+                live_eval = (a, parts[0])
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+    print("四格全部训完。评测：\n")
+    logs = (sorted(Path("results/logs").glob("EVAL-*.txt"))
+            if Path("results/logs").is_dir() else [])
+    final = {}                      # arm → FINAL 那一行（只有满 10 task 的才进来）
+    for arm in ARMS:
+        cand = [f for f in logs if f"-{arm}-" in f.name and "sub255" in f.name]
+        if not cand:
+            print(f"  {arm:<4}" + ("⏳ 跑中（还没写日志）"
+                                   if live_eval and live_eval[0] == arm else "— 未评"))
+            continue
+        txt = max(cand, key=lambda f: f.stat().st_mtime).read_text().splitlines()
+        fin = [l for l in txt if l.startswith(("FINAL", "PARTIAL"))]
+        tasks = [l for l in txt if l.startswith("task ")]
+        if fin and fin[-1].startswith("FINAL"):
+            final[arm] = fin[-1]
+            print(f"  {arm:<4}✅ {fin[-1]}")
+        elif live_eval and live_eval[0] == arm:
+            tail = f"  {tasks[-1].split('累计')[-1].strip()}" if tasks else ""
+            print(f"  {arm:<4}⏳ 跑中 pid={live_eval[1]}  {len(tasks)}/10 task{tail}")
+        else:
+            fix = f"  → 补跑 --start_task {len(tasks)}" if tasks else ""
+            print(f"  {arm:<4}❌ 断了  {len(tasks)}/10 task{fix}")
+
+    print()
+    if len(final) == len(ARMS):
+        print("四条 FINAL 齐了 → 配对（McNemar）分析。")
+        print("⚠️ 主分析是 **9-task**（事前登记），10-task 只供与文献并列。")
+    else:
+        print("⚠️ 只有满 10 task 的 FINAL 才是判据数 —— PARTIAL 是残缺合计，不能当成绩。")
 
 
 if __name__ == "__main__":
