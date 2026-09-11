@@ -159,6 +159,15 @@ class Config:
     eval_only: bool = False
     eval_steps: int = 100                      # 只前向时跑几个微批
     micro: int = 0                             # 0 = 用 MICRO 表；>0 覆盖，累积自动配平
+    # ⭐ **跨臂拉平有效 token 数。** 不给时各臂用满自己能填的槽：真值深度实测
+    #    G3/M3 用 242 个、M2/G4 用 256 个，剩下的是**全零向量**，仍占位仍被注意 ——
+    #    于是 G4−G3 里混进 5.5% 的预算差，而 protocol 写的是"N=256 全组相同"。
+    #    给定时 `coord_bin_pool` 只保留 patch 数最多的 N 个箱，输出长度就是 N，
+    #    **一个空槽都没有**，四臂严格同预算。
+    #    ⚠️ **默认 0（关）是刻意的**：四格已按"不拉平"训完，打开它做评测就是
+    #    训练/评测不一致 —— 那比这个偏差本身更糟。要用就四臂一起重训
+    #    （~100 h，见 `docs/05` §13.5 的选项 B）。
+    enforce_n: int = 0
     run_id_note: Optional[str] = None
     # fmt: on
 
@@ -324,7 +333,7 @@ def main(cfg: Config) -> None:
     # ⚠️ 接线必须在 peft 包装**之后**：get_peft_model 会代理属性，
     #    包装前挂上去的 forward 会被代理层绕过（挂了等于没挂，且不报错）。
     wcfg = WireConfig(arm=cfg.arm, K=cfg.K, budget=cfg.budget, n_t=cfg.n_t,
-                      bbox=bbox)
+                      bbox=bbox, enforce_n=cfg.enforce_n or None)
     state = wire(vla.base_model.model, wcfg)
     print(f"已接线: arm={cfg.arm}  K={cfg.K}  N={cfg.budget}  n_t={cfg.n_t}")
 
@@ -417,7 +426,9 @@ def main(cfg: Config) -> None:
     # 切错了 acc 全是噪声 —— 而 loss 一切正常，是个纯静默的指标错。
     # ⚠️ 用 WireConfig.pools 判，别列臂名 —— 加一臂就漏一处，而这是形状断言，
     #    漏了会把新臂直接拦在门外（这次加 M3 就撞了三处写死的臂名）。
-    n_vis = cfg.budget if wcfg.pools else cfg.K * 256
+    # ⚠️ 视觉块长度 = 实际输出槽数。开了 --enforce_n 就是它，不是 budget ——
+    #    写死 budget 会让 logits 的切片错位，而那**不报错**，只是 acc 变成噪声。
+    n_vis = ((wcfg.enforce_n or cfg.budget) if wcfg.pools else cfg.K * 256)
 
     def save(step: int) -> None:
         d = adapter_dir / f"step{step}"

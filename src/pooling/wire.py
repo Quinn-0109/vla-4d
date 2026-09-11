@@ -152,6 +152,7 @@ class _State:
         self.rope: Optional[tuple] = None
         self.rope_calls: int = 0        # 我们的 rotary_emb 被真正调用了几次
         self.cfg = None                 # wire() 时存下，assert_arm_wiring 要按臂判
+        self.slot_mask = None           # 上一次池化的槽有效掩码，见 _patch_projector
         self.pe_axes_seen: int = 0      # 上一次 forward 里 PE 坐标真的是几轴
         self.orig: dict = {}            # 原始实现，unwire 时还回去
         # 32 层用的是同一条序列，cos/sin 只算一次（build_rope 不便宜）
@@ -276,7 +277,16 @@ def _patch_projector(model, cfg: WireConfig, state: _State) -> None:
     def wrapped(img_patches, *a, **kw):
         emb = orig(img_patches, *a, **kw)                 # (B, K*256, D_llm)
         bt = state.take()
-        emb, pos1d, coord_pe, _ = _pool_and_coords(emb, cfg, bt)
+        emb, pos1d, coord_pe, slot_mask = _pool_and_coords(emb, cfg, bt)
+        # ⚠️ **空槽此前被当成有效视觉 token。** `_pool_and_coords` 返回的
+        #    槽有效掩码曾经被丢掉（写成 `_`），`_Rope` 转手传 `ones_like`，
+        #    于是 n_used < budget 时尾部的**全零向量**照样进序列、照样被注意。
+        #    更糟的是各臂的空槽数不同（真值深度实测 G3/M3 用 242 槽、
+        #    M2/G4 用 256），G4−G3 里因此混进 5.5% 的预算差。
+        #    治本是 `--enforce_n` 把有效槽数拉平（那时根本没有空槽）；
+        #    这里把掩码接上是第二道：万一某个样本 n_used < enforce_n，
+        #    至少 RoPE 侧知道哪些槽是空的。
+        state.slot_mask = slot_mask
 
         # ⚠️ 这里**只准备视觉部分**，整条序列留到 `_Rope.forward` 再拼。
         #    投影器看不到 `input_ids`，文本有多长它不知道；早先在这里写死
@@ -331,8 +341,11 @@ def _patch_rope(model, cfg: WireConfig, state: _State) -> None:
                     f"序列长 {need} 比 1+视觉 {1 + n_vis} 还短 —— 池化输出与"
                     "实际喂进 LLM 的视觉块对不上，先查 projector 那一步。")
             if state.rope_cache_key != need:
+                sm = state.slot_mask
+                if sm is None:
+                    sm = torch.ones_like(pos1d, dtype=torch.bool)
                 p1, c4, isvis = assemble(
-                    c_norm, pos1d, torch.ones_like(pos1d, dtype=torch.bool),
+                    c_norm, pos1d, sm.to(pos1d.device),
                     n_text=n_text, k=cfg.K)
                 state.rope_cache = build_rope(p1, c4, isvis, cfg.head_dim, plan)
                 state.rope_cache_key = need

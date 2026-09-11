@@ -76,6 +76,15 @@ class Config:
     stride: int = 16
     budget: int = 256
     n_t: int = 2
+    # ⭐ **跨臂拉平有效 token 数。** 不给时各臂用满自己能填的槽：真值深度实测
+    #    G3/M3 用 242 个、M2/G4 用 256 个，剩下的是**全零向量**，仍占位仍被注意 ——
+    #    于是 G4−G3 里混进 5.5% 的预算差，而 protocol 写的是"N=256 全组相同"。
+    #    给定时 `coord_bin_pool` 只保留 patch 数最多的 N 个箱，输出长度就是 N，
+    #    **一个空槽都没有**，四臂严格同预算。
+    #    ⚠️ **默认 0（关）是刻意的**：四格已按"不拉平"训完，打开它做评测就是
+    #    训练/评测不一致 —— 那比这个偏差本身更糟。要用就四臂一起重训
+    #    （~100 h，见 `docs/05` §13.5 的选项 B）。
+    enforce_n: int = 0
 
     adapter: Optional[str] = None              # LoRA adapter 目录；None = 用底座
     vla_path: str = "openvla/openvla-7b"
@@ -272,7 +281,7 @@ def main(cfg: Config) -> None:
             flipped=bool(v.get("flipped", True))) for k, v in cams_raw.items()}
         print(f"度量坐标：包围盒 {bp}，相机 {len(cameras)} 台")
     wcfg = WireConfig(arm=cfg.arm, K=cfg.K, budget=cfg.budget, n_t=cfg.n_t,
-                      bbox=bbox)
+                      bbox=bbox, enforce_n=cfg.enforce_n or None)
 
     processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
     model = AutoModelForVision2Seq.from_pretrained(

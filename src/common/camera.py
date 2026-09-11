@@ -48,6 +48,12 @@ class Camera:
     pos: torch.Tensor                 # (3,) 相机在世界系的位置
     rot: torch.Tensor                 # (3,3) 相机系 -> 世界系
     flipped: bool = True              # 深度图是否已 180° 翻转（见约定 2）
+    # ⭐ 视觉侧的中心裁剪比例。给了它，`patch_uv` 就把 patch 中心映回原图，
+    #    与 RGB 看到的区域对齐（`docs/05` §13.5 ③）。
+    #    ⚠️ **默认 None（不裁）是刻意的**：四格已按"不对齐"训完，
+    #    只在评测侧打开就是训练/评测不一致。要用就四臂一起重训，
+    #    且 `patch_depth` 必须传同一个值 —— 两边都改才有意义。
+    crop_scale: float | None = None
 
     # ---------------------------------------------------------------- 构造
     @staticmethod
@@ -108,15 +114,35 @@ class Camera:
         return torch.stack([u, v], dim=-1), depth
 
     # ---------------------------------------------------------------- patch 级
-    def patch_uv(self, device=None) -> torch.Tensor:
+    def patch_uv(self, device=None, crop_scale: float | None = None) -> torch.Tensor:
         """
         (GRID*GRID, 2) 每个 patch 中心的像素坐标，行优先，**已按 `flipped` 翻回原始朝向**。
 
         `flipped=True` 时缓存里的 (r, c) 对应原始图像的 (H-1-r*, W-1-c*)——
         180° 翻转就是两个轴都倒过来。
+
+        `crop_scale`：**视觉侧若做了中心裁剪，这里必须给同一个值。**
+        RGB 走 `center_crop_resize(crop_scale=0.9)` 之后，网络看到的 patch (r,c)
+        对应原图的是裁剪框内的一小块，而射线若按完整 224 算，
+        两者就指向不同的地方 —— 实测错位 ±0.38 个 patch，**不报任何错**。
+        缺省 None = 不裁（与 2026-09 之前的行为逐位相同）。
         """
-        r = torch.arange(GRID, dtype=torch.float64, device=device) * PATCH + (PATCH - 1) / 2
-        c = torch.arange(GRID, dtype=torch.float64, device=device) * PATCH + (PATCH - 1) / 2
+        crop_scale = self.crop_scale if crop_scale is None else crop_scale
+        if crop_scale is None:
+            r = torch.arange(GRID, dtype=torch.float64, device=device) * PATCH + (PATCH - 1) / 2
+            c = r.clone()
+        else:
+            import numpy as np
+
+            from common.imgproc import crop_src_coords
+            # patch 中心在**裁剪后 224 图**里的位置 → 映回原图坐标
+            j = np.arange(GRID) * PATCH + (PATCH - 1) / 2
+            src = crop_src_coords(self.height, 224, crop_scale)
+            r = torch.as_tensor(np.interp(j, np.arange(224), src),
+                                dtype=torch.float64, device=device)
+            src_w = crop_src_coords(self.width, 224, crop_scale)
+            c = torch.as_tensor(np.interp(j, np.arange(224), src_w),
+                                dtype=torch.float64, device=device)
         vv, uu = torch.meshgrid(r, c, indexing="ij")
         if self.flipped:
             uu = (self.width - 1) - uu

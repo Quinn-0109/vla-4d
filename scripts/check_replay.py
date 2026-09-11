@@ -142,8 +142,16 @@ def demo_all_states(task, demo_key: str):
         return np.asarray(f["data"][demo_key]["states"])
 
 
-def patch_depth(env, d: np.ndarray, flip: bool, grid: int = 16, patch: int = 16):
-    """深度缓冲 → 米 → patch 级均值 (16,16)。与 depth_diag 同一套换算与翻转。"""
+def patch_depth(env, d: np.ndarray, flip: bool, grid: int = 16, patch: int = 16,
+                crop_scale: float | None = None):
+    """
+    深度缓冲 → 米 → patch 级均值 (16,16)。与 depth_diag 同一套换算与翻转。
+
+    `crop_scale`：**视觉侧若做了中心裁剪，这里必须给同一个值。**
+    以前这里把整张深度图 resize 到 224，而 RGB 是裁过再拉回的 ——
+    同一个 (r,c)，两者看的不是同一块地方（`docs/05` §13.5 ③）。
+    缺省 None = 不裁，与 2026-09 之前逐位相同。
+    """
     from PIL import Image
     try:
         from robosuite.utils.camera_utils import get_real_depth_map
@@ -155,8 +163,23 @@ def patch_depth(env, d: np.ndarray, flip: bool, grid: int = 16, patch: int = 16)
         m = near / (1.0 - d * (1.0 - near / far))
     if flip:
         m = m[::-1, ::-1]
-    m = np.array(Image.fromarray(m.astype(np.float32), mode="F")
-                 .resize((224, 224), Image.BILINEAR))
+    if crop_scale is None:
+        m = np.array(Image.fromarray(m.astype(np.float32), mode="F")
+                     .resize((224, 224), Image.BILINEAR))
+    else:
+        # 与 RGB 同一份裁剪几何 —— 双线性重采样到裁剪框内的 224×224
+        from common.imgproc import crop_src_coords
+        m = m.astype(np.float32)
+        ry = crop_src_coords(m.shape[0], 224, crop_scale)
+        rx = crop_src_coords(m.shape[1], 224, crop_scale)
+
+        def _lerp1(a, r, axis):
+            lo = np.clip(np.floor(r).astype(int), 0, a.shape[axis] - 1)
+            hi = np.clip(lo + 1, 0, a.shape[axis] - 1)
+            f = (r - lo).reshape([-1 if i == axis else 1 for i in range(a.ndim)])
+            return np.take(a, lo, axis) * (1 - f) + np.take(a, hi, axis) * f
+
+        m = _lerp1(_lerp1(m, ry, 0), rx, 1)
     return m.reshape(16, 14, 16, 14).transpose(0, 2, 1, 3).reshape(16, 16, -1).mean(-1)
 
 

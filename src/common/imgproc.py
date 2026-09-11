@@ -23,6 +23,24 @@ import numpy as np
 CROP_SCALE = 0.9        # = RLDS random_resized_crop 的 scale 下界（也是上界）
 
 
+def crop_src_coords(n_in: int, out: int, crop_scale: float = CROP_SCALE) -> np.ndarray:
+    """
+    输出像素 j（0..out-1）在**原图**里对应的坐标。裁剪几何的**唯一定义**。
+
+    ⚠️ 这个函数存在的全部理由：RGB、深度、射线三条路径以前各写一遍裁剪，
+       结果只有 RGB 真的裁了 —— `patch_depth` 把整张深度图 resize、
+       `Camera.patch_uv` 按完整 224 算 patch 中心。于是同一个 (r,c)，
+       RGB 看的是原图的一处、深度与射线说的是另一处，
+       实测 patch 中心错位 **±0.38 个 patch**（crop_scale=0.9，224 图）。
+       **它不报任何错**，只是给度量坐标加噪声。
+       三处现在都从这里取几何，走散了就是同时走散。
+    """
+    side = float(np.clip(np.sqrt(crop_scale), 0.0, 1.0))
+    off = (1.0 - side) / 2.0
+    scale = side * (n_in - 1) / (out - 1) if out > 1 else 0.0
+    return off * (n_in - 1) + np.arange(out, dtype=np.float64) * scale
+
+
 def center_crop_resize(img, crop_scale: float = CROP_SCALE, out: int = None):
     """
     (H, W, 3) uint8 → 中心裁 `sqrt(crop_scale)` 边长、再双线性拉回 (out, out)。
@@ -77,6 +95,17 @@ def _selftest() -> None:
     assert got.mean() < marked.mean() / 4, (got.mean(), marked.mean())
     assert b >= 5, b
     print(f"✅ 3/4 裁掉的是外围 {b} 像素带（{marked.mean():.1f} → {got.mean():.1f}）")
+
+    # 裁剪几何只有一份定义 —— center_crop_resize 内部的 axis() 与对外导出的
+    # crop_src_coords 必须逐位相同，否则深度/射线又会与 RGB 走散
+    side = float(np.clip(np.sqrt(CROP_SCALE), 0.0, 1.0))
+    off = (1.0 - side) / 2.0
+    for n_in, out in ((224, 224), (256, 224), (224, 112)):
+        scale = (side) * (n_in - 1) / (out - 1) if out > 1 else 0.0
+        ref = off * (n_in - 1) + np.arange(out, dtype=np.float64) * scale
+        assert np.allclose(ref, crop_src_coords(n_in, out)), (n_in, out)
+    d = crop_src_coords(224, 224) - np.arange(224)
+    print(f"✅ 3b/4 裁剪几何单一来源；224→224 的位移 {d.min():+.2f}…{d.max():+.2f} px")
 
     try:
         import tensorflow as tf
