@@ -16,6 +16,9 @@ results/figures/*
 !results/logs/
 results/logs/*
 !results/logs/*.txt
+# 逐局结果：配对检验（McNemar）的唯一输入，聚合之后再也恢复不出来。
+# 每臂 500 行 JSON，几十 KB —— 和日志同属"结论本身"，必须版本化。
+!results/logs/*.jsonl
 
 rollouts/
 runs/                 # 微调输出: adapter + 优化器状态 + metrics.jsonl

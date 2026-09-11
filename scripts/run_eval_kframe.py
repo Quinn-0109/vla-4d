@@ -119,6 +119,7 @@ class Config:
     seed: int = 7                              # 沿用阶段 0
     local_log_dir: str = "results/logs"
     run_note: str = ""
+    overwrite: bool = False                    # 允许覆盖已有 FINAL 的同名日志
     # fmt: on
 
 
@@ -348,11 +349,30 @@ def main(cfg: Config) -> None:
     #    段号不进 run_id 的话，接着跑 task 4-9 会把 task 0-3 的记录直接覆盖掉。
     _seg = (f"-t{cfg.start_task}_{cfg.end_task}"
             if (cfg.start_task or cfg.end_task >= 0) else "")
+    # ⚠️ **凡是会改变这个数的东西，都必须进文件名。** 原来只有
+    #    suite/arm/K/stride/seed/note —— 于是换 checkpoint、换 --eval_batch、
+    #    换 --budget/--n_t/--enforce_n 重跑，会**以 "w" 模式覆盖掉上一次的结果**，
+    #    而日志正是这些数字的唯一出处（results/ 只在训练机上有一份）。
+    #    step 取 adapter 目录名：runs/<exp>/adapter/step30000 → "step30000"。
+    _step = Path(cfg.adapter).name if cfg.adapter else "base"
+    _extra = f"-{_step}-b{cfg.eval_batch}-N{cfg.budget}-nt{cfg.n_t}"
+    if cfg.enforce_n:
+        _extra += f"-e{cfg.enforce_n}"
     run_id = (f"EVAL-{cfg.task_suite_name}-{cfg.arm}-K{cfg.K}s{cfg.stride}"
-              f"-seed{cfg.seed}{'' if cfg.center_crop else '-nocrop'}{_seg}"
+              f"-seed{cfg.seed}{'' if cfg.center_crop else '-nocrop'}{_extra}{_seg}"
               + (f"--{cfg.run_note}" if cfg.run_note else ""))
     Path(cfg.local_log_dir).mkdir(parents=True, exist_ok=True)
-    log = open(os.path.join(cfg.local_log_dir, run_id + ".txt"), "w")
+    _txt = Path(cfg.local_log_dir) / (run_id + ".txt")
+    # 第二道：同名且已经跑完（有 FINAL）的日志不许静默盖掉。
+    if _txt.is_file() and any(l.startswith("FINAL") for l in
+                              _txt.read_text(errors="ignore").splitlines()):
+        if not cfg.overwrite:
+            raise SystemExit(
+                f"{_txt} 已经有完整结果（FINAL）。\n"
+                "  这次运行的配置与它完全相同，跑出来只会覆盖掉那份数字。\n"
+                "  想重跑就加 --overwrite True；想留两份就换 --run_note。")
+        print(f"⚠️ --overwrite：将覆盖已完成的 {_txt.name}")
+    log = open(_txt, "w")
     # 逐局结果：配对检验的唯一输入。与主日志同名、扩展名不同，分段跑各写各的。
     per_ep = open(os.path.join(cfg.local_log_dir, run_id + ".episodes.jsonl"), "w")
     print(f"日志: {log.name}")

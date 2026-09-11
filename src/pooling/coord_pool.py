@@ -117,6 +117,7 @@ def _resolve_bins(
     n_group: tuple[int, ...],
     n_t: int | None = None,
     extent: list[float] | torch.Tensor | None = None,
+    scan_window: int = 0,
 ) -> list[int]:
     """
     确定每个轴分几个箱。**这是本模块唯一的"超参"，而它由规则定死、不可调。**
@@ -137,7 +138,25 @@ def _resolve_bins(
     拉平后公共预算被砍掉四分之三，且**不报任何错**，只会让所有臂一起变弱、
     差异被压向 0。
 
-    二分搜索没有这个毛病：占用数随 s 单调不减，跨过平台不需要"每一步都有进展"。
+    ⚠️⚠️ **"占用数随 s 单调不减"是错的 —— 有数值反例。** 不同 `res` 的网格
+    **不嵌套**（箱边是 `floor(q * nb)`，nb 一变边就整体挪），所以细化会把原本
+    分在两格的点重新并到一起。随机均匀点实测 **400/400 个样本**都出现过下降，
+    例如 res=13 占 190 → res=14 占 189。写这句话时想的是"细化只会切开不会合并"，
+    那对**嵌套**网格（每次二分）成立，对这里的等分网格不成立。
+
+    **但实测吃亏为 0**，两套坐标都查过（穷举 res 与二分对比）：
+
+        网格 (t,h,w)，预算 256    二分 [2,11,11] 占 242 ＝ 穷举最优 242
+        度量 (t,x,y,z)，20 次     二分与穷举之差 中位 0、最大 0
+
+    原因：下陷只有 1–4 格，而在逼近预算的那一段占用数陡升，
+    `occupied ≤ budget` 这个**谓词**因此实际上仍是单调的 —— 二分找的是谓词的
+    翻转点，不是占用数的极值点。**所以结论不变，变的是"为什么它对"**：
+    不是因为占用数单调，而是因为谓词在这些数据上恰好单调。
+
+    `scan_window > 0` 时在二分结果之后再扫 `res+1 … res+w`，取占用数最大的可行解，
+    不依赖这个巧合。**默认 0（关）** —— 四格已按现有行为训完，
+    打开它可能改变分箱，那就是训练/评测不一致（`docs/05` §13.5 同一类）。
     另外它给的是**物理各向同性**的体素——对度量坐标而言这本就是更该有的性质，
     而贪心的 [7,6,6] 之类在物理上是扁的。
     代价是 G3 从 252 降到接近但略低于 budget 的一个数，由 `enforce_n` 统一拉平。
@@ -206,16 +225,25 @@ def _resolve_bins(
             t[ax] = max(1, int(round(res * ext[ax] / base)))
         return t
 
-    # 占用数随 res 单调不减 → 二分搜索最大的可行 res。
+    # 二分找 `occupied ≤ budget` 这个**谓词**的翻转点。
+    # ⚠️ 占用数本身并不单调（见上面的反例），只是谓词在实测数据上是单调的。
     # 上界取 budget：某个轴分到比预算还多的箱毫无意义（非空箱数本就 ≤ budget）。
-    lo_r, hi_r, best = 1, budget, g
+    lo_r, hi_r, best, best_r = 1, budget, g, 0
     while lo_r <= hi_r:
         mid = (lo_r + hi_r) // 2
         t = bins_for(mid)
         if occupied(t) <= budget:
-            best, lo_r = t, mid + 1
+            best, best_r, lo_r = t, mid, mid + 1
         else:
             hi_r = mid - 1
+    if scan_window and best_r:
+        # 不依赖"谓词单调"这个巧合：再往上扫一段，取占用数最大的可行解。
+        bo = occupied(best)
+        for r in range(best_r + 1, min(best_r + scan_window, budget) + 1):
+            t = bins_for(r)
+            o = occupied(t)
+            if o <= budget and o > bo:
+                best, bo = t, o
     return best
 
 
@@ -643,6 +671,26 @@ if __name__ == "__main__":
             key = key * 1e4 + cm[:, ax].double()
         assert torch.equal(key.argsort(), torch.arange(cm.shape[0])), f"{name} 顺序不单调"
     print("    ✓ 有序")
+
+    # [5b] "占用数随 res 单调不减" —— 这句话曾写在 _resolve_bins 里，是**错的**。
+    #      不同 res 的网格不嵌套，细化会把原本分开的点重新并到一起。
+    #      这条自检把反例钉住，免得它哪天又被当成前提写回去。
+    def _occ(qq, gs):
+        ix = torch.zeros(qq.shape[0], dtype=torch.long)
+        for ax, nb in enumerate(gs):
+            ix = ix * nb + (qq[:, ax] * nb).long().clamp(0, nb - 1)
+        return int(torch.unique(ix).numel())
+
+    torch.manual_seed(0)
+    qq = torch.rand(200, 3).clamp(0, 1 - 1e-6)
+    occs = [_occ(qq, [r, r, r]) for r in range(1, 40)]
+    drops = [(r + 1, occs[r - 1], occs[r]) for r in range(1, len(occs))
+             if occs[r] < occs[r - 1]]
+    assert drops, "反例没了？那说明 _occ 或取整规则变了，先查它再改注释"
+    print(f"✅ [5b] 占用数**不**随 res 单调：{len(drops)} 处下降，"
+          f"例如 res={drops[0][0] - 1}→{drops[0][0]} 占 {drops[0][1]}→{drops[0][2]}")
+    print("      二分仍然对，是因为 `occupied ≤ budget` 这个**谓词**在实测数据上单调；"
+          "\n      scan_window>0 可以不依赖这个巧合（默认关，见 _resolve_bins）")
 
     print("\n[6] enforce_n 把各组有效 token 数拉到严格相等")
     common = int(min(g2.n_used.min(), g3.n_used.min(), g4.n_used.min()))

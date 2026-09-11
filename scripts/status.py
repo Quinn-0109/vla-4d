@@ -14,12 +14,14 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 ARMS = ("G3", "M3", "M2", "G4")
 MAX_STEPS = 30_000
+N_TASKS = 10                                      # libero_10
 PE_AXES = {"G3": 3, "M3": 4, "M2": 3, "G4": 4}   # 与 wire.WireConfig.pe_axes 一致
 DATA_ROOT = "/root/autodl-tmp/datasets/modified_libero_rlds"
 
@@ -148,32 +150,58 @@ def eval_status() -> None:
     print("四格全部训完。评测：\n")
     logs = (sorted(Path("results/logs").glob("EVAL-*.txt"))
             if Path("results/logs").is_dir() else [])
-    final = {}                      # arm → FINAL 那一行（只有满 10 task 的才进来）
+    final = {}                      # arm → 满 10 task 的成绩
     for arm in ARMS:
         cand = [f for f in logs if f"-{arm}-" in f.name and "sub255" in f.name]
         if not cand:
             print(f"  {arm:<4}" + ("⏳ 跑中（还没写日志）"
                                    if live_eval and live_eval[0] == arm else "— 未评"))
             continue
-        txt = max(cand, key=lambda f: f.stat().st_mtime).read_text().splitlines()
-        fin = [l for l in txt if l.startswith(("FINAL", "PARTIAL"))]
-        tasks = [l for l in txt if l.startswith("task ")]
-        if fin and fin[-1].startswith("FINAL"):
-            final[arm] = fin[-1]
-            print(f"  {arm:<4}✅ {fin[-1]}")
+
+        # ⚠️ **分段跑会写到多个文件**（run_id 里带 -t{start}_{end}），
+        #    每个各自 PARTIAL。只看最新那一个，会把"两段合起来已经跑完"
+        #    误报成"断在第 5 个 task"，并给出一个**错误的续跑位置**。
+        #    所以按 task_id 取并集：同一个 task 出现在多个文件里时以最新的为准。
+        seen, whole = {}, None
+        for f in sorted(cand, key=lambda x: x.stat().st_mtime):
+            txt = f.read_text(errors="ignore").splitlines()
+            for line in txt:
+                m = re.match(r"task (\d+) .*?: (\d+)/(\d+) =", line)
+                if m:
+                    seen[int(m.group(1))] = (int(m.group(2)), int(m.group(3)), f.name)
+            for line in txt:
+                if line.startswith("FINAL"):
+                    whole = line
+        if whole:                                   # 一次整跑到底
+            final[arm] = whole
+            print(f"  {arm:<4}✅ {whole}")
+            continue
+
+        ok = sum(v[0] for v in seen.values())
+        n = sum(v[1] for v in seen.values())
+        miss = [t for t in range(N_TASKS) if t not in seen]
+        nseg = len({v[2] for v in seen.values()})
+        seg = f"（{nseg} 段）" if nseg > 1 else ""
+        if not miss:
+            # 各段加起来已覆盖全部 task —— 这是判据数，脚本自己不会打 FINAL
+            final[arm] = f"合并 {ok}/{n} = {ok / max(n, 1):.4f}{seg}"
+            print(f"  {arm:<4}✅ {final[arm]}  ← 分段合并，非单个 FINAL")
         elif live_eval and live_eval[0] == arm:
-            tail = f"  {tasks[-1].split('累计')[-1].strip()}" if tasks else ""
-            print(f"  {arm:<4}⏳ 跑中 pid={live_eval[1]}  {len(tasks)}/10 task{tail}")
+            print(f"  {arm:<4}⏳ 跑中 pid={live_eval[1]}  "
+                  f"{len(seen)}/{N_TASKS} task  {ok}/{n}{seg}")
         else:
-            fix = f"  → 补跑 --start_task {len(tasks)}" if tasks else ""
-            print(f"  {arm:<4}❌ 断了  {len(tasks)}/10 task{fix}")
+            # 续跑位置取**缺口的第一个**，不是"已完成个数"——分段之后两者不同
+            print(f"  {arm:<4}❌ 断了  {len(seen)}/{N_TASKS} task{seg}  "
+                  f"缺 {miss}  → 补跑 --start_task {miss[0]}"
+                  + (f" --end_task {miss[-1] + 1}" if len(miss) > 1 else ""))
 
     print()
     if len(final) == len(ARMS):
-        print("四条 FINAL 齐了 → 配对（McNemar）分析。")
+        print("四臂结果齐了 → 配对（McNemar）分析，输入是 *.episodes.jsonl。")
         print("⚠️ 主分析是 **9-task**（事前登记），10-task 只供与文献并列。")
     else:
-        print("⚠️ 只有满 10 task 的 FINAL 才是判据数 —— PARTIAL 是残缺合计，不能当成绩。")
+        print("⚠️ 判据数 = 覆盖全部 10 个 task 的成绩（单段 FINAL 或多段并集）；"
+              "单个 PARTIAL 不是。")
 
 
 if __name__ == "__main__":
