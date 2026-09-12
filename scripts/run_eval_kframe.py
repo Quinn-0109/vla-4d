@@ -588,8 +588,13 @@ def main(cfg: Config) -> None:
 
                 if not checked:
                     assert_arm_wiring(state, cfg.arm)
+                    # ⚠️ **PE 轴数要打出来。** `assert_arm_wiring` 里已经逐臂对拍
+                    #    （错了会抛），但不打印就等于没人能从日志里复核 ——
+                    #    训练脚本 2026-09 加了这一项，评测脚本当时漏了。
+                    #    错配臂与它的同池化伙伴在日志里其余部分完全一样。
                     say(f"# ✓ 接线正常（arm={cfg.arm}，rotary_emb "
-                        f"{state.rope_calls} 次）")
+                        f"{state.rope_calls} 次，PE {state.pe_axes_seen} 轴）"
+                        f"  —— 应为 {wcfg.pe_axes} 轴")
                     checked = True
 
                 # ⭐ 批量 vs 逐条：**比动作 token，不比 logits**。批量 matmul 的
