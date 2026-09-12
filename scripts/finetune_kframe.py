@@ -148,6 +148,9 @@ class Config:
     subset_dir: str = "results/subset/libero_10_s1"
     camera_json: str = "results/tables/camera_libero.json"
     log_steps: int = 10
+    # ⚠️ 只允许 G3。见下面那道拦：不带子集训的 G3 **不属于 2×2**，
+    #    只能与全量训练的 G2 比粒度、或与 G3-subset 比数据量效应。
+    no_subset: bool = False
     # "auto" = 自己挑本运行目录下最新的、**带优化器状态**的 checkpoint。
     # 容器重启后重跑同一条命令即可接上，不用人工拼路径。
     resume_from: Optional[str] = None
@@ -279,7 +282,20 @@ def main(cfg: Config) -> None:
     #    所以在这里硬拦，而不是靠人记得传参数。
     ARMS_2X2 = ("G3", "G4", "M2", "M3")
     sub_cache = None
-    if cfg.arm in ARMS_2X2:
+    if cfg.arm in ARMS_2X2 and cfg.no_subset:
+        # ⚠️⚠️ **这样训出来的臂不属于 2×2。** 纪律 1b 要求四格看同样的数据，
+        #    不带子集训的 G3 与 M3/M2/G4 的差里混着"数据量"，**不能填进那张表**。
+        #    它只有一个合法用途：与**同样全量训练**的 G2 比"跨帧 vs 帧独立池化"，
+        #    以及与 G3-subset 比"纯数据量效应"（`docs/05` §13.8）。
+        #    G4/M2/M3 靠深度缓存查表，没有子集根本跑不起来，所以这里只放 G3。
+        if cfg.arm != "G3":
+            raise SystemExit(
+                f"--no_subset 只允许 G3。{cfg.arm} 要按哈希查深度缓存，"
+                "而缓存只覆盖子集里的帧 —— 不带子集会在第一个批次就 KeyError。")
+        print("⚠️ --no_subset：全量数据训练 G3。**这一臂不属于 2×2**，"
+              "只能与全量训练的 G2 比，或与 G3-subset 比数据量效应。"
+              "\n   exp_id 里带 'fulldata' 标记，别和四格的 checkpoint 混起来。")
+    elif cfg.arm in ARMS_2X2:
         sp = Path(cfg.subset_dir) / "depth_cache.npz"
         if not sp.exists():
             raise SystemExit(
@@ -304,7 +320,10 @@ def main(cfg: Config) -> None:
               f"+N{cfg.budget}+nt{cfg.n_t}+b{micro}x{accum}"
               f"+lr{cfg.learning_rate}+lora-r{cfg.lora_rank}"
               f"{'' if cfg.lora_vision else '+frozen-vision'}"
-              f"{'+aug' if cfg.image_aug else ''}")
+              f"{'+aug' if cfg.image_aug else ''}"
+              # ⚠️ 进 exp_id：不带子集训的 G3 **不属于 2×2**，目录名必须自带警告，
+              #    否则半年后翻 runs/ 的人会把它当成四格里的 G3。
+              f"{'+fulldata' if cfg.no_subset else ''}")
     if cfg.run_id_note:
         exp_id += f"--{cfg.run_id_note}"
     run_dir = Path(cfg.run_root_dir) / exp_id
