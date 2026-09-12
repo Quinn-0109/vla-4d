@@ -257,6 +257,12 @@ def _require_free_vram(need_gb: float) -> None:
             who = "\n  当前占着显存的进程：\n    " + "\n    ".join(q.splitlines())
     except (OSError, _sp.SubprocessError):
         pass
+    if not who:
+        # ⚠️ 容器里 nvidia-smi 常常看不到任何 PID（跨命名空间，甚至看不到自己），
+        #    所以"列不出进程"**不等于**没人占着 —— 别据此以为是驱动的问题。
+        who = ("\n  （nvidia-smi 没列出任何进程 —— 容器里这很常见，跨命名空间看不到 PID。"
+               "\n   改用：pgrep -af 'run_eval_kframe|finetune_kframe'  或  "
+               "fuser -v /dev/nvidia*）")
     raise SystemExit(
         f"显存不够：空闲 {free_gb:.1f} / 共 {total_gb:.1f} GiB，"
         f"加载 7B 需要约 {need_gb:.0f} GiB。{who}\n"
