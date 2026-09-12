@@ -120,6 +120,8 @@ class Config:
     local_log_dir: str = "results/logs"
     run_note: str = ""
     overwrite: bool = False                    # 允许覆盖已有 FINAL 的同名日志
+    # 加载 7B 前要求的空闲显存。0 = 不检查。bf16 权重约 15 GB + 激活，留 18 GB。
+    need_gb: float = 18.0
     # fmt: on
 
 
@@ -227,6 +229,42 @@ def build_window(hist: deque, k: int, stride: int):
     return out, np.asarray(mask, dtype=bool)
 
 
+def _require_free_vram(need_gb: float) -> None:
+    """
+    加载 7B 之前先看显存够不够，不够就说清楚**是谁占着**。
+
+    ⚠️ 这道闸是 2026-09-12 用一次真事故换来的：四臂串行评测里 G3 排第一，
+    而上一个训练进程还没退干净、占着 19.6 GiB，于是 G3 在 `.to(dev)` 上抛
+    `CUDA out of memory ... Process 54827 has 19.64 GiB memory in use` ——
+    一串指向 torch 内部的栈，看不出"别人占着"这件事。等那个进程退了，
+    后面三臂全部正常跑完，于是日志里只剩"G3 莫名其妙没结果"。
+    **串行跑批量任务时，第一个任务承担了全部的环境不干净风险。**
+    """
+    if not need_gb or not torch.cuda.is_available():
+        return
+    free, total = torch.cuda.mem_get_info()
+    free_gb, total_gb = free / 2**30, total / 2**30
+    if free_gb >= need_gb:
+        return
+    who = ""
+    try:
+        import subprocess as _sp
+        q = _sp.run(["nvidia-smi",
+                     "--query-compute-apps=pid,used_memory,process_name",
+                     "--format=csv,noheader"],
+                    capture_output=True, text=True, timeout=10).stdout.strip()
+        if q:
+            who = "\n  当前占着显存的进程：\n    " + "\n    ".join(q.splitlines())
+    except (OSError, _sp.SubprocessError):
+        pass
+    raise SystemExit(
+        f"显存不够：空闲 {free_gb:.1f} / 共 {total_gb:.1f} GiB，"
+        f"加载 7B 需要约 {need_gb:.0f} GiB。{who}\n"
+        "  多半是上一个训练/评测进程还没退干净。等它退，或 kill 掉再跑；\n"
+        "  确认真的够用就调 --need_gb（0 = 不检查）。\n"
+        "  ⚠️ 不检查的话，报错会是 torch 内部的一串 OOM 栈，看不出是别人占着。")
+
+
 @draccus.wrap()
 def main(cfg: Config) -> None:
     assert torch.cuda.is_available(), "需要 GPU"
@@ -283,6 +321,8 @@ def main(cfg: Config) -> None:
         print(f"度量坐标：包围盒 {bp}，相机 {len(cameras)} 台")
     wcfg = WireConfig(arm=cfg.arm, K=cfg.K, budget=cfg.budget, n_t=cfg.n_t,
                       bbox=bbox, enforce_n=cfg.enforce_n or None)
+
+    _require_free_vram(cfg.need_gb)
 
     processor = AutoProcessor.from_pretrained(cfg.vla_path, trust_remote_code=True)
     model = AutoModelForVision2Seq.from_pretrained(
