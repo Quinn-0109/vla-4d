@@ -100,6 +100,7 @@ def main() -> None:
     print()
     if done_all:
         eval_status()
+        fulldata_status()
         return
 
     # 下一步该动哪一臂：先补断掉的（丢的步数最少），再开没起过的
@@ -125,6 +126,7 @@ def main() -> None:
         print(f"  起来后确认：grep -E '✓ 形状|PE |留存率' results/logs/{todo}.log")
         print(f"  {todo} 必须打出 **PE {PE_AXES[todo]} 轴** —— "
               "错配臂与它的同池化伙伴在日志里其余部分完全一样。")
+    fulldata_status()
 
 
 def eval_status() -> None:
@@ -172,9 +174,12 @@ def eval_status() -> None:
             for line in txt:
                 if line.startswith("FINAL"):
                     whole = line
+        # 逐局 JSONL 是配对检验（McNemar）的唯一输入，聚合之后恢复不出来。
+        ep = list(Path("results/logs").glob(f"EVAL-*-{arm}-*.episodes.jsonl"))
+        tag = "  逐局✅" if ep else "  逐局❌（配对做不了，需重评）"
         if whole:                                   # 一次整跑到底
             final[arm] = whole
-            print(f"  {arm:<4}✅ {whole}")
+            print(f"  {arm:<4}✅ {whole}{tag}")
             continue
 
         ok = sum(v[0] for v in seen.values())
@@ -202,6 +207,53 @@ def eval_status() -> None:
     else:
         print("⚠️ 判据数 = 覆盖全部 10 个 task 的成绩（单段 FINAL 或多段并集）；"
               "单个 PARTIAL 不是。")
+
+
+def fulldata_status() -> None:
+    """
+    G3 全量数据（`--no_subset`，exp_id 带 `+fulldata`）。
+
+    ⚠️ **它不属于 2×2**（`docs/05` §13.8）：纪律 1b 要求四格看同样的数据，
+       它与 M3/M2/G4 的差里混着数据量。合法用途只有两个 ——
+       与全量训练的 G2 比粒度、与 G3-subset 比纯数据量效应。
+       所以单列一节，绝不混进上面那张表。
+    """
+    runs = [d for d in Path("runs").glob("*fulldata*") if d.is_dir()]
+    logs = ([f for f in Path("results/logs").glob("EVAL-*.txt")
+             if "fullG3" in f.name] if Path("results/logs").is_dir() else [])
+    if not runs and not logs:
+        return
+    print("\n" + "─" * 52)
+    print("G3 全量数据（**不属于 2×2**，`docs/05` §13.8 事前登记）")
+    for d in runs:
+        ck = sorted(int(x.name[4:]) for x in (d / "adapter").glob("step*")
+                    if x.name[4:].isdigit()) if (d / "adapter").is_dir() else []
+        rec = {}
+        mp = d / "metrics.jsonl"
+        if mp.is_file() and mp.read_text().strip():
+            rec = json.loads(mp.read_text().strip().splitlines()[-1])
+        step = rec.get("step", 0)
+        if MAX_STEPS in ck:
+            print(f"  训练 ✅ 完成")
+        else:
+            sps = rec.get("steps_per_sec") or 1e-9
+            print(f"  训练 {step}/{MAX_STEPS}  剩 {(MAX_STEPS - step) / sps / 3600:.1f} h"
+                  f"  （断了就加 --resume_from auto 重跑同一条命令）")
+    for f in logs:
+        fin = [l for l in f.read_text(errors="ignore").splitlines()
+               if l.startswith(("FINAL", "PARTIAL"))]
+        print(f"  评测 {fin[-1] if fin else '跑中'}")
+        if fin and fin[-1].startswith("FINAL"):
+            try:
+                sr = float(fin[-1].split("success_rate=")[1].split()[0])
+            except (IndexError, ValueError):
+                continue
+            print(f"       ⚠️ 判读要用 **9-task**（排除 task 1），"
+                  f"10-task 的 {sr:.2%} 不是判据数")
+    print("  判读表（事前写死，看到数字后不得移动边界）：")
+    print("    ≥38%  缺口是数据量 → 2×2 照常读")
+    print("    33–38% 各占一半 → 限制一节给分解，不得声称跨帧池化更优")
+    print("    ≤33%  跨帧池化本身有害 → 按 06 §3.3 第二转向改写主线")
 
 
 if __name__ == "__main__":
