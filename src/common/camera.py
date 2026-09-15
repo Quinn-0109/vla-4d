@@ -63,14 +63,14 @@ class Camera:
                       width=int(d["width"]),
                       pos=torch.tensor(d["pos"], dtype=torch.float64),
                       rot=torch.tensor(d["rot"], dtype=torch.float64).reshape(3, 3),
-                      flipped=bool(d.get("flipped", True)))
+                      flipped=bool(d.get("flipped", True)), crop_scale=d.get("crop_scale"))
 
     def to_json(self, path: str | Path) -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         Path(path).write_text(json.dumps({
             "fovy": self.fovy, "height": self.height, "width": self.width,
             "pos": self.pos.tolist(), "rot": self.rot.reshape(-1).tolist(),
-            "flipped": self.flipped}, indent=2))
+            "flipped": self.flipped, "crop_scale": self.crop_scale}, indent=2))
 
     # ---------------------------------------------------------------- 内参
     def focal(self) -> float:
@@ -152,7 +152,7 @@ class Camera:
     def to(self, device) -> "Camera":
         """搬到指定设备。训练循环里可以一次搬好，省得每步都 `.to`。"""
         return Camera(self.fovy, self.height, self.width,
-                      self.pos.to(device), self.rot.to(device), self.flipped)
+                      self.pos.to(device), self.rot.to(device), self.flipped, self.crop_scale)
 
     def patch_xyz(self, depth: torch.Tensor) -> torch.Tensor:
         """

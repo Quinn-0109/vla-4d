@@ -24,6 +24,7 @@ G0 仍然用它评；这份只加 K 帧历史窗口 + 接线。**评测协议其
 #    `finetune_single.py` 的文件头记过这个坑，我写这份时照样踩了 —— 所以再记一次。
 
 import gc
+import hashlib
 import json
 import os
 import sys
@@ -58,6 +59,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from check_replay import patch_depth  # noqa: E402
 
 from common.imgproc import center_crop_resize  # noqa: E402
+from common.provenance import (check_config, code_identity, config_dict, eval_paths,
+                               sha256, training_record, validate_config, write_json, WIRE_FIELDS)
 from common.runs import resolve_adapter  # noqa: E402
 from pooling.wire import (WireConfig, assert_arm_wiring, frame_feats,  # noqa: E402
                           set_batch, set_vision_feats, wire)
@@ -76,6 +79,7 @@ class Config:
     stride: int = 16
     budget: int = 256
     n_t: int = 2
+    partition: str = "quantile"
     # ⭐ **跨臂拉平有效 token 数。** 不给时各臂用满自己能填的槽：真值深度实测
     #    G3/M3 用 242 个、M2/G4 用 256 个，剩下的是**全零向量**，仍占位仍被注意 ——
     #    于是 G4−G3 里混进 5.5% 的预算差，而 protocol 写的是"N=256 全组相同"。
@@ -273,6 +277,7 @@ def _require_free_vram(need_gb: float) -> None:
 
 @draccus.wrap()
 def main(cfg: Config) -> None:
+    validate_config(cfg, training=False)
     assert torch.cuda.is_available(), "需要 GPU"
     dev = "cuda"
     unnorm_key = cfg.unnorm_key or f"{cfg.task_suite_name}_no_noops"
@@ -326,7 +331,22 @@ def main(cfg: Config) -> None:
             flipped=bool(v.get("flipped", True))) for k, v in cams_raw.items()}
         print(f"度量坐标：包围盒 {bp}，相机 {len(cameras)} 台")
     wcfg = WireConfig(arm=cfg.arm, K=cfg.K, budget=cfg.budget, n_t=cfg.n_t,
-                      bbox=bbox, enforce_n=cfg.enforce_n or None)
+                      bbox=bbox, enforce_n=cfg.enforce_n or None, partition=cfg.partition)
+
+    repo = Path(__file__).resolve().parents[1]
+    trained = training_record(adapter)
+    if trained:
+        check_config(trained["config"], config_dict(cfg), WIRE_FIELDS)
+    elif adapter:
+        print("旧 adapter 无训练配置记录：接线与数据来源须由原始训练日志核对。")
+    run_id, output_paths = eval_paths(cfg, repo)
+    suite = benchmark.get_benchmark_dict()[cfg.task_suite_name]()
+    t_end = suite.n_tasks if cfg.end_task < 0 else cfg.end_task
+    if not 0 <= cfg.start_task < t_end <= suite.n_tasks:
+        raise SystemExit(f"非法 task 范围 [{cfg.start_task}, {t_end})，suite 有 {suite.n_tasks} 个任务")
+    for tid in range(cfg.start_task, t_end):
+        if len(suite.get_task_init_states(tid)) < max(cfg.num_trials_per_task, cfg.verify_env):
+            raise SystemExit(f"task {tid} 初始状态数量不足")
 
     _require_free_vram(cfg.need_gb)
 
@@ -391,36 +411,22 @@ def main(cfg: Config) -> None:
 
     print(f"中心裁: {'开' if cfg.center_crop else '**关**'}"
           f"（训练用 image_aug=True，关掉就是训练/评测不一致）")
-    # ⚠️ 分段跑必须落到**不同的**日志文件：log 是 "w" 模式打开的，
-    #    段号不进 run_id 的话，接着跑 task 4-9 会把 task 0-3 的记录直接覆盖掉。
-    _seg = (f"-t{cfg.start_task}_{cfg.end_task}"
-            if (cfg.start_task or cfg.end_task >= 0) else "")
-    # ⚠️ **凡是会改变这个数的东西，都必须进文件名。** 原来只有
-    #    suite/arm/K/stride/seed/note —— 于是换 checkpoint、换 --eval_batch、
-    #    换 --budget/--n_t/--enforce_n 重跑，会**以 "w" 模式覆盖掉上一次的结果**，
-    #    而日志正是这些数字的唯一出处（results/ 只在训练机上有一份）。
-    #    step 取 adapter 目录名：runs/<exp>/adapter/step30000 → "step30000"。
-    _step = Path(cfg.adapter).name if cfg.adapter else "base"
-    _extra = f"-{_step}-b{cfg.eval_batch}-N{cfg.budget}-nt{cfg.n_t}"
-    if cfg.enforce_n:
-        _extra += f"-e{cfg.enforce_n}"
-    run_id = (f"EVAL-{cfg.task_suite_name}-{cfg.arm}-K{cfg.K}s{cfg.stride}"
-              f"-seed{cfg.seed}{'' if cfg.center_crop else '-nocrop'}{_extra}{_seg}"
-              + (f"--{cfg.run_note}" if cfg.run_note else ""))
+    # 启动前已检查身份；元数据与逐局文件同名归档。
     Path(cfg.local_log_dir).mkdir(parents=True, exist_ok=True)
-    _txt = Path(cfg.local_log_dir) / (run_id + ".txt")
-    # 第二道：同名且已经跑完（有 FINAL）的日志不许静默盖掉。
-    if _txt.is_file() and any(l.startswith("FINAL") for l in
-                              _txt.read_text(errors="ignore").splitlines()):
-        if not cfg.overwrite:
-            raise SystemExit(
-                f"{_txt} 已经有完整结果（FINAL）。\n"
-                "  这次运行的配置与它完全相同，跑出来只会覆盖掉那份数字。\n"
-                "  想重跑就加 --overwrite True；想留两份就换 --run_note。")
-        print(f"⚠️ --overwrite：将覆盖已完成的 {_txt.name}")
-    log = open(_txt, "w")
-    # 逐局结果：配对检验的唯一输入。与主日志同名、扩展名不同，分段跑各写各的。
-    per_ep = open(os.path.join(cfg.local_log_dir, run_id + ".episodes.jsonl"), "w")
+    if not cfg.overwrite and any(p.exists() for p in output_paths.values()):
+        raise SystemExit("评测记录已存在，拒绝覆盖；请换 run_note")
+    metadata = {"schema_version": 1, "config": config_dict(cfg), "code": code_identity(repo),
+                "training": trained, "adapter": str(adapter) if adapter else None,
+                "adapter_sha256": sha256(next(adapter / n for n in
+                    ("adapter_model.safetensors", "adapter_model.bin")
+                    if (adapter / n).is_file())) if adapter else None,
+                "unnorm_key": unnorm_key, "action_stats": model.norm_stats[unnorm_key]}
+    metadata["initial_states_sha256"] = {
+        str(t): hashlib.sha256(np.asarray(suite.get_task_init_states(t)).tobytes()).hexdigest()
+        for t in range(suite.n_tasks)}
+    write_json(output_paths["meta"], metadata)
+    log = output_paths["log"].open("w" if cfg.overwrite else "x", encoding="utf-8")
+    per_ep = output_paths["episodes"].open("w" if cfg.overwrite else "x", encoding="utf-8")
     print(f"日志: {log.name}")
 
     def say(msg: str) -> None:
@@ -436,14 +442,13 @@ def main(cfg: Config) -> None:
 
     say(f"# arm={cfg.arm} K={cfg.K} stride={cfg.stride} N={cfg.budget} "
         f"n_t={cfg.n_t} adapter={adapter} n/task={cfg.num_trials_per_task} "
-        f"seed={cfg.seed}")
+        f"seed={cfg.seed} partition={cfg.partition}")
 
     say(f"# 中心裁={'开' if cfg.center_crop else '关'} "
         f"视觉特征缓存={'开' if cfg.vision_cache else '关'}"
         + (f"（头 {cfg.verify_vision_cache} 步逐位对拍）"
            if cfg.vision_cache and cfg.verify_vision_cache else ""))
     n_checked = 0
-    suite = benchmark.get_benchmark_dict()[cfg.task_suite_name]()
     max_steps = MAX_STEPS[cfg.task_suite_name]
     total_ep = total_ok = 0
     checked = False
@@ -520,8 +525,8 @@ def main(cfg: Config) -> None:
                 envs.append(OffScreenRenderEnv(
                     bddl_file_name=bddl, camera_heights=256,
                     camera_widths=256, camera_depths=True))
-            _, desc = get_libero_env(task, "openvla", resolution=256)
-            if task_id == 0 and cfg.verify_env:
+            desc = task.language
+            if task_id == cfg.start_task and cfg.verify_env:
                 ref, _ = get_libero_env(task, "openvla", resolution=256)
                 bad = 0
                 for j in range(cfg.verify_env):
@@ -592,9 +597,9 @@ def main(cfg: Config) -> None:
                         fe = torch.cat([feats[i][min(j, len(feats[i]) - 1)]
                                         for j in jj], dim=1)
                         if n_checked < cfg.verify_vision_cache:
-                            ref = torch.cat([state.orig["vision"](c) for c in
-                                             torch.split(to_px(frames), 6, dim=1)],
-                                            dim=1)
+                            with torch.no_grad():
+                                ref = torch.cat([state.orig["vision"](c) for c in
+                                                 torch.split(to_px(frames), 6, dim=1)], dim=1)
                             if not torch.equal(fe, ref):
                                 d = (fe.float() - ref.float()).abs().max().item()
                                 raise SystemExit(
@@ -656,7 +661,7 @@ def main(cfg: Config) -> None:
                             set_vision_feats(state, fe_rows[r])
                         set_batch(state, frame_pad_mask=pm[r:r + 1],
                                   depth=None if dep is None else dep[r:r + 1],
-                                  cameras=None if cams is None else cams[r:r + 1])
+                                  cameras=() if cams is None else cams[r:r + 1])
                         with torch.no_grad():
                             ref = model.predict_action(
                                 input_ids=ids1, pixel_values=px_rows[r],

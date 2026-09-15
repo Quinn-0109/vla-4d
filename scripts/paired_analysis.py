@@ -2,9 +2,9 @@
 """
 2×2 的配对分析 —— McNemar + 主效应分解。
 
-    python scripts/paired_analysis.py
+    python scripts/paired_analysis.py --manifest docs/paired-manifest.json
 
-输入是 `results/logs/EVAL-*.episodes.jsonl`（每局一行 `{arm, task_id, episode,
+输入是清单明确指定的逐局文件（每局一行 `{arm, task_id, episode,
 success}`）。四臂跑的是**同一批确定性初始状态**，`(task_id, episode)` 就是配对键。
 
 ⚠️ **为什么必须配对，以及它实际帮了多少。** 聚合后的 task 级成功数**恢复不出**
@@ -23,6 +23,8 @@ success}`）。四臂跑的是**同一批确定性初始状态**，`(task_id, ep
 from __future__ import annotations
 
 import json
+import argparse
+import hashlib
 import math
 import sys
 from pathlib import Path
@@ -32,21 +34,70 @@ EXCLUDE_TASKS = (1,)                  # 事前登记，见模块 docstring
 LOGDIR = Path("results/logs")
 
 
-def load() -> dict:
-    """arm → {(task_id, episode): success}。同一臂多份文件时后写的覆盖先写的。"""
+def load(manifest: Path) -> dict:
+    """只读取清单指定且哈希匹配的文件；旧日志的来源须人工核对后登记。"""
+    spec = json.loads(manifest.read_text(encoding="utf-8"))
+    arms = spec["arms"]
+    if "REPLACE" in json.dumps(spec):
+        raise ValueError("清单仍有 REPLACE 占位符，须从原始记录核对后填写")
+    if not 2 <= len(arms) <= 4 or not set(arms) <= set(ARMS):
+        raise ValueError("清单须包含 2–4 个不同的 2×2 实验臂")
     out = {a: {} for a in ARMS}
-    files = sorted(LOGDIR.glob("EVAL-*.episodes.jsonl"),
-                   key=lambda f: f.stat().st_mtime)
-    for f in files:
-        for line in f.read_text(errors="ignore").splitlines():
-            if not line.strip():
-                continue
-            try:
+    required = {"suite", "dataset_sha256", "checkpoint_step", "K", "stride",
+                "budget", "n_t", "enforce_n", "center_crop", "eval_batch", "seed",
+                "num_trials_per_task", "training_seed", "eval_code_commit"}
+    reference = None
+    paths = set()
+    for arm, entry in arms.items():
+        protocol = entry["protocol"]
+        if set(protocol) != required or any(v is None for k, v in protocol.items() if k != "training_seed"):
+            raise ValueError(f"{arm}: protocol 字段不完整或未知，见清单示例")
+        if protocol["training_seed"] is None:
+            print(f"⚠️ {arm}: 训练种子未记录；结果只描述当前 checkpoint，不能认定种子一致。")
+        if (protocol["suite"] != "libero_10" or protocol["num_trials_per_task"] != 50
+                or protocol["checkpoint_step"] != 30000):
+            raise ValueError(f"{arm}: 本分析要求 libero_10、每任务 50 局、step30000")
+        digest = protocol["dataset_sha256"]
+        if not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            raise ValueError(f"{arm}: 必须登记固定训练子集清单的 SHA256")
+        if reference is not None and protocol != reference:
+            raise ValueError(f"{arm}: 实验协议不一致，禁止合并不同数据/训练/评测配置")
+        reference = protocol
+        if entry.get("dataset") != "sub255" or not entry.get("checkpoint"):
+            raise ValueError(f"{arm}: 只接受 sub255 四组实验，必须登记准确 checkpoint 路径")
+        if "fulldata" in entry["checkpoint"] or "fullG3" in entry["checkpoint"]:
+            raise ValueError(f"{arm}: G3-full 不属于 2×2")
+        if not entry["files"]:
+            raise ValueError(f"{arm}: 未指定文件")
+        for item in entry["files"]:
+            f = (manifest.parent / item["path"]).resolve()
+            if f in paths:
+                raise ValueError(f"重复文件: {f}")
+            paths.add(f)
+            if "fullG3" in f.name or "fulldata" in f.name:
+                raise ValueError(f"{f}: G3-full 不属于 2×2")
+            raw = f.read_bytes()
+            if hashlib.sha256(raw).hexdigest() != item["sha256"]:
+                raise ValueError(f"{f}: SHA256 不匹配，文件已改变")
+            for lineno, line in enumerate(raw.decode("utf-8").splitlines(), 1):
+                if not line.strip():
+                    continue
                 r = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if r.get("arm") in out:
-                out[r["arm"]][(int(r["task_id"]), int(r["episode"]))] = int(r["success"])
+                if (r.get("arm") != arm or type(r.get("task_id")) is not int
+                        or type(r.get("episode")) is not int
+                        or type(r.get("success")) not in (int, bool)
+                        or r["success"] not in (0, 1)):
+                    raise ValueError(f"{f}:{lineno}: 非法逐局记录或实验臂不匹配")
+                key = (r["task_id"], r["episode"])
+                if not (0 <= key[0] < 10 and 0 <= key[1] < 50):
+                    raise ValueError(f"{f}:{lineno}: task/episode 越界")
+                if key in out[arm]:
+                    raise ValueError(f"{f}:{lineno}: 重复配对键 {key}，禁止覆盖")
+                out[arm][key] = int(r["success"])
+        expected = {(t, e) for t in range(10) if t not in EXCLUDE_TASKS for e in range(50)}
+        missing = expected - out[arm].keys()
+        if missing:
+            raise ValueError(f"{arm}: 主分析缺 {len(missing)} 局，例如 {sorted(missing)[:5]}")
     return out
 
 
@@ -67,14 +118,23 @@ def mcnemar(base: dict, treat: dict, keys) -> tuple:
     if m == 0:
         return n_base, n_treat, 0.0, 1.0
     # 连续性校正的 McNemar；m 小的时候它保守，正是我们要的方向
-    chi = (abs(n_treat - n_base) - 1) ** 2 / m if m > 1 else 0.0
+    chi = max(abs(n_treat - n_base) - 1, 0) ** 2 / m
     z = math.copysign(math.sqrt(max(chi, 0.0)), n_treat - n_base)
     p = math.erfc(abs(z) / math.sqrt(2))
     return n_base, n_treat, z, p
 
 
 def main() -> int:
-    data = load()
+    parser = argparse.ArgumentParser(description="严格按显式清单分析 2×2，禁止目录混读")
+    parser.add_argument("--manifest", type=Path, required=True,
+                        help="经来源核对的 JSON 清单；见 docs/paired-manifest.example.json")
+    args = parser.parse_args()
+    try:
+        data = load(args.manifest)
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        print(f"拒绝分析: {exc}", file=sys.stderr)
+        return 1
+    print(f"数据清单: {args.manifest.resolve()}（来源配置由清单登记，文件哈希已核对）")
     have = [a for a in ARMS if data[a]]
     missing = [a for a in ARMS if not data[a]]
     if missing:
@@ -85,8 +145,7 @@ def main() -> int:
             print(f"     A=$(ls -d runs/*{a}*sub255*/adapter/step30000); "
                   f"python scripts/run_eval_kframe.py --arm {a} --adapter \"$A\" "
                   f"--num_trials_per_task 50 --eval_batch 8 --run_note sub255")
-        print("   **不补就只能做非配对比较**，SE 约 3.0 而非 ~2.0，"
-              "而 2×2 的差值正是 1–6 点这个量级。\n")
+        print("   当前只报告已登记且完整的实验臂；配对带来的精度收益以实测为准。\n")
     if len(have) < 2:
         print("至少要两臂才能配对。")
         return 1
@@ -125,7 +184,7 @@ def main() -> int:
         #    配对能把 SE 从 3.1 压到 ~2.0，而 G3/G4 实测不一致率 34%，
         #    SE 只从 2.98 降到 2.74（收益 8%，不是 35%）。**不打印这个数，
         #    就会以为"做了配对所以更灵敏"，而实际上几乎没有。**
-        se = math.sqrt(n_b + n_a) / len(keys) * 100 if (n_b + n_a) else float("nan")
+        se = math.sqrt(n_b + n_a) / len(keys) * 100
         print(f"{desc:<34}{(p[a]-p[b])*100:+7.2f}{agree:>7}{n_b:>6}{n_a:>6}"
               f"{se:>7.2f}{z:>7.2f}{pv:>9.4f}")
 
@@ -137,6 +196,18 @@ def main() -> int:
         print(f"  池化侧用度量坐标   {pool * 100:+6.2f} 点")
         print(f"  PE 侧用度量坐标    {pe * 100:+6.2f} 点")
         print(f"  交互（超加性）     {inter * 100:+6.2f} 点")
+        print("  逐局配对正态近似 95% 区间（描述性；不包含训练种子方差）：")
+        for label, weights in (
+            ("池化", {"M2": .5, "G4": .5, "G3": -.5, "M3": -.5}),
+            ("PE", {"M3": .5, "G4": .5, "G3": -.5, "M2": -.5}),
+            ("交互", {"G4": 1, "M2": -1, "M3": -1, "G3": 1}),
+        ):
+            values = [sum(w * data[a][k] for a, w in weights.items()) for k in keys]
+            mean = sum(values) / len(values)
+            se = math.sqrt(sum((v - mean) ** 2 for v in values)
+                           / (len(values) - 1) / len(values))
+            print(f"    {label}: [{100 * (mean - 1.96 * se):+.2f}, "
+                  f"{100 * (mean + 1.96 * se):+.2f}] 点")
         print("  ⚠️ **两次单独胜出不等于超加性** —— 要声称"
               "『超出两个独立收益之和』，看的是交互这一行本身。")
 

@@ -15,6 +15,7 @@
 #    切回 GPU 模式后先跑: bash setup/check_gpu.sh
 # ============================================================================
 set -euo pipefail
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # ---------------------------------------------------------- 0. 定位数据盘
 # 系统盘通常很小(30G)，环境和模型都必须放数据盘，否则装到一半爆盘。
@@ -248,7 +249,7 @@ pip install "imageio[ffmpeg]" matplotlib pandas
 # ⚠️ 关键一步：OpenVLA 锁死了直接依赖，但那些包对传递依赖大多没设上界，
 #    pip 会拉来 2026 年的 numpy / opencv / tensorflow-metadata，导致运行时崩溃。
 #    setup/constraints.txt 里按"实际能跑通的交集"逐个钉死，必须放在所有 pip 安装之后。
-CONSTRAINTS="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/setup/constraints.txt"
+CONSTRAINTS="$REPO_DIR/setup/constraints.txt"
 if [ -f "$CONSTRAINTS" ]; then
   echo "==> 应用传递依赖约束: $CONSTRAINTS"
   pip install -r "$CONSTRAINTS"

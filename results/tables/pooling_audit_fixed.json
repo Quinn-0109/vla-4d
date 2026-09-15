@@ -1,0 +1,170 @@
+{
+  "K": 8,
+  "budget": 256,
+  "n_t": 2,
+  "enforce_n": 0,
+  "partition": "quantile_fixed",
+  "rows": [
+    {
+      "arm": "G2",
+      "real_frames": 1,
+      "output_slots": 256,
+      "used_slots": 256,
+      "empty_slots": 0,
+      "dropped_valid_patches": 0,
+      "latest_frame_kept": 256,
+      "cross_frame_slots": 0
+    },
+    {
+      "arm": "G3",
+      "real_frames": 1,
+      "output_slots": 256,
+      "used_slots": 256,
+      "empty_slots": 0,
+      "dropped_valid_patches": 0,
+      "latest_frame_kept": 256,
+      "cross_frame_slots": 0
+    },
+    {
+      "arm": "G2",
+      "real_frames": 2,
+      "output_slots": 256,
+      "used_slots": 242,
+      "empty_slots": 14,
+      "dropped_valid_patches": 0,
+      "latest_frame_kept": 256,
+      "cross_frame_slots": 0
+    },
+    {
+      "arm": "G3",
+      "real_frames": 2,
+      "output_slots": 256,
+      "used_slots": 256,
+      "empty_slots": 0,
+      "dropped_valid_patches": 0,
+      "latest_frame_kept": 256,
+      "cross_frame_slots": 256
+    },
+    {
+      "arm": "G2",
+      "real_frames": 3,
+      "output_slots": 256,
+      "used_slots": 243,
+      "empty_slots": 13,
+      "dropped_valid_patches": 0,
+      "latest_frame_kept": 256,
+      "cross_frame_slots": 0
+    },
+    {
+      "arm": "G3",
+      "real_frames": 3,
+      "output_slots": 256,
+      "used_slots": 256,
+      "empty_slots": 0,
+      "dropped_valid_patches": 0,
+      "latest_frame_kept": 256,
+      "cross_frame_slots": 256
+    },
+    {
+      "arm": "G2",
+      "real_frames": 4,
+      "output_slots": 256,
+      "used_slots": 256,
+      "empty_slots": 0,
+      "dropped_valid_patches": 0,
+      "latest_frame_kept": 256,
+      "cross_frame_slots": 0
+    },
+    {
+      "arm": "G3",
+      "real_frames": 4,
+      "output_slots": 256,
+      "used_slots": 256,
+      "empty_slots": 0,
+      "dropped_valid_patches": 0,
+      "latest_frame_kept": 256,
+      "cross_frame_slots": 256
+    },
+    {
+      "arm": "G2",
+      "real_frames": 5,
+      "output_slots": 256,
+      "used_slots": 245,
+      "empty_slots": 11,
+      "dropped_valid_patches": 0,
+      "latest_frame_kept": 256,
+      "cross_frame_slots": 0
+    },
+    {
+      "arm": "G3",
+      "real_frames": 5,
+      "output_slots": 256,
+      "used_slots": 242,
+      "empty_slots": 14,
+      "dropped_valid_patches": 0,
+      "latest_frame_kept": 256,
+      "cross_frame_slots": 121
+    },
+    {
+      "arm": "G2",
+      "real_frames": 6,
+      "output_slots": 256,
+      "used_slots": 216,
+      "empty_slots": 40,
+      "dropped_valid_patches": 0,
+      "latest_frame_kept": 256,
+      "cross_frame_slots": 0
+    },
+    {
+      "arm": "G3",
+      "real_frames": 6,
+      "output_slots": 256,
+      "used_slots": 242,
+      "empty_slots": 14,
+      "dropped_valid_patches": 0,
+      "latest_frame_kept": 256,
+      "cross_frame_slots": 242
+    },
+    {
+      "arm": "G2",
+      "real_frames": 7,
+      "output_slots": 256,
+      "used_slots": 252,
+      "empty_slots": 4,
+      "dropped_valid_patches": 0,
+      "latest_frame_kept": 256,
+      "cross_frame_slots": 0
+    },
+    {
+      "arm": "G3",
+      "real_frames": 7,
+      "output_slots": 256,
+      "used_slots": 242,
+      "empty_slots": 14,
+      "dropped_valid_patches": 0,
+      "latest_frame_kept": 256,
+      "cross_frame_slots": 242
+    },
+    {
+      "arm": "G2",
+      "real_frames": 8,
+      "output_slots": 256,
+      "used_slots": 200,
+      "empty_slots": 56,
+      "dropped_valid_patches": 0,
+      "latest_frame_kept": 256,
+      "cross_frame_slots": 0
+    },
+    {
+      "arm": "G3",
+      "real_frames": 8,
+      "output_slots": 256,
+      "used_slots": 242,
+      "empty_slots": 14,
+      "dropped_valid_patches": 0,
+      "latest_frame_kept": 256,
+      "cross_frame_slots": 242
+    }
+  ],
+  "scope": "规则网格与补帧掩码诊断；不是 LIBERO 评测，不含真实深度或视觉特征"
+}

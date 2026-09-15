@@ -273,7 +273,7 @@ def _fps_indices(x: torch.Tensor, m: int) -> torch.Tensor:
 
 def _quantile_assign(qi: torch.Tensor, budget: int, n_t: int,
                      group_axes: tuple[int, ...], n_group: tuple[int, ...],
-                     extent) -> tuple[torch.Tensor, int]:
+                     extent, fixed_axes: bool = False) -> tuple[torch.Tensor, int]:
     """
     **等量分箱**：箱数沿用体素那套规则，但每个轴的**箱边取该轴的分位数**
     （等距 → 等量）。返回 (inv, m)。
@@ -302,6 +302,12 @@ def _quantile_assign(qi: torch.Tensor, budget: int, n_t: int,
     for ax in range(c):
         nb = max(1, g[ax])
         if nb == 1:
+            continue
+        if fixed_axes and (ax in group_axes or ax == 0):
+            # 箱数搜索按固定时间边界计算占用；不能在分配时按有效帧重切时间。
+            # K=8 只有末两帧有效时，旧路径从一个时间箱变成两个，产生 512 格，
+            # top-budget 截断会把最新一帧整个丢掉。新版本只对自由空间轴取分位数。
+            idx[:, ax] = (qi[:, ax] * nb).floor().long().clamp(0, nb - 1)
             continue
         # ⚠️ **箱边取"值"的分位数，不是按秩切。** 按秩切会把**并列值拆开**：
         #    同一个 (h,w) 在不同帧上值相同、秩不同，于是同位置的 patch 落进
@@ -459,9 +465,10 @@ def coord_bin_pool(
             if partition == "fps":
                 # 时间解耦 + 空间 FPS（默认）。见 _fps_assign 的说明
                 inv, m = _fps_assign(qi, budget, n_t or 1, group_axes, n_group)
-            elif partition == "quantile":
+            elif partition in ("quantile", "quantile_fixed"):
                 inv, m = _quantile_assign(qi, budget, n_t or 1,
-                                          group_axes, n_group, span)
+                                          group_axes, n_group, span,
+                                          fixed_axes=partition == "quantile_fixed")
             elif partition == "voxel":
                 # 均匀体素（旧版，保留作对照）。extent = 各轴物理跨度，
                 # 让体素在物理空间里是立方体（见 _resolve_bins）
@@ -475,7 +482,7 @@ def coord_bin_pool(
                 m = keys.shape[0]
             else:
                 raise ValueError(
-                    f"partition 只能是 'quantile'/'fps'/'voxel'，收到 {partition!r}")
+                    f"partition 只能是 quantile/quantile_fixed/fps/voxel，收到 {partition!r}")
             cnt = torch.zeros(m, device=device).index_add_(
                 0, inv, torch.ones(tv, device=device))
 

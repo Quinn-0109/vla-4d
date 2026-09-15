@@ -1,0 +1,108 @@
+{
+  "arms": {
+    "G3": {
+      "dataset": "sub255",
+      "checkpoint": "runs/REPLACE_G3_sub255/adapter/step30000",
+      "protocol": {
+        "suite": "libero_10",
+        "dataset_sha256": "REPLACE_WITH_SUBSET_MANIFEST_SHA256",
+        "checkpoint_step": 30000,
+        "K": 8,
+        "stride": 16,
+        "budget": 256,
+        "n_t": 2,
+        "enforce_n": 0,
+        "center_crop": true,
+        "eval_batch": 8,
+        "seed": 7,
+        "num_trials_per_task": 50,
+        "training_seed": "REPLACE_FROM_TRAINING_RECORD",
+        "eval_code_commit": "REPLACE_WITH_EVALUATION_COMMIT"
+      },
+      "files": [
+        {
+          "path": "../results/logs/REPLACE_G3.episodes.jsonl",
+          "sha256": "REPLACE_WITH_FILE_SHA256"
+        }
+      ]
+    },
+    "M3": {
+      "dataset": "sub255",
+      "checkpoint": "runs/REPLACE_M3_sub255/adapter/step30000",
+      "protocol": {
+        "suite": "libero_10",
+        "dataset_sha256": "REPLACE_WITH_SUBSET_MANIFEST_SHA256",
+        "checkpoint_step": 30000,
+        "K": 8,
+        "stride": 16,
+        "budget": 256,
+        "n_t": 2,
+        "enforce_n": 0,
+        "center_crop": true,
+        "eval_batch": 8,
+        "seed": 7,
+        "num_trials_per_task": 50,
+        "training_seed": "REPLACE_FROM_TRAINING_RECORD",
+        "eval_code_commit": "REPLACE_WITH_EVALUATION_COMMIT"
+      },
+      "files": [
+        {
+          "path": "../results/logs/REPLACE_M3.episodes.jsonl",
+          "sha256": "REPLACE_WITH_FILE_SHA256"
+        }
+      ]
+    },
+    "M2": {
+      "dataset": "sub255",
+      "checkpoint": "runs/REPLACE_M2_sub255/adapter/step30000",
+      "protocol": {
+        "suite": "libero_10",
+        "dataset_sha256": "REPLACE_WITH_SUBSET_MANIFEST_SHA256",
+        "checkpoint_step": 30000,
+        "K": 8,
+        "stride": 16,
+        "budget": 256,
+        "n_t": 2,
+        "enforce_n": 0,
+        "center_crop": true,
+        "eval_batch": 8,
+        "seed": 7,
+        "num_trials_per_task": 50,
+        "training_seed": "REPLACE_FROM_TRAINING_RECORD",
+        "eval_code_commit": "REPLACE_WITH_EVALUATION_COMMIT"
+      },
+      "files": [
+        {
+          "path": "../results/logs/REPLACE_M2.episodes.jsonl",
+          "sha256": "REPLACE_WITH_FILE_SHA256"
+        }
+      ]
+    },
+    "G4": {
+      "dataset": "sub255",
+      "checkpoint": "runs/REPLACE_G4_sub255/adapter/step30000",
+      "protocol": {
+        "suite": "libero_10",
+        "dataset_sha256": "REPLACE_WITH_SUBSET_MANIFEST_SHA256",
+        "checkpoint_step": 30000,
+        "K": 8,
+        "stride": 16,
+        "budget": 256,
+        "n_t": 2,
+        "enforce_n": 0,
+        "center_crop": true,
+        "eval_batch": 8,
+        "seed": 7,
+        "num_trials_per_task": 50,
+        "training_seed": "REPLACE_FROM_TRAINING_RECORD",
+        "eval_code_commit": "REPLACE_WITH_EVALUATION_COMMIT"
+      },
+      "files": [
+        {
+          "path": "../results/logs/REPLACE_G4.episodes.jsonl",
+          "sha256": "REPLACE_WITH_FILE_SHA256"
+        }
+      ]
+    }
+  }
+}

@@ -19,7 +19,7 @@
       而 G4 vs M2 正是强命题的唯一直接证据。
 
     export OPENVLA_ROOT=<openvla 路径>
-    python scripts/check_wire.py --arms G1,G3,G4,M2
+    python scripts/check_wire.py --arms G3,M3,M2,G4
 
 权重默认用手上已有的 libero-spatial 微调版（挂点验证与权重是哪一份无关，
 省一次 15 GB 下载）。已经下过就加 `--offline` 完全走本地缓存；
@@ -97,9 +97,10 @@ def load_depth_and_cams(cache_dir: str, cam_json: str, k: int, b: int):
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--arms", default="G1,G3,G4,M2")
+    ap.add_argument("--arms", default="G3,M3,M2,G4")
     ap.add_argument("--K", type=int, default=8)
     ap.add_argument("--batch", type=int, default=1)
+    ap.add_argument("--partition", choices=("quantile", "quantile_fixed", "voxel", "fps"), default="quantile")
     ap.add_argument("--cache_dir", default="results/depth_cache")
     ap.add_argument("--camera", default="results/tables/camera_libero.json")
     ap.add_argument("--ckpt", default=CKPT,
@@ -136,7 +137,7 @@ def main() -> None:
     px = torch.randn(B, K * 6, 224, 224, dtype=torch.bfloat16, device=dev)
 
     def run(arm, dep):
-        cfg = WireConfig(arm=arm, K=K,
+        cfg = WireConfig(arm=arm, K=K, partition=args.partition,
                          bbox=bbox)   # needs_depth 的臂都要，别列臂名
         st = wire(model, cfg)
         try:
@@ -193,15 +194,19 @@ def main() -> None:
         print("  ❌ G4 不随深度变 = 度量坐标没进到模型里，那个'G4'是带深度通道的 G3。")
 
     print(f"\n=== D: G4 与 M2 必须不同（池化侧逐位相同，只差 PE 坐标）===")
+    ok_d = True
     if "G4" in res and "M2" in res:
         d = float((res["G4"] - res["M2"]).abs().max())
         if d > 1e-3:
             print(f"  ✅ |Δlogits|max = {d:.2e}，PE 侧坐标确实起作用")
         else:
+            ok_d = False
             print(f"  ❌ |Δlogits|max = {d:.2e} —— PE 侧坐标没起作用。"
                   "\n     G4 vs M2 是强命题的唯一直接证据，这条通路不存在就没得测。")
     else:
         print("  （没同时跑 G4 与 M2，跳过）")
+    if not (ok_c and ok_d):
+        raise SystemExit("挂点验证失败，停止后续训练")
 
 
 if __name__ == "__main__":

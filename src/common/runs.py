@@ -16,7 +16,9 @@ CONFIG = "adapter_config.json"
 
 
 def is_adapter(p: Path) -> bool:
-    return (p / CONFIG).is_file()
+    return (p / CONFIG).is_file() and any(
+        (p / name).is_file() and (p / name).stat().st_size > 0
+        for name in ("adapter_model.safetensors", "adapter_model.bin"))
 
 
 def list_adapters(run_root="runs"):
@@ -42,11 +44,11 @@ def resolve_adapter(path, run_root="runs") -> Path:
         return p
 
     have = list_adapters(run_root)
-    why = ("这个目录不存在" if not p.exists() else
-           f"目录在，但里面没有 {CONFIG}（存的是"
+    why = ("这个路径不是目录" if not p.is_dir() else
+           f"目录在，但缺少 {CONFIG} 或非空 adapter 权重（存的是"
            f" {sorted(x.name for x in p.iterdir())[:6]} …）")
     lines = [f"加载不了 adapter: {p}", f"  {why}"]
-    if p.exists() and not is_adapter(p):
+    if p.is_dir() and not is_adapter(p):
         # 上一级/下一级常常才是对的：runs/<exp>/adapter 与 .../adapter/step30000
         near = [d for d in list(p.glob("step*")) + [p.parent] if is_adapter(d)]
         if near:
@@ -66,6 +68,7 @@ def _selftest() -> None:
         good = root / "G2+x" / "adapter" / "step30000"
         good.mkdir(parents=True)
         (good / CONFIG).write_text(json.dumps({}))
+        (good / "adapter_model.safetensors").write_bytes(b"test weight placeholder")
         (root / "G2+x" / "adapter" / "step2500").mkdir(parents=True)   # 半截的，不算
 
         assert resolve_adapter(good, root) == good

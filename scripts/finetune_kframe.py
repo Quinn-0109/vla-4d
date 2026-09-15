@@ -51,6 +51,8 @@ from prismatic.vla.datasets import RLDSDataset  # noqa: E402
 from prismatic.vla.datasets.rlds.utils.data_utils import save_dataset_statistics  # noqa: E402
 
 from common.lora import lora_targets  # noqa: E402
+from common.provenance import prepare_training, validate_config  # noqa: E402
+from common.checkpoints import checkpoint_directory  # noqa: E402
 from data.depth_cache import DepthCache  # noqa: E402
 from data.kframe import (KFrameBatchTransform, PaddedCollatorKFrame,  # noqa: E402
                          patch_strided_chunking)
@@ -113,6 +115,7 @@ class Config:
     stride: int = 16                           # docs/05 §9.3 定稿
     budget: int = 256                          # docs/06 §3.0：N=256，所有组同预算
     n_t: int = 2
+    partition: str = "quantile"
 
     vla_path: str = "openvla/openvla-7b"
     data_root_dir: Path = Path("datasets/modified_libero_rlds")
@@ -166,12 +169,13 @@ class Config:
     #    G3/M3 用 242 个、M2/G4 用 256 个，剩下的是**全零向量**，仍占位仍被注意 ——
     #    于是 G4−G3 里混进 5.5% 的预算差，而 protocol 写的是"N=256 全组相同"。
     #    给定时 `coord_bin_pool` 只保留 patch 数最多的 N 个箱，输出长度就是 N，
-    #    **一个空槽都没有**，四臂严格同预算。
+    #    不足 N 个非空箱时仍有空槽；不能保证不同臂实际有效 token 数相同。
     #    ⚠️ **默认 0（关）是刻意的**：四格已按"不拉平"训完，打开它做评测就是
     #    训练/评测不一致 —— 那比这个偏差本身更糟。要用就四臂一起重训
     #    （~100 h，见 `docs/05` §13.5 的选项 B）。
     enforce_n: int = 0
     run_id_note: Optional[str] = None
+    seed: Optional[int] = None                # None 保留旧行为；新实验建议显式设置
     # fmt: on
 
 
@@ -241,8 +245,16 @@ def _host_mem() -> dict:
 
 @draccus.wrap()
 def main(cfg: Config) -> None:
+    validate_config(cfg, training=True)
     assert torch.cuda.is_available(), "需要 GPU"
     dev = "cuda"
+    from common.tf_cpu import hide_gpu_from_tf
+    hide_gpu_from_tf()
+    if cfg.seed is not None:
+        from transformers import set_seed
+        set_seed(cfg.seed)
+        import tensorflow as tf
+        tf.random.set_seed(cfg.seed)
 
     # G4/M2 的三份前置产物，缺一不可。**在加载 7B 之前查**。
     # ⚠️ M3 只有 PE 侧用度量坐标，但同样要深度与包围盒 —— 用 needs_depth 判，
@@ -306,7 +318,7 @@ def main(cfg: Config) -> None:
         sub_cache = DepthCache.load(sp)
         print(f"固定子集：{len(sub_cache.idx)} 帧（{sp}）")
 
-    micro, accum = MICRO_ARM.get(cfg.arm, MICRO[cfg.K])
+    micro, accum = MICRO.get(cfg.K, (1, EFF_BATCH))
     if cfg.micro:
         # ⚠️ **有效批必须恒为 16**（docs/06 §4.4）。只让改微批，累积自动配平；
         #    除不尽就直接拒绝 —— 有效批一旦跟着显存漂移，跨臂比较就作废了，
@@ -324,10 +336,36 @@ def main(cfg: Config) -> None:
               # ⚠️ 进 exp_id：不带子集训的 G3 **不属于 2×2**，目录名必须自带警告，
               #    否则半年后翻 runs/ 的人会把它当成四格里的 G3。
               f"{'+fulldata' if cfg.no_subset else ''}")
+    if cfg.enforce_n:
+        exp_id += f"+e{cfg.enforce_n}"
+    if cfg.partition != "quantile":
+        exp_id += f"+{cfg.partition}"
+    if cfg.seed is not None:
+        exp_id += f"+seed{cfg.seed}"
+    if cfg.bench_only:
+        exp_id += "+bench"
     if cfg.run_id_note:
         exp_id += f"--{cfg.run_id_note}"
     run_dir = Path(cfg.run_root_dir) / exp_id
     adapter_dir = run_dir / "adapter"
+    if cfg.resume_from == "auto":
+        candidates = sorted((p for p in adapter_dir.glob("step*")
+                             if p.name[4:].isdigit() and (p / "trainer_state.pt").is_file()
+                             and (p / "adapter_model.safetensors").is_file()),
+                            key=lambda p: int(p.name[4:]))
+        if not candidates:
+            raise SystemExit(f"没有可续训的完整 checkpoint: {adapter_dir}")
+        cfg.resume_from = str(candidates[-1])
+    resume_path = Path(cfg.resume_from).expanduser().resolve() if cfg.resume_from else None
+    if resume_path:
+        cfg.resume_from = str(resume_path)
+        needed = [resume_path / "adapter_model.safetensors"]
+        if not cfg.eval_only:
+            needed.append(resume_path / "trainer_state.pt")
+        if not all(p.is_file() for p in needed):
+            raise SystemExit(f"续训缺少权重或优化器状态: {resume_path}")
+    if not cfg.eval_only:
+        prepare_training(cfg, run_dir, Path(__file__).resolve().parents[1], resume_path)
     run_dir.mkdir(parents=True, exist_ok=True)
     print(f"运行目录: {run_dir}\n有效批 = {micro} × {accum} = {micro * accum}")
 
@@ -352,7 +390,7 @@ def main(cfg: Config) -> None:
     # ⚠️ 接线必须在 peft 包装**之后**：get_peft_model 会代理属性，
     #    包装前挂上去的 forward 会被代理层绕过（挂了等于没挂，且不报错）。
     wcfg = WireConfig(arm=cfg.arm, K=cfg.K, budget=cfg.budget, n_t=cfg.n_t,
-                      bbox=bbox, enforce_n=cfg.enforce_n or None)
+                      bbox=bbox, enforce_n=cfg.enforce_n or None, partition=cfg.partition)
     state = wire(vla.base_model.model, wcfg)
     print(f"已接线: arm={cfg.arm}  K={cfg.K}  N={cfg.budget}  n_t={cfg.n_t}")
 
@@ -363,31 +401,14 @@ def main(cfg: Config) -> None:
         from peft import set_peft_model_state_dict
         from safetensors.torch import load_file
         src = Path(cfg.resume_from)
-        if cfg.resume_from == "auto":
-            # ⚠️ 容器重启会把训练进程一并带走（G3 死在 26970/30000 就是这样：
-            #    cgroup oom_kill=0、磁盘没满，PID 1 的启动时刻正好对上）。
-            #    重启后人工拼路径要挑"最新且**优化器状态还在**"的那个 ——
-            #    `keep_all_optim=False` 只给最新的存 trainer_state.pt，
-            #    上次 G2 就是照着步数挑、挑中一个没有优化器的，当场 FileNotFound。
-            #    所以这里按"有 trainer_state.pt"筛，不是按步数最大。
-            cand = sorted(
-                (int(d.name[4:]) for d in adapter_dir.glob("step*")
-                 if d.name[4:].isdigit() and (d / "trainer_state.pt").exists()),
-                reverse=True)
-            if not cand:
-                have = sorted(d.name for d in adapter_dir.glob("step*"))
-                raise SystemExit(
-                    f"--resume_from auto：{adapter_dir} 下没有带优化器状态的 checkpoint。\n"
-                    f"  现有: {have or '（空）'}\n"
-                    "  （只有最新的那个存 trainer_state.pt；要保留全部就加 "
-                    "--keep_all_optim True）")
-            src = adapter_dir / f"step{cand[0]}"
-            print(f"--resume_from auto → 选中 {src}"
-                  + (f"（跳过了 {cand[1:]}，它们没有优化器状态）" if len(cand) > 1 else ""))
         set_peft_model_state_dict(vla, load_file(src / "adapter_model.safetensors"))
-        ck = torch.load(src / "trainer_state.pt", map_location="cpu")
-        optimizer.load_state_dict(ck["optimizer"])
-        start_step = ck["step"]
+        if not cfg.eval_only:
+            ck = torch.load(src / "trainer_state.pt", map_location="cpu")
+            optimizer.load_state_dict(ck["optimizer"])
+            start_step = ck["step"]
+        if start_step >= cfg.max_steps and not cfg.eval_only:
+            print(f"checkpoint 已完成 {start_step} 步，目标 {cfg.max_steps}，无需再更新权重。")
+            return
         print(f"从 {src} 续训，已完成 {start_step} 步")
 
     # ⚠️ 数据集路径先自己查一遍。tfds 找不到时会吐三百行的全球数据集清单
@@ -427,7 +448,8 @@ def main(cfg: Config) -> None:
         shuffle_buffer_size=cfg.shuffle_buffer_size,
         image_aug=cfg.image_aug,
     )
-    save_dataset_statistics(dataset.dataset_statistics, run_dir)
+    if not cfg.eval_only:
+        save_dataset_statistics(dataset.dataset_statistics, run_dir)
     if sub_cache is not None:
         from data.subset_filter import SubsetFiltered
         dataset = SubsetFiltered(dataset, sub_cache)
@@ -451,9 +473,10 @@ def main(cfg: Config) -> None:
 
     def save(step: int) -> None:
         d = adapter_dir / f"step{step}"
-        vla.save_pretrained(d)
-        torch.save({"optimizer": optimizer.state_dict(), "step": step},
-                   d / "trainer_state.pt")
+        with checkpoint_directory(d) as staging:
+            vla.save_pretrained(staging)
+            torch.save({"optimizer": optimizer.state_dict(), "step": step},
+                       staging / "trainer_state.pt")
         processor.save_pretrained(run_dir)
         # ⚠️ 权重的清理：本项目已经因为盘满断过一次长跑（G2 停在 32500）。
         #    **删之前先确认新的已经存好**——顺序反了就是两头落空。
@@ -487,10 +510,8 @@ def main(cfg: Config) -> None:
         print(f"\n[step {step}] 已存 -> {d}")
         # ⚠️ 续训**必须用同一个 --micro**：exp_id 里带 b{micro}x{accum}，
         #    换了微批就写进另一个目录，等于从头再来而且不报错。
-        print(f"  续训: python scripts/finetune_kframe.py --arm {cfg.arm} "
-              f"--micro {micro} --data_root_dir {cfg.data_root_dir} "
-              + (f"--run_id_note {cfg.run_id_note} " if cfg.run_id_note else "")
-              + f"--resume_from {d}", flush=True)
+        print(f"  配置已归档: {run_dir / 'run_config.json'}；续训请用原命令并加 "
+              f"--resume_from auto（保留 no_subset、enforce_n、seed 等参数）。", flush=True)
 
     # ⚠️⚠️ **第一批就把形状钉死。** openvla 的 RLDSDataset 把 window_size=1 写死在
     #    构造函数里，K 一旦没顶进去就会静默退化成单帧：pixel_values 变成
@@ -540,6 +561,7 @@ def main(cfg: Config) -> None:
         hit = tot = 0
         loss_sum = 0.0
         checked = False
+        i = -1
         with torch.no_grad():
             for i, batch in enumerate(loader):
                 if i >= cfg.eval_steps:
@@ -576,6 +598,8 @@ def main(cfg: Config) -> None:
                     print(f"  {i + 1:>4}/{cfg.eval_steps} 微批  "
                           f"acc {hit / max(tot, 1):.3f}  loss {loss_sum / (i + 1):.3f}",
                           flush=True)
+        if i < 0:
+            raise RuntimeError("数据集未产出任何评估批次")
         print(f"\n=== 只前向复核（{cfg.arm}，{cfg.resume_from}）===")
         print(f"  动作 token 准确率 {hit / max(tot, 1):.4f}（{hit}/{tot}）")
         print(f"  loss {loss_sum / max(min(cfg.eval_steps, i + 1), 1):.4f}")
@@ -586,6 +610,7 @@ def main(cfg: Config) -> None:
     vla.train()
     optimizer.zero_grad()
     checked_rope = False
+    step = start_step
     with tqdm.tqdm(total=cfg.max_steps, initial=start_step) as bar:
         for micro_idx, batch in enumerate(loader):
             if micro_idx == 0:
@@ -660,7 +685,10 @@ def main(cfg: Config) -> None:
             if step >= cfg.max_steps:
                 break
 
-    save(min(step, cfg.max_steps))
+    if step == start_step:
+        raise RuntimeError("数据不足以完成一个有效梯度批次，未保存 checkpoint")
+    if step % cfg.save_steps != 0:
+        save(step)
     print(f"完成 -> {adapter_dir}")
 
 

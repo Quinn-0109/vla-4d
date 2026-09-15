@@ -64,6 +64,7 @@ class WireConfig:
     n_t: int = N_T_DEFAULT
     head_dim: int = 128
     enforce_n: Optional[int] = None     # 跨臂拉平后的公共预算
+    partition: str = "quantile"       # 旧 checkpoint 保留原算法；quantile_fixed 修复补帧期时间重切
     bbox: Optional[torch.Tensor] = None  # (2,3) 工作空间包围盒，G4/M2 必需
 
     def __post_init__(self):
@@ -236,7 +237,7 @@ def _pool_and_coords(emb: torch.Tensor, cfg: WireConfig, bt: _Batch):
 
     kw = dict(group_axes=(0,), n_group=(k,)) if cfg.arm == "G2" else dict(n_t=cfg.n_t)
     out = coord_bin_pool(emb, pc, cfg.budget, lo, hi,
-                         enforce_n=cfg.enforce_n, valid=valid, **kw)
+                         enforce_n=cfg.enforce_n, valid=valid, partition=cfg.partition, **kw)
 
     # PE 侧坐标 —— 2×2 的四格在这里分开。**两个错配臂都是"另取一套坐标算质心"**，
     # 走的是同一份 `_grid_centroid`（它对任意坐标张量通用），
@@ -484,6 +485,7 @@ def set_vision_feats(state: _State, feats) -> None:
     state.vision_feats = feats
 
 
+@torch.no_grad()
 def frame_feats(state: _State, model, px6) -> torch.Tensor:
     """
     单帧 (1, 6, H, W) → (1, 256, D)，走**未经包装的原始主干**。

@@ -1,0 +1,23 @@
+{
+  "root": "C:\\Users\\HUAWEI\\Documents\\New project\\vla-4d-review",
+  "code": {
+    "commit": "2dc0c16c267d68471998932f762de7a089ebf630",
+    "source_sha256": "44d8b73e6278624e3a1c7ac74f9dd87ef9a403d13d3a6b97624ebc62dda3f996"
+  },
+  "python_files": 56,
+  "syntax_errors": [],
+  "package_versions": {
+    "torch": "2.2.0+cpu",
+    "numpy": "1.26.4",
+    "transformers": null,
+    "peft": null,
+    "tensorflow": null,
+    "draccus": null
+  },
+  "openvla_root": null,
+  "adapters": [],
+  "episode_files": [],
+  "metadata_missing": [],
+  "scope": "文件/语法/已安装版本检查；不验证 CUDA、EGL、模型前向、训练或成功率",
+  "next_action": "没有本地结果；在训练机运行同一命令，先收集 checkpoint 与逐局日志"
+}

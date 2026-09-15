@@ -160,24 +160,37 @@ def eval_status() -> None:
                                    if live_eval and live_eval[0] == arm else "— 未评"))
             continue
 
+        # 只允许同一运行的分段合并；不同 step/batch/note 不按修改时间混合。
+        groups = {re.sub(r"-t\d+_-?\d+(?=--|\.txt$)", "", f.name) for f in cand}
+        if len(groups) != 1:
+            print(f"  {arm:<4}⚠️ 有 {len(groups)} 组评测配置，拒绝自动合并；请显式选择来源")
+            continue
+
         # ⚠️ **分段跑会写到多个文件**（run_id 里带 -t{start}_{end}），
         #    每个各自 PARTIAL。只看最新那一个，会把"两段合起来已经跑完"
         #    误报成"断在第 5 个 task"，并给出一个**错误的续跑位置**。
-        #    所以按 task_id 取并集：同一个 task 出现在多个文件里时以最新的为准。
-        seen, whole = {}, None
+        #    所以仅合并同一运行的不重叠分段；重复 task 拒绝汇总。
+        seen, whole, duplicate = {}, None, False
         for f in sorted(cand, key=lambda x: x.stat().st_mtime):
             txt = f.read_text(errors="ignore").splitlines()
             for line in txt:
                 m = re.match(r"task (\d+) .*?: (\d+)/(\d+) =", line)
                 if m:
+                    if int(m.group(1)) in seen:
+                        duplicate = True
                     seen[int(m.group(1))] = (int(m.group(2)), int(m.group(3)), f.name)
             for line in txt:
                 if line.startswith("FINAL"):
                     whole = line
+        if duplicate or any(t not in range(N_TASKS) or v[1] != 50 or not 0 <= v[0] <= v[1]
+                            for t, v in seen.items()):
+            print(f"  {arm:<4}⚠️ 聚合记录重复或不是每任务 50 局，拒绝自动汇总")
+            continue
         # 逐局 JSONL 是配对检验（McNemar）的唯一输入，聚合之后恢复不出来。
-        ep = list(Path("results/logs").glob(f"EVAL-*-{arm}-*.episodes.jsonl"))
-        tag = "  逐局✅" if ep else "  逐局❌（配对做不了，需重评）"
-        if whole:                                   # 一次整跑到底
+        ep = list(Path("results/logs").glob(f"EVAL-*-{arm}-*--sub255.episodes.jsonl"))
+        tag = ("  有逐局文件（完整性与来源须用 --manifest 核验）" if ep
+               else "  未发现 sub255 逐局文件（检查来源或补评）")
+        if whole and set(seen) == set(range(N_TASKS)):
             final[arm] = whole
             print(f"  {arm:<4}✅ {whole}{tag}")
             continue
@@ -202,7 +215,7 @@ def eval_status() -> None:
 
     print()
     if len(final) == len(ARMS):
-        print("四臂结果齐了 → 配对（McNemar）分析，输入是 *.episodes.jsonl。")
+        print("聚合日志已覆盖四臂；配对分析须指定 --manifest，不能据此认定逐局数据齐全。")
         print("⚠️ 主分析是 **9-task**（事前登记），10-task 只供与文献并列。")
     else:
         print("⚠️ 判据数 = 覆盖全部 10 个 task 的成绩（单段 FINAL 或多段并集）；"
@@ -251,9 +264,10 @@ def fulldata_status() -> None:
             print(f"       ⚠️ 判读要用 **9-task**（排除 task 1），"
                   f"10-task 的 {sr:.2%} 不是判据数")
     print("  判读表（事前写死，看到数字后不得移动边界）：")
-    print("    ≥38%  缺口是数据量 → 2×2 照常读")
-    print("    33–38% 各占一半 → 限制一节给分解，不得声称跨帧池化更优")
-    print("    ≤33%  跨帧池化本身有害 → 按 06 §3.3 第二转向改写主线")
+    print("    ≥38%  优先检查数据子集的贡献；不能据此证明等价")
+    print("    33–38%  归因仍未定，不作精确比例分解")
+    print("    ≤33%  优先检查跨帧压缩实现与信息损失")
+    print("    以上是资源决策阈值；结论需差值区间，单次训练不覆盖训练种子方差。")
 
 
 if __name__ == "__main__":
