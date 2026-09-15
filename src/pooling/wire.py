@@ -64,7 +64,11 @@ class WireConfig:
     n_t: int = N_T_DEFAULT
     head_dim: int = 128
     enforce_n: Optional[int] = None     # 跨臂拉平后的公共预算
-    partition: str = "quantile"       # 旧 checkpoint 保留原算法；quantile_fixed 修复补帧期时间重切
+    # ⚠️ **默认是修好的那个。** `"quantile"`（旧算法）在补帧期会把**最新一帧整个丢掉**：
+    #    K=8/n_t=2 下有效帧为 2/3/4 时（= episode 的第 16–63 步）实测最新帧存活 0/256。
+    #    留它是为了复现 2026-09 那批 checkpoint，**不是为了继续用**。
+    #    帧独立池化的 G2 不受影响（实测 256/256），所以它只打跨帧四臂。
+    partition: str = "quantile_fixed"
     bbox: Optional[torch.Tensor] = None  # (2,3) 工作空间包围盒，G4/M2 必需
 
     def __post_init__(self):

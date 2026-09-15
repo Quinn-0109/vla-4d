@@ -71,7 +71,10 @@ class PoolingRegressions(unittest.TestCase):
         emb[:,-256:] = 1
         bbox = torch.tensor([[-2.,-2.,-2.],[2.,2.,2.]])
         for arm in ("G3", "M3"):
-            old = _pool_and_coords(emb, WireConfig(arm=arm,K=8,bbox=bbox), bt)[0]
+            # ⚠️ 显式要旧算法。本用例验的就是旧行为，不能靠"默认恰好是它" ——
+            #    默认已于 2026-09-15 翻成 quantile_fixed（`docs/05` §13.9）。
+            old = _pool_and_coords(emb, WireConfig(arm=arm,K=8,bbox=bbox,
+                                                 partition="quantile"), bt)[0]
             new = _pool_and_coords(emb, WireConfig(arm=arm,K=8,bbox=bbox,
                                                  partition="quantile_fixed"), bt)[0]
             self.assertEqual(float(old.abs().sum()), 0)

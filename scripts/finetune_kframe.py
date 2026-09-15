@@ -115,7 +115,9 @@ class Config:
     stride: int = 16                           # docs/05 §9.3 定稿
     budget: int = 256                          # docs/06 §3.0：N=256，所有组同预算
     n_t: int = 2
-    partition: str = "quantile"
+    # ⚠️ 默认已修好。`quantile` 是旧算法，补帧期会丢掉最新一帧
+    #    （`docs/05` §13.9），只用于复现 2026-09 那批 checkpoint。
+    partition: str = "quantile_fixed"
 
     vla_path: str = "openvla/openvla-7b"
     data_root_dir: Path = Path("datasets/modified_libero_rlds")
@@ -338,7 +340,10 @@ def main(cfg: Config) -> None:
               f"{'+fulldata' if cfg.no_subset else ''}")
     if cfg.enforce_n:
         exp_id += f"+e{cfg.enforce_n}"
-    if cfg.partition != "quantile":
+    # ⚠️ 后缀标的是**偏离默认**的那一个。默认翻转之后，带 `+quantile` 的目录
+    #    才是旧算法；而 2026-09 那四格是在翻转之前跑的，**目录名没有后缀却是旧算法**
+    #    —— 见 `docs/05` §13.9 的说明，别只看目录名。
+    if cfg.partition != "quantile_fixed":
         exp_id += f"+{cfg.partition}"
     if cfg.seed is not None:
         exp_id += f"+seed{cfg.seed}"
