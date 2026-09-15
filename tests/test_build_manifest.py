@@ -47,7 +47,9 @@ class ManifestBuilderTests(unittest.TestCase):
             build(self.files, output)
 
     def test_changed_partition_rejected(self):
-        self.change_meta(lambda d: d["training"]["config"].update(partition="quantile_fixed"))
+        # 改成**旧算法**：这正是现实里的失效模式 —— 一个臂用 legacy、其余用 fixed。
+        # （原先改成 quantile_fixed，而默认翻转后那成了空操作，用例静默失效。）
+        self.change_meta(lambda d: d["training"]["config"].update(partition="quantile"))
         with self.assertRaises(ValueError):
             build(self.files, self.root / "manifest.json")
 

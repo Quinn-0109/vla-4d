@@ -79,7 +79,9 @@ class Config:
     stride: int = 16
     budget: int = 256
     n_t: int = 2
-    partition: str = "quantile"
+    # ⚠️ 默认已修好。`quantile` 是旧算法，补帧期会丢掉最新一帧
+    #    （`docs/05` §13.9），只用于复现 2026-09 那批 checkpoint。
+    partition: str = "quantile_fixed"
     # ⭐ **跨臂拉平有效 token 数。** 不给时各臂用满自己能填的槽：真值深度实测
     #    G3/M3 用 242 个、M2/G4 用 256 个，剩下的是**全零向量**，仍占位仍被注意 ——
     #    于是 G4−G3 里混进 5.5% 的预算差，而 protocol 写的是"N=256 全组相同"。

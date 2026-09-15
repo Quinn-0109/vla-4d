@@ -390,7 +390,7 @@ def coord_bin_pool(
     n_t: int | None = None,
     enforce_n: int | None = None,
     valid: torch.Tensor | None = None,
-    partition: str = "quantile",
+    partition: str = "quantile_fixed",
 ) -> PoolOut:
     """
     把 (B, T, D) 的 token 按坐标分箱、箱内平均，压到 budget 个。
