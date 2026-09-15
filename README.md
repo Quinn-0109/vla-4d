@@ -3,7 +3,7 @@
 大创项目：复现 OpenVLA，并沿 4D 时空方向做改进。
 
 **2026-09-15 更新**：CPU 回归发现旧版跨帧等量分箱在历史不足时会丢掉最新帧。
-已加入显式修正版 `quantile_fixed`，旧 checkpoint 默认继续使用 `quantile`。
+训练与评测默认使用修正版 `quantile_fixed`；复现旧 checkpoint 须显式指定 `--partition quantile`。
 下一步优先验证修正版 G3，再判断是否扩展度量几何实验。
 可复现证据、训练命令和验收条件见 [当前推进方案](docs/07-修复与推进.md)。
 已有成功率记录见 `docs/05`；本次没有运行 GPU 训练或 LIBERO 闭环评测。
