@@ -1,0 +1,15 @@
+# arm=G2 K=8 stride=16 N=256 n_t=2 adapter=runs/G2+libero_10_no_noops+K8s16+N256+nt2+b8x2+lr0.0005+lora-r32+frozen-vision+aug--K8fix/adapter/step30000 n/task=50 seed=7
+# 中心裁=开 视觉特征缓存=开
+# 批量=8 局并行（已覆盖 openvla 的 batch>1 断言，见 _allow_batched_generation）
+# ✓ 接线正常（arm=G2，rotary_emb 224 次）
+task 0 'put both the alphabet soup and the tomat': 18/50 = 0.360   累计 18/50 = 0.3600
+task 1 'put both the cream cheese box and the bu': 24/50 = 0.480   累计 42/100 = 0.4200
+task 2 'turn on the stove and put the moka pot o': 24/50 = 0.480   累计 66/150 = 0.4400
+task 3 'put the black bowl in the bottom drawer ': 21/50 = 0.420   累计 87/200 = 0.4350
+task 4 'put the white mug on the left plate and ': 18/50 = 0.360   累计 105/250 = 0.4200
+task 5 'pick up the book and place it in the bac': 24/50 = 0.480   累计 129/300 = 0.4300
+task 6 'put the white mug on the plate and put t': 17/50 = 0.340   累计 146/350 = 0.4171
+task 7 'put both the alphabet soup and the cream': 22/50 = 0.440   累计 168/400 = 0.4200
+task 8 'put both moka pots on the stove': 26/50 = 0.520   累计 194/450 = 0.4311
+task 9 'put the yellow and white mug in the micr': 17/50 = 0.340   累计 211/500 = 0.4220
+FINAL success_rate=0.4220 (211/500)

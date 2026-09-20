@@ -1,0 +1,231 @@
+{
+  "schema_version": 1,
+  "config": {
+    "arm": "G3",
+    "K": 8,
+    "stride": 16,
+    "budget": 256,
+    "n_t": 2,
+    "partition": "quantile_fixed",
+    "enforce_n": 0,
+    "adapter": "/root/autodl-tmp/vla-4d-fixed-cf3e1583/runs/G3+libero_10_no_noops+K8s16+N256+nt2+b8x2+lr0.0005+lora-r32+frozen-vision+aug+fulldata+seed7--fixed-main-20260918/adapter/step30000",
+    "vla_path": "openvla/openvla-7b",
+    "task_suite_name": "libero_10",
+    "num_trials_per_task": 50,
+    "num_steps_wait": 10,
+    "unnorm_key": null,
+    "stats_json": null,
+    "run_root": "runs",
+    "subset_dir": "results/subset/libero_10_s1",
+    "camera_json": "results/tables/camera_libero.json",
+    "verify_env": 3,
+    "center_crop": true,
+    "vision_cache": true,
+    "verify_vision_cache": 0,
+    "eval_batch": 8,
+    "verify_batch": 0,
+    "start_task": 0,
+    "end_task": -1,
+    "seed": 7,
+    "local_log_dir": "results/logs",
+    "run_note": "fixed-main",
+    "overwrite": false,
+    "need_gb": 18.0
+  },
+  "code": {
+    "commit": "933c1bd8396f7580428be58fa5af9f8254764731",
+    "source_sha256": "98d4f4135c5664503995c549adc5e2805b198e0ad0fe073d661f4169329f35b3"
+  },
+  "training": {
+    "schema_version": 1,
+    "config": {
+      "arm": "G3",
+      "K": 8,
+      "stride": 16,
+      "budget": 256,
+      "n_t": 2,
+      "partition": "quantile_fixed",
+      "vla_path": "openvla/openvla-7b",
+      "data_root_dir": "/root/autodl-tmp/datasets/modified_libero_rlds",
+      "dataset_name": "libero_10_no_noops",
+      "run_root_dir": "runs",
+      "max_steps": 30000,
+      "learning_rate": 0.0005,
+      "image_aug": true,
+      "shuffle_buffer_size": 100000,
+      "lora_rank": 32,
+      "lora_dropout": 0.0,
+      "lora_vision": false,
+      "grad_checkpoint": true,
+      "save_steps": 2500,
+      "keep_all_optim": false,
+      "keep_last": 2,
+      "keep_every": 10000,
+      "subset_dir": "results/subset/libero_10_s1",
+      "camera_json": "results/tables/camera_libero.json",
+      "log_steps": 10,
+      "no_subset": true,
+      "resume_from": null,
+      "bench_only": false,
+      "eval_only": false,
+      "eval_steps": 100,
+      "micro": 8,
+      "enforce_n": 0,
+      "run_id_note": "fixed-main-20260918",
+      "seed": 7
+    },
+    "dataset": {
+      "name": "libero_10_no_noops",
+      "selection": "full",
+      "subset_sha256": null,
+      "depth_cache_sha256": null
+    },
+    "code": {
+      "commit": "933c1bd8396f7580428be58fa5af9f8254764731",
+      "source_sha256": "98d4f4135c5664503995c549adc5e2805b198e0ad0fe073d661f4169329f35b3"
+    },
+    "created_at": "2026-09-18T09:28:03.890128+00:00",
+    "resume_source": null,
+    "historical_config_verified": true
+  },
+  "adapter": "/root/autodl-tmp/vla-4d-fixed-cf3e1583/runs/G3+libero_10_no_noops+K8s16+N256+nt2+b8x2+lr0.0005+lora-r32+frozen-vision+aug+fulldata+seed7--fixed-main-20260918/adapter/step30000",
+  "adapter_sha256": "e9ee2bd7d9f18b54fdb43c2d48e092692bb7952414420d8e537efa7220968ae2",
+  "unnorm_key": "libero_10_no_noops",
+  "action_stats": {
+    "action": {
+      "mean": [
+        0.01820324920117855,
+        0.05858374014496803,
+        -0.05592384561896324,
+        0.004626928828656673,
+        0.00289608770981431,
+        -0.007673131301999092,
+        0.5457824468612671
+      ],
+      "std": [
+        0.2825464606285095,
+        0.35904666781425476,
+        0.3673802614212036,
+        0.03770702704787254,
+        0.05429719388484955,
+        0.08725254982709885,
+        0.49815231561660767
+      ],
+      "max": [
+        0.9375,
+        0.9375,
+        0.9375,
+        0.30000001192092896,
+        0.29357144236564636,
+        0.375,
+        1.0
+      ],
+      "min": [
+        -0.9375,
+        -0.9375,
+        -0.9375,
+        -0.23642857372760773,
+        -0.3053571283817291,
+        -0.3675000071525574,
+        0.0
+      ],
+      "q01": [
+        -0.6348214149475098,
+        -0.7741071581840515,
+        -0.7633928656578064,
+        -0.09749999642372131,
+        -0.14819999992847435,
+        -0.2742857038974762,
+        0.0
+      ],
+      "q99": [
+        0.7714285850524902,
+        0.8464285731315613,
+        0.9375,
+        0.13928571343421936,
+        0.15964286029338837,
+        0.3246428668498993,
+        1.0
+      ],
+      "mask": [
+        true,
+        true,
+        true,
+        true,
+        true,
+        true,
+        false
+      ]
+    },
+    "proprio": {
+      "mean": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "std": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "max": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "min": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "q01": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ],
+      "q99": [
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0
+      ]
+    },
+    "num_transitions": 101469,
+    "num_trajectories": 379
+  },
+  "initial_states_sha256": {
+    "0": "0a3fec5f02eebb70c1c38b7fa1eebbb74bdc9499d9664dac239552dab6b908da",
+    "1": "b1052d497a7e006f561f2db76cee1f06d827d9f945e0e5422299f541f18c00db",
+    "2": "9631343c40bbe5ded2f59bca5f63e725f428a762d4b8c4b8fa1b487546291425",
+    "3": "9b5e7c410fc673763dae35df688c2e463d5e404a4c990c6a9dc2bcafd5436a83",
+    "4": "a7356fbcba37b1fde6684c0d839e64205181404a2505d5ffc38fa34009d3aa5e",
+    "5": "adc7c3fd13bfd80ef2c53b6acec553592cbb54fe4b43df83f9e7611c29a4cd0a",
+    "6": "646804b35c86e6195ea6206482011b6aaf8c000ca5610279034a22b399b1c11f",
+    "7": "fec6c3312d8d73c4de89fe3f6c54094664ab303b38ab10708ecc0f0fbff74c50",
+    "8": "dcd0faf3d4c1e13a7596a4c46103d7881b11750de5ba32a64010c1290c09481e",
+    "9": "a5cdea6ddd43f45924947d85feedc2e69de7c6ba9430307d174e67d849629a8d"
+  }
+}
