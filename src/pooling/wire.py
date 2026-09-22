@@ -158,6 +158,8 @@ class _State:
         self.rope_calls: int = 0        # 我们的 rotary_emb 被真正调用了几次
         self.cfg = None                 # wire() 时存下，assert_arm_wiring 要按臂判
         self.slot_mask = None           # 上一次池化的槽有效掩码，见 _patch_projector
+        self.collect_alloc = False      # 打开才算分配统计（见 alloc_stats）
+        self.alloc = None               # 上一次 forward 的分配统计
         self.pe_axes_seen: int = 0      # 上一次 forward 里 PE 坐标真的是几轴
         self.orig: dict = {}            # 原始实现，unwire 时还回去
         # 32 层用的是同一条序列，cos/sin 只算一次（build_rope 不便宜）
@@ -202,7 +204,8 @@ def _patch_vision(model, k: int, state: Optional["_State"] = None) -> None:
     model.vision_backbone.forward = wrapped
 
 
-def _pool_and_coords(emb: torch.Tensor, cfg: WireConfig, bt: _Batch):
+def _pool_and_coords(emb: torch.Tensor, cfg: WireConfig, bt: _Batch,
+                     sink: Optional[dict] = None):
     """
     投影后的 (B, K*256, D) → 池化后的 (B, N, D) + PE 侧要用的东西。
 
@@ -255,7 +258,77 @@ def _pool_and_coords(emb: torch.Tensor, cfg: WireConfig, bt: _Batch):
         coord_pe = out.coord
 
     pos1d = seq_centroid(out.assign, cfg.enforce_n or cfg.budget)
+    if sink is not None:
+        # ⚠️ 用显式的 sink 而不是函数属性/全局：后者非可重入，
+        #    两个 state 共存时会互相覆盖，而那**不会报错**。
+        sink["assign"], sink["valid"] = out.assign, valid
     return out.feat, pos1d, coord_pe, out.mask
+
+
+def alloc_stats(assign: torch.Tensor, k: int, n_slots: int,
+                valid: Optional[torch.Tensor] = None) -> list:
+    """
+    池化分配的统计 —— **演示与诊断共用同一份定义。**
+
+    `assign` 是 `coord_bin_pool` 的 (B, K*256) 槽号（-1 = 未分配）。
+    每个样本返回一个 dict，字段与 `docs/08` 优先级 4 列的四件事一一对应：
+
+      ① `keep_rate[k]`   第 k 帧被分到某个输出槽的 patch 数 / 256
+                         （< 1 表示该帧有 patch 因箱被截断而丢弃）
+      ② `newest_slots`   含有至少一个"最新帧"patch 的输出槽数
+      ③ `token_share[k]` ⭐ **"第 k 帧分到多少 token"的定义**：
+                         Σ_槽 (该槽里来自第 k 帧的 patch 数 / 该槽 patch 总数)。
+                         按 patch 计数做**分数归属**，各帧之和 = 实际用掉的槽数。
+                         ⚠️ 这是一个**选择**，不是天然存在的量 —— 跨帧池化的
+                         一个槽由多帧共同构成，"属于某一帧的整数个 token"
+                         并不存在（`docs/05` §13.12 ②）。换别的归属方式，
+                         这一列的数会变，结论**必须连同定义一起报**。
+      ④ `mixed_frac`     含有 ≥2 个不同帧的槽 / 实际用掉的槽数（跨帧混合程度）
+
+    另附 `n_valid`（真实帧数）与 `n_used`（实际用掉的槽数），
+    读上面四项时必须带着它们 —— 补帧期 `n_valid` 小，四项的含义都不同。
+
+    ⚠️ **这些量给机制线索，不给因果。** "成功率下降是因为分配如何"这种话
+    它证明不了（`docs/05` §13.12 ②）。
+    """
+    out = []
+    n_patch = N_PATCH
+    for i in range(assign.shape[0]):
+        a = assign[i].reshape(k, n_patch)
+        nv = int(valid[i].reshape(k, n_patch)[:, 0].sum()) if valid is not None else k
+        keep = [(a[f] >= 0).sum().item() / n_patch for f in range(k)]
+        newest = int(torch.unique(a[k - 1][a[k - 1] >= 0]).numel())
+        flat = a.reshape(-1)
+        sel = flat >= 0
+        slots = flat[sel]
+        frame_of = torch.arange(k, device=a.device).repeat_interleave(n_patch)[sel]
+        tot = torch.zeros(n_slots, device=a.device).index_add_(
+            0, slots, torch.ones_like(slots, dtype=torch.float))
+        share = []
+        for f in range(k):
+            m = frame_of == f
+            if not bool(m.any()):
+                share.append(0.0)
+                continue
+            cnt = torch.zeros(n_slots, device=a.device).index_add_(
+                0, slots[m], torch.ones_like(slots[m], dtype=torch.float))
+            share.append(float((cnt / tot.clamp(min=1)).sum()))
+        used = int((tot > 0).sum())
+        # 每个槽里出现了几个不同的帧
+        nf = torch.zeros(n_slots, device=a.device)
+        for f in range(k):
+            m = frame_of == f
+            if bool(m.any()):
+                hit = torch.zeros(n_slots, device=a.device)
+                hit.index_add_(0, slots[m], torch.ones_like(slots[m], dtype=torch.float))
+                nf += (hit > 0).float()
+        mixed = int(((nf >= 2) & (tot > 0)).sum())
+        out.append({"n_valid": nv, "n_used": used,
+                    "keep_rate": [round(x, 4) for x in keep],
+                    "newest_slots": newest,
+                    "token_share": [round(x, 3) for x in share],
+                    "mixed_frac": round(mixed / max(used, 1), 4)})
+    return out
 
 
 def _grid_centroid(assign: torch.Tensor, gc: torch.Tensor, n_slots: int) -> torch.Tensor:
@@ -282,7 +355,11 @@ def _patch_projector(model, cfg: WireConfig, state: _State) -> None:
     def wrapped(img_patches, *a, **kw):
         emb = orig(img_patches, *a, **kw)                 # (B, K*256, D_llm)
         bt = state.take()
-        emb, pos1d, coord_pe, slot_mask = _pool_and_coords(emb, cfg, bt)
+        # ⚠️ 先清掉上一次的结果。不清的话，不池化的臂（或某次没填 sink）
+        #    会让调用方读到**上一批的统计**而毫不知情 —— 数还在、只是错批。
+        state.alloc = None
+        sink = {} if state.collect_alloc else None
+        emb, pos1d, coord_pe, slot_mask = _pool_and_coords(emb, cfg, bt, sink=sink)
         # ⚠️ **空槽此前被当成有效视觉 token。** `_pool_and_coords` 返回的
         #    槽有效掩码曾经被丢掉（写成 `_`），`_Rope` 转手传 `ones_like`，
         #    于是 n_used < budget 时尾部的**全零向量**照样进序列、照样被注意。
@@ -304,6 +381,11 @@ def _patch_projector(model, cfg: WireConfig, state: _State) -> None:
                 f"{cfg.arm}：PE 坐标 {coord_pe.shape[-1]} 轴，量程 {lo.numel()} 轴。"
                 "两者必须同时由 pe_metric 决定。")
         state.pe_axes_seen = int(coord_pe.shape[-1])
+        if sink and cfg.pools:
+            # ⚠️ 只在显式打开时算：它是 O(K*256) 的 Python 循环，
+            #    训练里每步都算会拖慢吞吐，而训练并不需要它。
+            state.alloc = alloc_stats(sink["assign"], cfg.K,
+                                      cfg.enforce_n or cfg.budget, sink["valid"])
         state.rope = (normalize(coord_pe.float(), lo, hi, cfg.K), pos1d)
         return emb
 

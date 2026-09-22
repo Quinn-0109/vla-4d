@@ -62,6 +62,7 @@ from common.imgproc import center_crop_resize  # noqa: E402
 from common.provenance import (check_config, code_identity, config_dict, eval_paths,
                                sha256, training_record, validate_config, write_json, WIRE_FIELDS)
 from common.runs import resolve_adapter  # noqa: E402
+from common.traj import write_episode  # noqa: E402
 from pooling.wire import (WireConfig, assert_arm_wiring, frame_feats,  # noqa: E402
                           set_batch, set_vision_feats, wire)
 
@@ -128,6 +129,15 @@ class Config:
     overwrite: bool = False                    # 允许覆盖已有 FINAL 的同名日志
     # 加载 7B 前要求的空闲显存。0 = 不检查。bf16 权重约 15 GB + 激活，留 18 GB。
     need_gb: float = 18.0
+    # ⭐ 顺带把演示素材落盘：每个 task 的前 N 局，逐步存 (观测, 动作, 分配统计)。
+    #    这样**演示不再需要 GPU** —— 回放已有记录即可；缺了记录才得重新推理。
+    #    ⚠️ 它只读地抄一份，不改变任何被测的东西（tests 里钉了这条），
+    #       所以它**不参与 run_id 身份**（见 provenance.eval_paths）。
+    #    ⚠️ 取的是每个 task 的前 N 局，不是随机抽样 —— 演示素材可以这样取，
+    #       统计结论不可以。要含失败例就先看 episodes.jsonl 再挑 task 段。
+    dump_traj: int = 0             # 0 = 关；上限 5 局/task（见 validate_config）
+    dump_rgb: bool = True          # 存当前帧 RGB（224²，压缩后约 20 KB/步）
+    dump_dir: Optional[str] = None  # 默认 results/traj/<run_id>
     # fmt: on
 
 
@@ -430,6 +440,12 @@ def main(cfg: Config) -> None:
     log = output_paths["log"].open("w" if cfg.overwrite else "x", encoding="utf-8")
     per_ep = output_paths["episodes"].open("w" if cfg.overwrite else "x", encoding="utf-8")
     print(f"日志: {log.name}")
+    # 演示素材目录。⚠️ 与日志分开放：它体积大（RGB），而日志要能随手 grep。
+    dump_dir = Path(cfg.dump_dir or f"results/traj/{run_id}") if cfg.dump_traj else None
+    if dump_dir is not None:
+        dump_dir.mkdir(parents=True, exist_ok=True)
+        if not wcfg.pools:
+            print(f"⚠️ arm={cfg.arm} 不池化，分配统计恒为 null（只有动作与观测）")
 
     def say(msg: str) -> None:
         """
@@ -446,6 +462,9 @@ def main(cfg: Config) -> None:
         f"n_t={cfg.n_t} adapter={adapter} n/task={cfg.num_trials_per_task} "
         f"seed={cfg.seed} partition={cfg.partition}")
 
+    if dump_dir is not None:
+        say(f"# 演示素材落盘：每 task 前 {cfg.dump_traj} 局 -> {dump_dir}"
+            f"（RGB={'开' if cfg.dump_rgb else '关'}）")
     say(f"# 中心裁={'开' if cfg.center_crop else '关'} "
         f"视觉特征缓存={'开' if cfg.vision_cache else '关'}"
         + (f"（头 {cfg.verify_vision_cache} 步逐位对拍）"
@@ -564,6 +583,10 @@ def main(cfg: Config) -> None:
                 envs[i].reset()
                 obs.append(envs[i].set_init_state(inits[ep]))
             ok_eps = set()                    # 本批里成功的 episode 下标
+            # 演示缓冲：{episode -> {"steps":[...], "rgb":[...]}}。先攒在内存里，
+            # 批末一次写盘 —— 逐步 append 到文件会让每步多一次 flush。
+            dbuf = ({ep: {"steps": [], "rgb": []} for ep in eps if ep < cfg.dump_traj}
+                    if dump_dir is not None else {})
             mx = (cfg.K - 1) * cfg.stride + 1
             hists = [deque(maxlen=mx) for _ in range(b)]
             feats = [deque(maxlen=mx) for _ in range(b)]
@@ -583,6 +606,11 @@ def main(cfg: Config) -> None:
                 for i in live:
                     img = get_libero_image(obs[i], 224)
                     hists[i].appendleft(img)
+                    if cfg.dump_rgb and eps[i] in dbuf:
+                        # ⚠️ 存的是**送进模型之前**的原图。中心裁是评测链路的一部分，
+                        #    演示时用 center_crop_resize 再裁一次即可复现模型所见；
+                        #    反过来只存裁过的图，就看不出裁掉了什么。
+                        dbuf[eps[i]]["rgb"].append(img)
                     if wcfg.needs_depth:
                         # 与训练侧同一套换算与翻转（check_replay.patch_depth），
                         # 且都是**仿真器真值深度** —— 训练与评测的深度来源一致
@@ -637,7 +665,28 @@ def main(cfg: Config) -> None:
                 #    四格评测的第一臂 G3 会当场崩。用 () 而不是把 set_batch 改宽松：
                 #    "没给相机" 和 "给了 None" 是两回事，后者该报错。
                 set_batch(state, depth=dep, frame_pad_mask=pm, cameras=cams or ())
+                # ⚠️ 只在这一批真有要存的局时才打开：分配统计是 CPU 上的
+                #    index_add_ 循环，全程开着会拖慢每一步，而绝大多数局不用存。
+                state.collect_alloc = any(eps[i] in dbuf for i in live)
                 acts = gen_actions(ids, px)
+                if dbuf:
+                    # ⭐ **在 verify_batch 之前记**：那段会用单行再跑几次前向，
+                    #    把 state.alloc 覆盖成 (1,·) 的统计，行号就对不上了。
+                    alloc = state.alloc if state.collect_alloc else None
+                    # ⚠️ 行号必须对得上。alloc 是按 batch 行算的，dbuf 是按
+                    #    episode 存的，中间靠 live 的顺序对应 —— 长度不等就说明
+                    #    这个对应已经断了，而错行的演示看起来完全正常。
+                    if alloc is not None and len(alloc) != len(live):
+                        raise SystemExit(
+                            f"分配统计 {len(alloc)} 行 vs 活动局 {len(live)} 行，"
+                            "对应关系已断，拒绝写演示素材")
+                    for r, i in enumerate(live):
+                        if eps[i] not in dbuf:
+                            continue
+                        dbuf[eps[i]]["steps"].append(
+                            {"t": int(t), "action": [round(float(x), 6) for x in acts[r]],
+                             "n_valid": int(pads[r].sum()),
+                             "alloc": None if alloc is None else alloc[r]})
 
                 if not checked:
                     assert_arm_wiring(state, cfg.arm)
@@ -704,6 +753,24 @@ def main(cfg: Config) -> None:
                                          "episode": int(ep),
                                          "success": int(ep in ok_eps)}) + "\n")
             per_ep.flush()
+            for ep, rec in dbuf.items():
+                # 头一行是表头：**演示素材必须自带它是哪次测量的**，
+                # 否则一段轨迹和另一段轨迹看起来一模一样。
+                head = {"run_id": run_id, "arm": cfg.arm,
+                        "task_id": int(task_id), "episode": int(ep),
+                        "task": desc, "success": int(ep in ok_eps),
+                        "pools": bool(wcfg.pools),
+                        "K": cfg.K, "stride": cfg.stride, "budget": cfg.budget,
+                        "n_t": cfg.n_t, "partition": cfg.partition,
+                        "center_crop": bool(cfg.center_crop),
+                        "num_steps_wait": cfg.num_steps_wait,
+                        "adapter": str(adapter) if adapter else None}
+                write_episode(dump_dir, head, rec["steps"],
+                              rec["rgb"] if cfg.dump_rgb else None)
+            if dbuf:
+                n_b = sum(f.stat().st_size for f in dump_dir.iterdir())
+                print(f"  演示素材：{len(dbuf)} 局 -> {dump_dir}"
+                      f"（累计 {n_b / 2**20:.0f} MiB）")
             # ⚠️ **碎片，不是泄漏。** `live` 随着 episode 陆续成功而缩小，
             #    batch 形状一路 8→7→…→1，每种形状都让缓存分配器切出不同大小的块；
             #    跑满 200 局后 `1.07 GiB reserved but unallocated` 却申请不到

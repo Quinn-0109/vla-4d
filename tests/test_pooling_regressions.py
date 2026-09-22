@@ -89,6 +89,66 @@ class PoolingRegressions(unittest.TestCase):
         self.assertFalse(out.requires_grad)
         self.assertIsNone(out.grad_fn)
 
+    def test_alloc_stats_definition_holds(self):
+        """
+        `alloc_stats` 的四件事**本身就是判据的一部分**，所以这里钉死它的定义。
+
+        钉的是三条恒等式/不变量，而不是某次运行的数值：
+          ① Σ_帧 token_share == n_used  —— 分数归属必须正好把用掉的槽分完；
+             若某帧的贡献被重复计入或漏计，这条等式**立刻不成立**。
+          ② 帧独立池化（G2）下 mixed_frac 必须是 0 —— 它的槽不跨帧，
+             这是"跨帧混合程度"这一列有没有量对的最直接检验。
+          ③ 补帧期用旧算子（quantile）时，最新帧 keep_rate 必须是 0 ——
+             `docs/05` §13.9 的那个缺陷，经由这四件事应当看得见。
+        """
+        from pooling.coord_pool import coord_bin_pool, grid_coords, grid_extent
+        from pooling.wire import alloc_stats
+        torch = self.torch
+        for real, framewise, partition in [(8, False, "quantile_fixed"),
+                                           (2, False, "quantile_fixed"),
+                                           (8, True,  "quantile_fixed"),
+                                           (2, False, "quantile")]:
+            with self.subTest(real=real, framewise=framewise, partition=partition):
+                out = self.pool(real, partition, framewise=framewise)
+                valid = (torch.arange(8) >= 8-real).repeat_interleave(256).unsqueeze(0)
+                st = alloc_stats(out.assign, 8, 256, valid)[0]
+                self.assertEqual(st["n_valid"], real)
+                # ① 分数归属之和 == 实际用掉的槽数
+                self.assertAlmostEqual(sum(st["token_share"]), st["n_used"], places=1)
+                self.assertLessEqual(st["newest_slots"], st["n_used"])
+                if framewise:
+                    # ② 帧独立：一个槽只会来自一帧
+                    self.assertEqual(st["mixed_frac"], 0.0)
+                if partition == "quantile" and real < 8:
+                    # ③ 旧算子在补帧期把最新帧整帧丢掉
+                    self.assertEqual(st["keep_rate"][-1], 0.0)
+                    self.assertEqual(st["newest_slots"], 0)
+                else:
+                    self.assertEqual(st["keep_rate"][-1], 1.0)
+
+    def test_alloc_stats_does_not_change_pooling(self):
+        """
+        ⚠️ 诊断开关**不能改变被测的东西**。`--dump_traj` 会打开
+        `state.collect_alloc`，那条路径多传一个 sink dict —— 这里要求
+        开与不开的池化输出逐位相同，否则"演示用的那次评测"就不是评测了。
+        """
+        from common.camera import Camera
+        from pooling.wire import WireConfig, _Batch, _pool_and_coords
+        torch = self.torch
+        cam = Camera(45,224,224,torch.zeros(3),torch.eye(3))
+        bt = _Batch(depth=torch.rand(1,8,256)+.5,
+                    frame_pad_mask=(torch.arange(8) >= 6).unsqueeze(0), cameras=[cam])
+        emb = torch.randn(1,2048,3)
+        bbox = torch.tensor([[-2.,-2.,-2.],[2.,2.,2.]])
+        for arm in ("G3", "M3", "G2"):
+            cfg = WireConfig(arm=arm,K=8,bbox=bbox)
+            sink = {}
+            a = _pool_and_coords(emb, cfg, bt)
+            b = _pool_and_coords(emb, cfg, bt, sink=sink)
+            for x, y in zip(a, b):
+                self.assertTrue(x is None or torch.equal(x, y))
+            self.assertIn("assign", sink)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -35,7 +35,8 @@ class ProvenanceTests(unittest.TestCase):
     def test_eval_bounds_before_loading(self):
         c = defaults("run_eval_kframe.py")
         for bad in ({"num_trials_per_task": 51}, {"eval_batch": 0},
-                    {"start_task": 5,"end_task": 5}, {"arm": "G1"}):
+                    {"start_task": 5,"end_task": 5}, {"arm": "G1"},
+                    {"dump_traj": 6}, {"dump_traj": -1}):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 validate_config(dict(c, **bad), training=False)
 
@@ -65,6 +66,22 @@ class ProvenanceTests(unittest.TestCase):
         a, _ = eval_paths(dict(c,start_task=0,end_task=4),self.root)
         b, _ = eval_paths(dict(c,start_task=4,end_task=10),self.root)
         self.assertEqual(a.split("-t0_4")[0], b.split("-t4_10")[0])
+
+    def test_dump_flags_share_identity(self):
+        """
+        `--dump_traj` 只是把动作与分配统计抄一份，**不改变被测量的成功率**，
+        所以开与不开必须是同一个 run_id —— 否则演示素材那次会被当成另一次
+        独立测量，而它并不是。反过来，凡是改变测量的开关（这里用中心裁）
+        必须换身份。
+        """
+        c = defaults("run_eval_kframe.py")
+        c["local_log_dir"] = str(self.root / "dump")
+        base, _ = eval_paths(c, self.root)
+        same, _ = eval_paths(dict(c, dump_traj=2, dump_rgb=False,
+                                  dump_dir="results/traj/demo"), self.root)
+        self.assertEqual(base, same)
+        diff, _ = eval_paths(dict(c, center_crop=not c["center_crop"]), self.root)
+        self.assertNotEqual(base, diff)
 
     def test_training_record_and_reentry_guard(self):
         c = defaults("finetune_kframe.py")

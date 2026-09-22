@@ -20,6 +20,16 @@ results/logs/*
 # 每臂 500 行 JSON，几十 KB —— 和日志同属"结论本身"，必须版本化。
 !results/logs/*.jsonl
 !results/logs/*.meta.json
+# 演示素材（--dump_traj 的产物）：RGB 的 npz 体积大，留在机器上不入库；
+# 但**挑出来给答辩用的那几局**的动作与分配统计只有几百 KB，且它就是交付物
+# 本身 —— 放行 results/traj/demo/ 下的 jsonl，其余一律不入库。
+# ⚠️ 挑素材时把 jsonl 拷进 demo/，不要把整个 results/traj/<run_id>/ 挪进去：
+#    那里面每局带一个几十 MB 的 npz。
+!results/traj/
+results/traj/*
+!results/traj/demo/
+results/traj/demo/*
+!results/traj/demo/*.jsonl
 
 rollouts/
 runs/                 # 微调输出: adapter + 优化器状态 + metrics.jsonl
