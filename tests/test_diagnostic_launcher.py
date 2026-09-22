@@ -1,5 +1,7 @@
 from pathlib import Path
 import importlib.util
+import json
+import tempfile
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,6 +29,20 @@ class DiagnosticLauncherTests(unittest.TestCase):
     def test_other_arms_rejected(self):
         with self.assertRaises(ValueError):
             mod.command("G4", Path("x"), Path("y"), "diag")
+
+    def test_registered_adapter_requires_frozen_identity(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "checkpoints.json"
+            p.write_text(json.dumps({
+                "schema_version": 1,
+                "purpose": "fixed_case_diagnostic_checkpoint_identity",
+                "arms": {"G3": {"adapter": "/runs/g3/adapter/step30000",
+                                  "adapter_weight_bytes": 162015576,
+                                  "adapter_sha256": "a" * 64}}}), encoding="utf-8")
+            self.assertEqual(mod.registered_adapter("G3", p),
+                             "/runs/g3/adapter/step30000")
+            with self.assertRaisesRegex(ValueError, "没有 G2"):
+                mod.registered_adapter("G2", p)
 
 
 if __name__ == "__main__":

@@ -36,6 +36,7 @@ results/traj/demo/*
 !results/cases/
 results/cases/*
 !results/cases/g3_fixed_diagnostic_cases.json
+!results/cases/diagnostic_checkpoints.json
 
 rollouts/
 runs/                 # 微调输出: adapter + 优化器状态 + metrics.jsonl

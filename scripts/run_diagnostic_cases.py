@@ -15,6 +15,7 @@ from common.runs import list_adapters, resolve_adapter  # noqa: E402
 
 ARMS = ("G0", "G2", "G3")
 DEFAULT_MANIFEST = ROOT / "results/cases/g3_fixed_diagnostic_cases.json"
+DEFAULT_CHECKPOINTS = ROOT / "results/cases/diagnostic_checkpoints.json"
 
 
 def command(arm: str, adapter: Path, manifest: Path, run_note: str,
@@ -45,11 +46,27 @@ def command(arm: str, adapter: Path, manifest: Path, run_note: str,
     ]
 
 
+def registered_adapter(arm: str, path: Path) -> str:
+    import json
+    doc = json.loads(path.read_text(encoding="utf-8"))
+    if (doc.get("schema_version") != 1
+            or doc.get("purpose") != "fixed_case_diagnostic_checkpoint_identity"):
+        raise ValueError("不是受支持的诊断 checkpoint 清单")
+    try:
+        row = doc["arms"][arm]
+    except KeyError as err:
+        raise ValueError(f"checkpoint 清单没有 {arm}") from err
+    digest = row.get("adapter_sha256", "")
+    if len(digest) != 64 or row.get("adapter_weight_bytes") != 162015576:
+        raise ValueError(f"{arm} 的 checkpoint 身份字段不完整")
+    return row["adapter"]
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--arm", required=True, choices=ARMS)
-    p.add_argument("--adapter", required=True,
-                   help="必须给确切 adapter/stepN；不存在时会列出所有可用 checkpoint")
+    p.add_argument("--adapter", help="可选覆盖；默认读取已冻结的 checkpoint 清单")
+    p.add_argument("--checkpoints", type=Path, default=DEFAULT_CHECKPOINTS)
     p.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     p.add_argument("--run_note", default="diag-cases-v1")
     p.add_argument("--run_root", default="runs")
@@ -59,7 +76,8 @@ def main() -> None:
     manifest = args.manifest.expanduser().resolve()
     load_case_manifest(manifest, ROOT)
     try:
-        adapter = resolve_adapter(args.adapter, args.run_root).resolve()
+        adapter_arg = args.adapter or registered_adapter(args.arm, args.checkpoints)
+        adapter = resolve_adapter(adapter_arg, args.run_root).resolve()
     except SystemExit as err:
         print(err, file=sys.stderr)
         have = list_adapters(args.run_root)

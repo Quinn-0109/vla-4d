@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "purpose": "fixed_case_diagnostic_checkpoint_identity",
+  "created_at": "2026-09-22T08:47:43.765158+00:00",
+  "arms": {
+    "G0": {
+      "adapter": "/root/autodl-tmp/vla-4d/runs/G0+libero_10_no_noops+K1s16+N256+nt2+b16x1+lr0.0005+lora-r32+frozen-vision+aug--libero10/adapter/step30000",
+      "adapter_weight_bytes": 162015576,
+      "adapter_sha256": "ed3b317bd298c09ec9fdefea94a8dd199b0f10fbd883e201f34f0097dba340e8",
+      "adapter_config_sha256": "b716d59639d335f4059ca8c4c9c6d6b664063027b170556a37c71f078502040c",
+      "dataset_statistics_sha256": "ec5a49e0b7b276b8cf0b1a1519e6460eb22d0f06e6f12c07929652ad939f4053",
+      "run_config_sha256": null,
+      "historical_config_verified": false,
+      "configuration_evidence": "original aggregate evaluation log; no run_config.json",
+      "formal_eval_log": "/root/autodl-tmp/vla-4d/results/logs/EVAL-libero_10-G0-K1s16-seed7--full.txt",
+      "formal_eval_log_sha256": "0c202a8ca643d3fe322dab8a4605aa561f86e5650522a2619fc080a6041adfc8",
+      "formal_result": {
+        "success": 117,
+        "n": 500,
+        "eval_batch": 8
+      }
+    },
+    "G2": {
+      "adapter": "/root/autodl-tmp/vla-4d/runs/G2+libero_10_no_noops+K8s16+N256+nt2+b8x2+lr0.0005+lora-r32+frozen-vision+aug--K8fix/adapter/step30000",
+      "adapter_weight_bytes": 162015576,
+      "adapter_sha256": "237fc4eaab5af7c1a655b4e3467c2e0dcf0b852c8cec0a665793c46640ca8be2",
+      "adapter_config_sha256": "9f4a94c82a048eb7173b53a1ae02fd6e050c21da63c5c7d8f1f7126f63927673",
+      "dataset_statistics_sha256": "ec5a49e0b7b276b8cf0b1a1519e6460eb22d0f06e6f12c07929652ad939f4053",
+      "run_config_sha256": null,
+      "historical_config_verified": false,
+      "configuration_evidence": "original aggregate evaluation log; no run_config.json",
+      "formal_eval_log": "/root/autodl-tmp/vla-4d/results/logs/EVAL-libero_10-G2-K8s16-seed7--b8.txt",
+      "formal_eval_log_sha256": "f084df14bc2ead31eb3bc1154ffca21b67c3290d87b8ea32729fc8aab4476728",
+      "formal_result": {
+        "success": 211,
+        "n": 500,
+        "eval_batch": 8
+      }
+    },
+    "G3": {
+      "adapter": "/root/autodl-tmp/vla-4d-fixed-cf3e1583/runs/G3+libero_10_no_noops+K8s16+N256+nt2+b8x2+lr0.0005+lora-r32+frozen-vision+aug+fulldata+seed7--fixed-main-20260918/adapter/step30000",
+      "adapter_weight_bytes": 162015576,
+      "adapter_sha256": "e9ee2bd7d9f18b54fdb43c2d48e092692bb7952414420d8e537efa7220968ae2",
+      "adapter_config_sha256": "b3b66c23663df7dc223d2e694db7edc192ffb6ce2120e5eb6ab6f6b1ddb14a5e",
+      "dataset_statistics_sha256": "ec5a49e0b7b276b8cf0b1a1519e6460eb22d0f06e6f12c07929652ad939f4053",
+      "run_config_sha256": "4a96cf477210627b9b88c73e6e465ee32d871287abb776fe9415ca9271322eb0",
+      "historical_config_verified": true,
+      "configuration_evidence": "run_config.json",
+      "formal_eval_log": "/root/autodl-tmp/vla-4d-fixed-cf3e1583/results/logs/EVAL-libero_10-G3-K8s16-seed7-step30000-b8-N256-nt2-r4781d28d6965--fixed-main.txt",
+      "formal_eval_log_sha256": "3d4570795f7405659d79452e6e14933ba44c212e69825eb503124e6a10c3a462",
+      "formal_result": {
+        "success": 118,
+        "n": 500,
+        "eval_batch": 8
+      }
+    }
+  }
+}
