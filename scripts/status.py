@@ -19,11 +19,44 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Windows 的默认 GBK 终端不能编码日志里的 ✓/⚠️。保留终端编码，只把无法编码的
+# 字符替换掉，避免只读状态命令在打印到一半时崩溃；UTF-8 终端不受影响。
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(errors="replace")
+
 ARMS = ("G3", "M3", "M2", "G4")
 MAX_STEPS = 30_000
 N_TASKS = 10                                      # libero_10
 PE_AXES = {"G3": 3, "M3": 4, "M2": 3, "G4": 4}   # 与 wire.WireConfig.pe_axes 一致
 DATA_ROOT = "/root/autodl-tmp/datasets/modified_libero_rlds"
+
+
+def completed_mainline_status() -> bool:
+    """正式修正版 G3 已归档时，显示当前结项路线而非历史四臂启动命令。"""
+    root = Path("results/logs")
+    logs = sorted(root.glob("EVAL-*-G3-*--fixed-main.txt")) if root.is_dir() else []
+    for log in reversed(logs):
+        lines = log.read_text(encoding="utf-8", errors="replace").splitlines()
+        final = next((line for line in reversed(lines) if line.startswith("FINAL ")), None)
+        episodes = log.with_suffix(".episodes.jsonl")
+        meta = log.with_suffix(".meta.json")
+        if final is None or not episodes.is_file() or not meta.is_file():
+            continue
+        rows = [json.loads(line) for line in episodes.read_text(encoding="utf-8").splitlines()
+                if line.strip()]
+        keys = {(r.get("task_id"), r.get("episode")) for r in rows}
+        successes = sum(int(r.get("success", 0)) for r in rows)
+        if len(rows) != 500 or len(keys) != 500:
+            print(f"正式 G3 记录不完整：rows={len(rows)} unique={len(keys)}，请先审计 {episodes}")
+            return True
+        print("\n当前主线：修正版 G3 已完成训练与正式评测")
+        print(f"  {final}")
+        print(f"  逐局记录 500/500，成功 {successes}/500")
+        print(f"  来源元数据 {meta}")
+        print("\n下一步：按 docs/09-当前任务执行清单.md 完成固定案例、分配诊断和结项演示。")
+        print("不要重新启动历史 2×2 四臂训练。")
+        return True
+    return False
 
 
 def running_arms() -> dict:
@@ -50,6 +83,8 @@ def arm_dir(arm: str) -> Path | None:
 
 
 def main() -> None:
+    if completed_mainline_status():
+        return
     live = running_arms()
     rows, done_all = [], True
     for arm in ARMS:

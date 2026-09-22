@@ -1,0 +1,61 @@
+{
+  "schema_version": 1,
+  "purpose": "mechanism_diagnosis_and_demo_only",
+  "statistical_use": "forbidden",
+  "source": {
+    "path": "results/logs/EVAL-libero_10-G3-K8s16-seed7-step30000-b8-N256-nt2-r4781d28d6965--fixed-main.episodes.jsonl",
+    "sha256": "bcf1ba2f02988eae16c542ede46b7fb8ac3080722c06046204f7fdba05a4ad67",
+    "arm": "G3",
+    "rows": 500,
+    "unique_keys": 500,
+    "successes": 118
+  },
+  "selection": {
+    "tasks": [
+      2,
+      4,
+      5
+    ],
+    "rule": "lowest episode id in each (task_id, g3_success) stratum",
+    "chosen_before_new_inference": true
+  },
+  "cases": [
+    {
+      "task_id": 2,
+      "episode": 0,
+      "g3_success": 1,
+      "stratum": "success"
+    },
+    {
+      "task_id": 2,
+      "episode": 1,
+      "g3_success": 0,
+      "stratum": "failure"
+    },
+    {
+      "task_id": 4,
+      "episode": 13,
+      "g3_success": 1,
+      "stratum": "success"
+    },
+    {
+      "task_id": 4,
+      "episode": 0,
+      "g3_success": 0,
+      "stratum": "failure"
+    },
+    {
+      "task_id": 5,
+      "episode": 0,
+      "g3_success": 1,
+      "stratum": "success"
+    },
+    {
+      "task_id": 5,
+      "episode": 1,
+      "g3_success": 0,
+      "stratum": "failure"
+    }
+  ],
+  "created_at": "2026-09-22T07:37:08.949929+00:00"
+}

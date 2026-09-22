@@ -31,6 +31,12 @@ results/traj/*
 results/traj/demo/*
 !results/traj/demo/*.jsonl
 
+# 机制诊断的事前案例清单很小，且必须证明它早于新推理冻结；只放行 manifest，
+# 后续 results/cases/<run_id>/ 下的逐步轨迹、图片与 gzip 仍保持忽略。
+!results/cases/
+results/cases/*
+!results/cases/g3_fixed_diagnostic_cases.json
+
 rollouts/
 runs/                 # 微调输出: adapter + 优化器状态 + metrics.jsonl
 experiments/logs/

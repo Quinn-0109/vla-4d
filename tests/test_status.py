@@ -1,6 +1,7 @@
 import contextlib
 import importlib.util
 import io
+import json
 import os
 from pathlib import Path
 import tempfile
@@ -46,3 +47,18 @@ class StatusTests(unittest.TestCase):
         self.log("-t0_5", range(5))
         self.log("-t4_10", range(4, 10))
         self.assertIn("拒绝自动汇总", self.output())
+
+    def test_completed_fixed_mainline_replaces_legacy_next_step(self):
+        stem = Path("results/logs/EVAL-libero_10-G3-step30000--fixed-main")
+        stem.with_suffix(".txt").write_text("FINAL success_rate=0.2360 (118/500)\n",
+                                            encoding="utf-8")
+        rows = [{"task_id": task, "episode": ep, "success": int(task * 50 + ep < 118)}
+                for task in range(10) for ep in range(50)]
+        stem.with_suffix(".episodes.jsonl").write_text(
+            "\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+        stem.with_suffix(".meta.json").write_text("{}\n", encoding="utf-8")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertTrue(status.completed_mainline_status())
+        self.assertIn("docs/09", out.getvalue())
+        self.assertNotIn("首次", out.getvalue())

@@ -138,25 +138,25 @@ def validate_config(cfg, training: bool) -> None:
             raise ValueError("非法 task 范围")
         if c["end_task"] != -1 and c["end_task"] <= c["start_task"]:
             raise ValueError("task 范围必须非空，end_task 为开区间")
-        # 演示素材：每局 RGB 约 520 步 × 20 KB ≈ 10 MB，**按 task 数乘上去**。
-        # 限 5 局/task 是为了防手误打成 50 —— 那是 10 个 task × 50 局 ≈ 5 GB，
-        # 而训练机的 results/ 已经丢过一次东西（磁盘满时删的就是它）。
-        if not 0 <= c.get("dump_traj", 0) <= 5:
-            raise ValueError("dump_traj 限 0..5 局/task（演示素材，不是统计样本）；"
-                             "要更多请说明理由并改这里")
+        if c.get("dump_traj"):
+            if not c.get("case_manifest"):
+                raise ValueError("dump_traj 必须配合事前冻结的 case_manifest")
+            if c.get("start_task") or c.get("end_task") != -1:
+                raise ValueError("case_manifest 已精确指定任务，不得再叠加 task 范围")
+            if type(c.get("dump_frame_every")) is not int or c["dump_frame_every"] <= 0:
+                raise ValueError("dump_frame_every 必须是正整数")
+            if c["eval_batch"] != 1:
+                raise ValueError("诊断案例必须 eval_batch=1，避免短批次引入批量数值差异")
+        elif c.get("case_manifest"):
+            raise ValueError("case_manifest 只能与 dump_traj 一起使用")
 
 
 def eval_paths(cfg, root: Path) -> tuple[str, dict]:
     c = config_dict(cfg)
     # 完整 checkpoint 路径、配置及本地源代码参与身份，不仅是 step30000 目录名。
-    # ⚠️ 不参与身份的键只有一类：**不改变被测量的东西**。
-    #    dump_traj/dump_rgb/dump_dir 属于这一类（只读地抄一份动作与分配统计，
-    #    见 run_eval_kframe 的 --dump_traj），所以开着它跑出来的成功率与
-    #    关着的那次**是同一次测量**，run_id 必须一样 —— 于是同配置的第二次
-    #    会被"已有记录"挡住，这正是想要的。
     identity = {k: v for k, v in c.items() if k not in
-                ("overwrite", "need_gb", "local_log_dir", "verify_env", "verify_batch", "verify_vision_cache",
-                 "start_task", "end_task", "dump_traj", "dump_rgb", "dump_dir")}
+                ("overwrite", "need_gb", "local_log_dir", "dump_dir", "verify_env", "verify_batch", "verify_vision_cache",
+                 "start_task", "end_task")}
     identity["code"] = code_identity(root)
     digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:12]
     step = Path(c["adapter"]).name if c["adapter"] else "base"

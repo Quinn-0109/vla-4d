@@ -140,6 +140,7 @@ class _Batch:
     depth: Optional[torch.Tensor] = None        # (B, K, 256) patch 级深度，米
     frame_pad_mask: Optional[torch.Tensor] = None   # (B, K) bool，True = 真实帧
     cameras: list = field(default_factory=list)     # 每个样本一个 Camera
+    alloc_callback: object = None                   # 评测诊断用；默认无额外开销
 
 
 class _State:
@@ -223,6 +224,11 @@ def _pool_and_coords(emb: torch.Tensor, cfg: WireConfig, bt: _Batch,
     if not cfg.pools:
         # G0 / G1：不池化。PE 侧仍要坐标（G1 用 (t,h,w)），位置用原始下标
         pos1d = torch.arange(k * N_PATCH, device=dev).float().expand(b, -1)
+        if bt.alloc_callback is not None:
+            assign = torch.arange(k * N_PATCH, device=dev).expand(b, -1).clone()
+            if valid is not None:
+                assign[~valid] = -1
+            bt.alloc_callback(assign, bt.frame_pad_mask)
         return emb, pos1d, gc, None
 
     # 度量坐标：**池化侧或 PE 侧任一需要就得算**（M3 只有 PE 侧要）
@@ -245,6 +251,8 @@ def _pool_and_coords(emb: torch.Tensor, cfg: WireConfig, bt: _Batch,
     kw = dict(group_axes=(0,), n_group=(k,)) if cfg.arm == "G2" else dict(n_t=cfg.n_t)
     out = coord_bin_pool(emb, pc, cfg.budget, lo, hi,
                          enforce_n=cfg.enforce_n, valid=valid, partition=cfg.partition, **kw)
+    if bt.alloc_callback is not None:
+        bt.alloc_callback(out.assign, bt.frame_pad_mask)
 
     # PE 侧坐标 —— 2×2 的四格在这里分开。**两个错配臂都是"另取一套坐标算质心"**，
     # 走的是同一份 `_grid_centroid`（它对任意坐标张量通用），
@@ -581,7 +589,7 @@ def frame_feats(state: _State, model, px6) -> torch.Tensor:
 
 
 def set_batch(state: _State, depth=None, frame_pad_mask=None, cameras=(),
-              n_uses: int = 1) -> None:
+              n_uses: int = 1, alloc_callback=None) -> None:
     """
     交出这一批的深度 / 补帧掩码 / 相机。**每次 forward 前都要调。**
 
@@ -593,7 +601,7 @@ def set_batch(state: _State, depth=None, frame_pad_mask=None, cameras=(),
     """
     assert n_uses >= 1, n_uses
     state.batch = _Batch(depth=depth, frame_pad_mask=frame_pad_mask,
-                         cameras=list(cameras))
+                         cameras=list(cameras), alloc_callback=alloc_callback)
     state.uses_left = n_uses
 
 

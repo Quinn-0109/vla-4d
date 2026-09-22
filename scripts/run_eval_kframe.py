@@ -58,11 +58,13 @@ from experiments.robot.robot_utils import (invert_gripper_action,  # noqa: E402
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from check_replay import patch_depth  # noqa: E402
 
+from analysis.alloc_stats import summarize_assignment  # noqa: E402
+from analysis.diagnostic_dump import (DiagnosticDump, cases_by_task,  # noqa: E402
+                                      load_case_manifest, observation_state)
 from common.imgproc import center_crop_resize  # noqa: E402
 from common.provenance import (check_config, code_identity, config_dict, eval_paths,
                                sha256, training_record, validate_config, write_json, WIRE_FIELDS)
 from common.runs import resolve_adapter  # noqa: E402
-from common.traj import write_episode  # noqa: E402
 from pooling.wire import (WireConfig, assert_arm_wiring, frame_feats,  # noqa: E402
                           set_batch, set_vision_feats, wire)
 
@@ -127,17 +129,14 @@ class Config:
     local_log_dir: str = "results/logs"
     run_note: str = ""
     overwrite: bool = False                    # 允许覆盖已有 FINAL 的同名日志
+    # 机制诊断只允许按事前冻结的 manifest 运行；不会产生新的成功率结论。
+    dump_traj: bool = False
+    case_manifest: Optional[str] = None
+    dump_dir: str = "results/cases"
+    dump_frames: bool = True
+    dump_frame_every: int = 1
     # 加载 7B 前要求的空闲显存。0 = 不检查。bf16 权重约 15 GB + 激活，留 18 GB。
     need_gb: float = 18.0
-    # ⭐ 顺带把演示素材落盘：每个 task 的前 N 局，逐步存 (观测, 动作, 分配统计)。
-    #    这样**演示不再需要 GPU** —— 回放已有记录即可；缺了记录才得重新推理。
-    #    ⚠️ 它只读地抄一份，不改变任何被测的东西（tests 里钉了这条），
-    #       所以它**不参与 run_id 身份**（见 provenance.eval_paths）。
-    #    ⚠️ 取的是每个 task 的前 N 局，不是随机抽样 —— 演示素材可以这样取，
-    #       统计结论不可以。要含失败例就先看 episodes.jsonl 再挑 task 段。
-    dump_traj: int = 0             # 0 = 关；上限 5 局/task（见 validate_config）
-    dump_rgb: bool = True          # 存当前帧 RGB（224²，压缩后约 20 KB/步）
-    dump_dir: Optional[str] = None  # 默认 results/traj/<run_id>
     # fmt: on
 
 
@@ -351,13 +350,33 @@ def main(cfg: Config) -> None:
         check_config(trained["config"], config_dict(cfg), WIRE_FIELDS)
     elif adapter:
         print("旧 adapter 无训练配置记录：接线与数据来源须由原始训练日志核对。")
+    case_doc = selected_cases = case_lookup = None
+    case_manifest_path = None
+    if cfg.dump_traj:
+        case_manifest_path = Path(cfg.case_manifest).expanduser().resolve()
+        case_doc = load_case_manifest(case_manifest_path, repo)
+        selected_cases = cases_by_task(case_doc)
+        case_lookup = {(r["task_id"], r["episode"]): r for r in case_doc["cases"]}
+        print(f"机制诊断 manifest: {case_manifest_path}，{sum(map(len, selected_cases.values()))} 局；"
+              "仅用于材料与诊断，禁止统计推断。")
+
     run_id, output_paths = eval_paths(cfg, repo)
+    dump_final = Path(cfg.dump_dir) / run_id if cfg.dump_traj else None
+    if dump_final is not None:
+        dump_partial = dump_final.with_name(dump_final.name + ".partial")
+        if dump_final.exists() or dump_partial.exists():
+            raise SystemExit(f"诊断输出已存在，拒绝覆盖: {dump_final}")
     suite = benchmark.get_benchmark_dict()[cfg.task_suite_name]()
     t_end = suite.n_tasks if cfg.end_task < 0 else cfg.end_task
     if not 0 <= cfg.start_task < t_end <= suite.n_tasks:
         raise SystemExit(f"非法 task 范围 [{cfg.start_task}, {t_end})，suite 有 {suite.n_tasks} 个任务")
-    for tid in range(cfg.start_task, t_end):
-        if len(suite.get_task_init_states(tid)) < max(cfg.num_trials_per_task, cfg.verify_env):
+    task_ids = list(selected_cases) if selected_cases is not None else list(range(cfg.start_task, t_end))
+    if any(tid < 0 or tid >= suite.n_tasks for tid in task_ids):
+        raise SystemExit(f"manifest 含 suite 范围外的 task: {task_ids}")
+    for tid in task_ids:
+        requested = max(selected_cases[tid]) + 1 if selected_cases is not None else cfg.num_trials_per_task
+        verify_needed = cfg.verify_env if tid == task_ids[0] else 0
+        if len(suite.get_task_init_states(tid)) < max(requested, verify_needed):
             raise SystemExit(f"task {tid} 初始状态数量不足")
 
     _require_free_vram(cfg.need_gb)
@@ -436,16 +455,21 @@ def main(cfg: Config) -> None:
     metadata["initial_states_sha256"] = {
         str(t): hashlib.sha256(np.asarray(suite.get_task_init_states(t)).tobytes()).hexdigest()
         for t in range(suite.n_tasks)}
+    dump = None
+    if cfg.dump_traj:
+        metadata["diagnostic_dump"] = {
+            "schema_version": 1,
+            "purpose": "mechanism_diagnosis_and_demo_only",
+            "statistical_use": "forbidden",
+            "manifest_path": str(case_manifest_path),
+            "manifest_sha256": sha256(case_manifest_path),
+            "manifest": case_doc,
+        }
+        dump = DiagnosticDump(dump_final, metadata)
     write_json(output_paths["meta"], metadata)
     log = output_paths["log"].open("w" if cfg.overwrite else "x", encoding="utf-8")
     per_ep = output_paths["episodes"].open("w" if cfg.overwrite else "x", encoding="utf-8")
     print(f"日志: {log.name}")
-    # 演示素材目录。⚠️ 与日志分开放：它体积大（RGB），而日志要能随手 grep。
-    dump_dir = Path(cfg.dump_dir or f"results/traj/{run_id}") if cfg.dump_traj else None
-    if dump_dir is not None:
-        dump_dir.mkdir(parents=True, exist_ok=True)
-        if not wcfg.pools:
-            print(f"⚠️ arm={cfg.arm} 不池化，分配统计恒为 null（只有动作与观测）")
 
     def say(msg: str) -> None:
         """
@@ -461,10 +485,10 @@ def main(cfg: Config) -> None:
     say(f"# arm={cfg.arm} K={cfg.K} stride={cfg.stride} N={cfg.budget} "
         f"n_t={cfg.n_t} adapter={adapter} n/task={cfg.num_trials_per_task} "
         f"seed={cfg.seed} partition={cfg.partition}")
+    if cfg.dump_traj:
+        say(f"# CASESET {len(case_doc['cases'])} 局，manifest={case_manifest_path} "
+            "—— 机制诊断与演示材料，不是成功率判据")
 
-    if dump_dir is not None:
-        say(f"# 演示素材落盘：每 task 前 {cfg.dump_traj} 局 -> {dump_dir}"
-            f"（RGB={'开' if cfg.dump_rgb else '关'}）")
     say(f"# 中心裁={'开' if cfg.center_crop else '关'} "
         f"视觉特征缓存={'开' if cfg.vision_cache else '关'}"
         + (f"（头 {cfg.verify_vision_cache} 步逐位对拍）"
@@ -525,12 +549,17 @@ def main(cfg: Config) -> None:
         return unnorm(out[:, -n:])
 
     t_end = suite.n_tasks if cfg.end_task < 0 else min(cfg.end_task, suite.n_tasks)
-    if cfg.start_task or t_end != suite.n_tasks:
+    if cfg.dump_traj:
+        say(f"# 只运行 manifest 中的 task {task_ids}；CASESET 永不汇总为 FINAL")
+    elif cfg.start_task or t_end != suite.n_tasks:
         say(f"# ⚠️ 只跑 task [{cfg.start_task}, {t_end})，共 {suite.n_tasks} 个 —— "
             f"**这不是判据数**，要凑满 10 个 task 才能对判据")
-    for task_id in tqdm.tqdm(range(cfg.start_task, t_end), desc="tasks"):
+    for task_id in tqdm.tqdm(task_ids, desc="tasks"):
         task = suite.get_task(task_id)
         inits = suite.get_task_init_states(task_id)
+        task_eps = (selected_cases[task_id] if selected_cases is not None
+                    else list(range(cfg.num_trials_per_task)))
+        task_batch = min(B, len(task_eps))
         # ⚠️ B 个 env 并行。它们**逐步同步推进**，所以任一时刻 pad_mask 全批相同；
         #    先结束的从活动集里摘掉，不再进 batch。
         envs, desc = [], None
@@ -542,12 +571,12 @@ def main(cfg: Config) -> None:
             from libero.libero.envs import OffScreenRenderEnv
             bddl = os.path.join(get_libero_path("bddl_files"),
                                 task.problem_folder, task.bddl_file)
-            for _ in range(B):
+            for _ in range(task_batch):
                 envs.append(OffScreenRenderEnv(
                     bddl_file_name=bddl, camera_heights=256,
                     camera_widths=256, camera_depths=True))
             desc = task.language
-            if task_id == cfg.start_task and cfg.verify_env:
+            if task_id == task_ids[0] and cfg.verify_env:
                 ref, _ = get_libero_env(task, "openvla", resolution=256)
                 bad = 0
                 for j in range(cfg.verify_env):
@@ -563,7 +592,7 @@ def main(cfg: Config) -> None:
                         "必须先解决再测。")
                 say(f"# ✓ 开深度渲染不改变 RGB（{cfg.verify_env} 个初始状态逐位一致）")
         else:
-            for _ in range(B):
+            for _ in range(task_batch):
                 e, desc = get_libero_env(task, "openvla", resolution=256)
                 envs.append(e)
         prompt = f"In: What action should the robot take to {desc.lower()}?\nOut:"
@@ -574,23 +603,20 @@ def main(cfg: Config) -> None:
         #    聚合之后 b/c 两个不一致格就永远拿不回来了。
         #    四臂跑同一批确定性初始状态，(task_id, episode_idx) 就是配对键。
 
-        for lo_ep in tqdm.tqdm(range(0, cfg.num_trials_per_task, B),
+        for lo_ep in tqdm.tqdm(range(0, len(task_eps), task_batch),
                                desc=f"task{task_id}", leave=False):
-            eps = list(range(lo_ep, min(lo_ep + B, cfg.num_trials_per_task)))
+            eps = task_eps[lo_ep:lo_ep + task_batch]
             b = len(eps)
             obs = []
             for i, ep in enumerate(eps):
                 envs[i].reset()
                 obs.append(envs[i].set_init_state(inits[ep]))
             ok_eps = set()                    # 本批里成功的 episode 下标
-            # 演示缓冲：{episode -> {"steps":[...], "rgb":[...]}}。先攒在内存里，
-            # 批末一次写盘 —— 逐步 append 到文件会让每步多一次 flush。
-            dbuf = ({ep: {"steps": [], "rgb": []} for ep in eps if ep < cfg.dump_traj}
-                    if dump_dir is not None else {})
             mx = (cfg.K - 1) * cfg.stride + 1
             hists = [deque(maxlen=mx) for _ in range(b)]
             feats = [deque(maxlen=mx) for _ in range(b)]
             dhists = [deque(maxlen=mx) for _ in range(b)]   # 逐帧 patch 深度 (16,16)
+            shists = [deque(maxlen=mx) for _ in range(b)]   # 每帧对应的环境动作步
             live = list(range(b))
             t = 0
 
@@ -602,15 +628,12 @@ def main(cfg: Config) -> None:
                     t += 1
                     continue
 
-                px_rows, fe_rows, pads = [], [], []
+                px_rows, fe_rows, pads, source_rows, current_imgs = [], [], [], [], []
                 for i in live:
                     img = get_libero_image(obs[i], 224)
+                    current_imgs.append(img)
                     hists[i].appendleft(img)
-                    if cfg.dump_rgb and eps[i] in dbuf:
-                        # ⚠️ 存的是**送进模型之前**的原图。中心裁是评测链路的一部分，
-                        #    演示时用 center_crop_resize 再裁一次即可复现模型所见；
-                        #    反过来只存裁过的图，就看不出裁掉了什么。
-                        dbuf[eps[i]]["rgb"].append(img)
+                    shists[i].appendleft(t - cfg.num_steps_wait)
                     if wcfg.needs_depth:
                         # 与训练侧同一套换算与翻转（check_replay.patch_depth），
                         # 且都是**仿真器真值深度** —— 训练与评测的深度来源一致
@@ -618,6 +641,10 @@ def main(cfg: Config) -> None:
                             envs[i], np.asarray(obs[i][f"{CAM_NAME}_depth"])[..., 0],
                             True))
                     frames, pad = build_window(hists[i], cfg.K, cfg.stride)
+                    source_steps, source_pad = build_window(shists[i], cfg.K, cfg.stride)
+                    if not np.array_equal(pad, source_pad):
+                        raise RuntimeError("图像窗口与来源步窗口的 padding 不一致")
+                    source_rows.append([int(x) for x in source_steps])
                     pads.append(pad)
                     if cfg.vision_cache:
                         # 每帧只算一次：视觉主干冻结，同一帧特征逐位相同，
@@ -664,29 +691,30 @@ def main(cfg: Config) -> None:
                 #    `cams` 就是 None —— **这条路径此前从未被端到端跑到过**，
                 #    四格评测的第一臂 G3 会当场崩。用 () 而不是把 set_batch 改宽松：
                 #    "没给相机" 和 "给了 None" 是两回事，后者该报错。
-                set_batch(state, depth=dep, frame_pad_mask=pm, cameras=cams or ())
-                # ⚠️ 只在这一批真有要存的局时才打开：分配统计是 CPU 上的
-                #    index_add_ 循环，全程开着会拖慢每一步，而绝大多数局不用存。
-                state.collect_alloc = any(eps[i] in dbuf for i in live)
-                acts = gen_actions(ids, px)
-                if dbuf:
-                    # ⭐ **在 verify_batch 之前记**：那段会用单行再跑几次前向，
-                    #    把 state.alloc 覆盖成 (1,·) 的统计，行号就对不上了。
-                    alloc = state.alloc if state.collect_alloc else None
-                    # ⚠️ 行号必须对得上。alloc 是按 batch 行算的，dbuf 是按
-                    #    episode 存的，中间靠 live 的顺序对应 —— 长度不等就说明
-                    #    这个对应已经断了，而错行的演示看起来完全正常。
-                    if alloc is not None and len(alloc) != len(live):
-                        raise SystemExit(
-                            f"分配统计 {len(alloc)} 行 vs 活动局 {len(live)} 行，"
-                            "对应关系已断，拒绝写演示素材")
+                captured = False
+
+                def capture_alloc(assign, frame_pad_mask):
+                    nonlocal captured
+                    if captured:
+                        raise RuntimeError("同一动作步重复产生 alloc_stats，拒绝写入重复记录")
+                    captured = True
+                    aa = assign.detach().cpu().tolist()
+                    pp = (frame_pad_mask.detach().cpu().tolist() if frame_pad_mask is not None
+                          else [[True] * cfg.K for _ in aa])
+                    if len(aa) != len(live):
+                        raise RuntimeError("alloc_stats batch 行数与活动环境数不一致")
                     for r, i in enumerate(live):
-                        if eps[i] not in dbuf:
-                            continue
-                        dbuf[eps[i]]["steps"].append(
-                            {"t": int(t), "action": [round(float(x), 6) for x in acts[r]],
-                             "n_valid": int(pads[r].sum()),
-                             "alloc": None if alloc is None else alloc[r]})
+                        stats = summarize_assignment(aa[r], pp[r], source_rows[r])
+                        stats.update({"arm": cfg.arm, "task_id": int(task_id),
+                                      "episode": int(eps[i]),
+                                      "env_step": int(t - cfg.num_steps_wait)})
+                        dump.write_alloc(stats)
+
+                set_batch(state, depth=dep, frame_pad_mask=pm, cameras=cams or (),
+                          alloc_callback=capture_alloc if dump is not None else None)
+                acts = gen_actions(ids, px)
+                if dump is not None and not captured:
+                    raise RuntimeError("已请求 alloc_stats，但模型前向没有产生分配记录")
 
                 if not checked:
                     assert_arm_wiring(state, cfg.arm)
@@ -734,9 +762,35 @@ def main(cfg: Config) -> None:
 
                 nxt = []
                 for r, i in enumerate(live):
-                    a = normalize_gripper_action(acts[r].copy(), binarize=True)
+                    before = obs[i]
+                    raw_action = acts[r].copy()
+                    a = normalize_gripper_action(raw_action.copy(), binarize=True)
                     a = invert_gripper_action(a)
                     obs[i], _, done, _ = envs[i].step(a.tolist())
+                    if dump is not None:
+                        action_step = t - cfg.num_steps_wait
+                        frame_path = None
+                        if cfg.dump_frames and action_step % cfg.dump_frame_every == 0:
+                            frame_path = dump.save_frame(
+                                f"task{task_id:02d}/ep{eps[i]:02d}/step{action_step:04d}.jpg",
+                                current_imgs[r])
+                        dump.write_trajectory({
+                            "schema_version": 1,
+                            "arm": cfg.arm,
+                            "task_id": int(task_id),
+                            "episode": int(eps[i]),
+                            "stratum": case_lookup[(task_id, eps[i])]["stratum"],
+                            "g3_reference_success": int(case_lookup[(task_id, eps[i])]["g3_success"]),
+                            "env_step": int(action_step),
+                            "source_steps": source_rows[r],
+                            "frame_pad_mask": [bool(x) for x in pads[r]],
+                            "raw_action": raw_action.tolist(),
+                            "executed_action": a.tolist(),
+                            "observation_before": observation_state(before),
+                            "observation_after": observation_state(obs[i]),
+                            "success": int(bool(done)),
+                            "frame": frame_path,
+                        })
                     if done:
                         t_ok += 1
                         total_ok += 1
@@ -753,24 +807,6 @@ def main(cfg: Config) -> None:
                                          "episode": int(ep),
                                          "success": int(ep in ok_eps)}) + "\n")
             per_ep.flush()
-            for ep, rec in dbuf.items():
-                # 头一行是表头：**演示素材必须自带它是哪次测量的**，
-                # 否则一段轨迹和另一段轨迹看起来一模一样。
-                head = {"run_id": run_id, "arm": cfg.arm,
-                        "task_id": int(task_id), "episode": int(ep),
-                        "task": desc, "success": int(ep in ok_eps),
-                        "pools": bool(wcfg.pools),
-                        "K": cfg.K, "stride": cfg.stride, "budget": cfg.budget,
-                        "n_t": cfg.n_t, "partition": cfg.partition,
-                        "center_crop": bool(cfg.center_crop),
-                        "num_steps_wait": cfg.num_steps_wait,
-                        "adapter": str(adapter) if adapter else None}
-                write_episode(dump_dir, head, rec["steps"],
-                              rec["rgb"] if cfg.dump_rgb else None)
-            if dbuf:
-                n_b = sum(f.stat().st_size for f in dump_dir.iterdir())
-                print(f"  演示素材：{len(dbuf)} 局 -> {dump_dir}"
-                      f"（累计 {n_b / 2**20:.0f} MiB）")
             # ⚠️ **碎片，不是泄漏。** `live` 随着 episode 陆续成功而缩小，
             #    batch 形状一路 8→7→…→1，每种形状都让缓存分配器切出不同大小的块；
             #    跑满 200 局后 `1.07 GiB reserved but unallocated` 却申请不到
@@ -801,7 +837,10 @@ def main(cfg: Config) -> None:
         log.write(line + "\n")
         log.flush()
 
-    if cfg.start_task == 0 and t_end == suite.n_tasks:
+    if cfg.dump_traj:
+        final = (f"CASESET {total_ok}/{total_ep} —— 事前冻结的机制诊断与演示案例，"
+                 "不是成功率判据，不得用于总体推断")
+    elif cfg.start_task == 0 and t_end == suite.n_tasks:
         final = f"FINAL success_rate={total_ok / max(total_ep, 1):.4f} ({total_ok}/{total_ep})"
     else:
         # ⚠️ **残缺的合计不叫 FINAL。** 判据认的是满 10 task 的数；
@@ -813,8 +852,12 @@ def main(cfg: Config) -> None:
     log.write(final + "\n")
     per_ep.close()
     print(f"逐局结果 -> {os.path.join(cfg.local_log_dir, run_id + '.episodes.jsonl')}"
-          f"（{cfg.arm}，配对检验用）")
+          + (f"（{cfg.arm}，案例核对用；禁止总体推断）" if cfg.dump_traj
+             else f"（{cfg.arm}，配对检验用）"))
     log.close()
+    if dump is not None:
+        published = dump.finalize()
+        print(f"诊断材料 -> {published}")
     print(json.dumps({"arm": cfg.arm, "suite": cfg.task_suite_name,
                       "n": total_ep, "success": total_ok}))
 
