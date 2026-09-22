@@ -138,25 +138,27 @@ def validate_config(cfg, training: bool) -> None:
             raise ValueError("非法 task 范围")
         if c["end_task"] != -1 and c["end_task"] <= c["start_task"]:
             raise ValueError("task 范围必须非空，end_task 为开区间")
-        if c.get("dump_traj"):
-            if not c.get("case_manifest"):
-                raise ValueError("dump_traj 必须配合事前冻结的 case_manifest")
+        dump_n = c.get("dump_traj", 0)
+        if type(dump_n) is not int or not 0 <= dump_n <= 5:
+            raise ValueError("dump_traj 限 0..5 局/task")
+        if c.get("case_manifest"):
+            if not dump_n:
+                raise ValueError("case_manifest 只能与 dump_traj 一起使用")
             if c.get("start_task") or c.get("end_task") != -1:
                 raise ValueError("case_manifest 已精确指定任务，不得再叠加 task 范围")
             if type(c.get("dump_frame_every")) is not int or c["dump_frame_every"] <= 0:
                 raise ValueError("dump_frame_every 必须是正整数")
             if c["eval_batch"] != 1:
                 raise ValueError("诊断案例必须 eval_batch=1，避免短批次引入批量数值差异")
-        elif c.get("case_manifest"):
-            raise ValueError("case_manifest 只能与 dump_traj 一起使用")
 
 
 def eval_paths(cfg, root: Path) -> tuple[str, dict]:
     c = config_dict(cfg)
     # 完整 checkpoint 路径、配置及本地源代码参与身份，不仅是 step30000 目录名。
     identity = {k: v for k, v in c.items() if k not in
-                ("overwrite", "need_gb", "local_log_dir", "dump_dir", "verify_env", "verify_batch", "verify_vision_cache",
-                 "start_task", "end_task")}
+                ("overwrite", "need_gb", "local_log_dir", "dump_traj", "dump_rgb",
+                 "dump_dir", "dump_frames", "dump_frame_every", "verify_env",
+                 "verify_batch", "verify_vision_cache", "start_task", "end_task")}
     identity["code"] = code_identity(root)
     digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:12]
     step = Path(c["adapter"]).name if c["adapter"] else "base"

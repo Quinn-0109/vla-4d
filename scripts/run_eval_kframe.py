@@ -65,6 +65,7 @@ from common.imgproc import center_crop_resize  # noqa: E402
 from common.provenance import (check_config, code_identity, config_dict, eval_paths,
                                sha256, training_record, validate_config, write_json, WIRE_FIELDS)
 from common.runs import resolve_adapter  # noqa: E402
+from common.traj import write_episode  # noqa: E402
 from pooling.wire import (WireConfig, assert_arm_wiring, frame_feats,  # noqa: E402
                           set_batch, set_vision_feats, wire)
 
@@ -129,10 +130,11 @@ class Config:
     local_log_dir: str = "results/logs"
     run_note: str = ""
     overwrite: bool = False                    # 允许覆盖已有 FINAL 的同名日志
-    # 机制诊断只允许按事前冻结的 manifest 运行；不会产生新的成功率结论。
-    dump_traj: bool = False
+    # 0=关闭；1..5=每 task 保存前 N 局。给 case_manifest 时改为精确案例诊断。
+    dump_traj: int = 0
+    dump_rgb: bool = True
     case_manifest: Optional[str] = None
-    dump_dir: str = "results/cases"
+    dump_dir: Optional[str] = None
     dump_frames: bool = True
     dump_frame_every: int = 1
     # 加载 7B 前要求的空闲显存。0 = 不检查。bf16 权重约 15 GB + 激活，留 18 GB。
@@ -350,9 +352,10 @@ def main(cfg: Config) -> None:
         check_config(trained["config"], config_dict(cfg), WIRE_FIELDS)
     elif adapter:
         print("旧 adapter 无训练配置记录：接线与数据来源须由原始训练日志核对。")
+    diagnostic = cfg.case_manifest is not None
     case_doc = selected_cases = case_lookup = None
     case_manifest_path = None
-    if cfg.dump_traj:
+    if diagnostic:
         case_manifest_path = Path(cfg.case_manifest).expanduser().resolve()
         case_doc = load_case_manifest(case_manifest_path, repo)
         selected_cases = cases_by_task(case_doc)
@@ -361,7 +364,9 @@ def main(cfg: Config) -> None:
               "仅用于材料与诊断，禁止统计推断。")
 
     run_id, output_paths = eval_paths(cfg, repo)
-    dump_final = Path(cfg.dump_dir) / run_id if cfg.dump_traj else None
+    dump_final = Path(cfg.dump_dir or "results/cases") / run_id if diagnostic else None
+    demo_dir = (Path(cfg.dump_dir or f"results/traj/{run_id}")
+                if cfg.dump_traj and not diagnostic else None)
     if dump_final is not None:
         dump_partial = dump_final.with_name(dump_final.name + ".partial")
         if dump_final.exists() or dump_partial.exists():
@@ -456,7 +461,7 @@ def main(cfg: Config) -> None:
         str(t): hashlib.sha256(np.asarray(suite.get_task_init_states(t)).tobytes()).hexdigest()
         for t in range(suite.n_tasks)}
     dump = None
-    if cfg.dump_traj:
+    if diagnostic:
         metadata["diagnostic_dump"] = {
             "schema_version": 1,
             "purpose": "mechanism_diagnosis_and_demo_only",
@@ -470,6 +475,10 @@ def main(cfg: Config) -> None:
     log = output_paths["log"].open("w" if cfg.overwrite else "x", encoding="utf-8")
     per_ep = output_paths["episodes"].open("w" if cfg.overwrite else "x", encoding="utf-8")
     print(f"日志: {log.name}")
+    if demo_dir is not None:
+        demo_dir.mkdir(parents=True, exist_ok=True)
+        if not wcfg.pools:
+            print(f"⚠️ arm={cfg.arm} 不池化，分配统计恒为 null（只有动作与观测）")
 
     def say(msg: str) -> None:
         """
@@ -485,9 +494,12 @@ def main(cfg: Config) -> None:
     say(f"# arm={cfg.arm} K={cfg.K} stride={cfg.stride} N={cfg.budget} "
         f"n_t={cfg.n_t} adapter={adapter} n/task={cfg.num_trials_per_task} "
         f"seed={cfg.seed} partition={cfg.partition}")
-    if cfg.dump_traj:
+    if diagnostic:
         say(f"# CASESET {len(case_doc['cases'])} 局，manifest={case_manifest_path} "
             "—— 机制诊断与演示材料，不是成功率判据")
+    elif demo_dir is not None:
+        say(f"# 演示素材落盘：每 task 前 {cfg.dump_traj} 局 -> {demo_dir}"
+            f"（RGB={'开' if cfg.dump_rgb else '关'}）")
 
     say(f"# 中心裁={'开' if cfg.center_crop else '关'} "
         f"视觉特征缓存={'开' if cfg.vision_cache else '关'}"
@@ -549,7 +561,7 @@ def main(cfg: Config) -> None:
         return unnorm(out[:, -n:])
 
     t_end = suite.n_tasks if cfg.end_task < 0 else min(cfg.end_task, suite.n_tasks)
-    if cfg.dump_traj:
+    if diagnostic:
         say(f"# 只运行 manifest 中的 task {task_ids}；CASESET 永不汇总为 FINAL")
     elif cfg.start_task or t_end != suite.n_tasks:
         say(f"# ⚠️ 只跑 task [{cfg.start_task}, {t_end})，共 {suite.n_tasks} 个 —— "
@@ -612,6 +624,10 @@ def main(cfg: Config) -> None:
                 envs[i].reset()
                 obs.append(envs[i].set_init_state(inits[ep]))
             ok_eps = set()                    # 本批里成功的 episode 下标
+            # 普通演示模式沿用队友实现的每 task 前 N 局；精确诊断模式由
+            # DiagnosticDump 逐步原子写入，两者不共用缓冲，避免格式混淆。
+            dbuf = ({ep: {"steps": [], "rgb": []} for ep in eps
+                     if ep < cfg.dump_traj} if demo_dir is not None else {})
             mx = (cfg.K - 1) * cfg.stride + 1
             hists = [deque(maxlen=mx) for _ in range(b)]
             feats = [deque(maxlen=mx) for _ in range(b)]
@@ -634,6 +650,8 @@ def main(cfg: Config) -> None:
                     current_imgs.append(img)
                     hists[i].appendleft(img)
                     shists[i].appendleft(t - cfg.num_steps_wait)
+                    if cfg.dump_rgb and eps[i] in dbuf:
+                        dbuf[eps[i]]["rgb"].append(img)
                     if wcfg.needs_depth:
                         # 与训练侧同一套换算与翻转（check_replay.patch_depth），
                         # 且都是**仿真器真值深度** —— 训练与评测的深度来源一致
@@ -710,11 +728,25 @@ def main(cfg: Config) -> None:
                                       "env_step": int(t - cfg.num_steps_wait)})
                         dump.write_alloc(stats)
 
+                state.collect_alloc = bool(dbuf)
                 set_batch(state, depth=dep, frame_pad_mask=pm, cameras=cams or (),
                           alloc_callback=capture_alloc if dump is not None else None)
                 acts = gen_actions(ids, px)
                 if dump is not None and not captured:
                     raise RuntimeError("已请求 alloc_stats，但模型前向没有产生分配记录")
+                if dbuf:
+                    alloc = state.alloc if state.collect_alloc else None
+                    if alloc is not None and len(alloc) != len(live):
+                        raise RuntimeError("分配统计 batch 行数与活动环境数不一致")
+                    for r, i in enumerate(live):
+                        if eps[i] not in dbuf:
+                            continue
+                        dbuf[eps[i]]["steps"].append({
+                            "t": int(t),
+                            "action": [round(float(x), 6) for x in acts[r]],
+                            "n_valid": int(pads[r].sum()),
+                            "alloc": None if alloc is None else alloc[r],
+                        })
 
                 if not checked:
                     assert_arm_wiring(state, cfg.arm)
@@ -807,6 +839,22 @@ def main(cfg: Config) -> None:
                                          "episode": int(ep),
                                          "success": int(ep in ok_eps)}) + "\n")
             per_ep.flush()
+            for ep, rec in dbuf.items():
+                head = {"run_id": run_id, "arm": cfg.arm,
+                        "task_id": int(task_id), "episode": int(ep),
+                        "task": desc, "success": int(ep in ok_eps),
+                        "pools": bool(wcfg.pools),
+                        "K": cfg.K, "stride": cfg.stride, "budget": cfg.budget,
+                        "n_t": cfg.n_t, "partition": cfg.partition,
+                        "center_crop": bool(cfg.center_crop),
+                        "num_steps_wait": cfg.num_steps_wait,
+                        "adapter": str(adapter) if adapter else None}
+                write_episode(demo_dir, head, rec["steps"],
+                              rec["rgb"] if cfg.dump_rgb else None)
+            if dbuf:
+                n_b = sum(f.stat().st_size for f in demo_dir.iterdir())
+                print(f"  演示素材：{len(dbuf)} 局 -> {demo_dir}"
+                      f"（累计 {n_b / 2**20:.0f} MiB）")
             # ⚠️ **碎片，不是泄漏。** `live` 随着 episode 陆续成功而缩小，
             #    batch 形状一路 8→7→…→1，每种形状都让缓存分配器切出不同大小的块；
             #    跑满 200 局后 `1.07 GiB reserved but unallocated` 却申请不到
@@ -837,7 +885,7 @@ def main(cfg: Config) -> None:
         log.write(line + "\n")
         log.flush()
 
-    if cfg.dump_traj:
+    if diagnostic:
         final = (f"CASESET {total_ok}/{total_ep} —— 事前冻结的机制诊断与演示案例，"
                  "不是成功率判据，不得用于总体推断")
     elif cfg.start_task == 0 and t_end == suite.n_tasks:
@@ -852,7 +900,7 @@ def main(cfg: Config) -> None:
     log.write(final + "\n")
     per_ep.close()
     print(f"逐局结果 -> {os.path.join(cfg.local_log_dir, run_id + '.episodes.jsonl')}"
-          + (f"（{cfg.arm}，案例核对用；禁止总体推断）" if cfg.dump_traj
+          + (f"（{cfg.arm}，案例核对用；禁止总体推断）" if diagnostic
              else f"（{cfg.arm}，配对检验用）"))
     log.close()
     if dump is not None:

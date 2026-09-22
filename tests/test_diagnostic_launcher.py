@@ -22,7 +22,7 @@ class DiagnosticLauncherTests(unittest.TestCase):
                                   Path("cases.json"), "diag", "python")
                 self.assertEqual(self.value(cmd, "--K"), k)
                 self.assertEqual(self.value(cmd, "--eval_batch"), "1")
-                self.assertEqual(self.value(cmd, "--dump_traj"), "True")
+                self.assertEqual(self.value(cmd, "--dump_traj"), "1")
                 self.assertEqual(self.value(cmd, "--case_manifest"), "cases.json")
                 self.assertIn("--verify_batch", cmd)
 

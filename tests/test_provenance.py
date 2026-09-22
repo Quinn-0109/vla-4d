@@ -40,17 +40,16 @@ class ProvenanceTests(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 validate_config(dict(c, **bad), training=False)
 
-    def test_diagnostic_dump_requires_frozen_manifest(self):
+    def test_generic_dump_and_frozen_diagnostic_modes(self):
         c = defaults("run_eval_kframe.py")
-        with self.assertRaisesRegex(ValueError, "case_manifest"):
-            validate_config(dict(c, dump_traj=True), training=False)
+        validate_config(dict(c, dump_traj=2), training=False)
         with self.assertRaisesRegex(ValueError, "一起使用"):
             validate_config(dict(c, case_manifest="cases.json"), training=False)
-        validate_config(dict(c, dump_traj=True, case_manifest="cases.json", eval_batch=1), training=False)
+        validate_config(dict(c, dump_traj=1, case_manifest="cases.json", eval_batch=1), training=False)
         with self.assertRaisesRegex(ValueError, "eval_batch=1"):
-            validate_config(dict(c, dump_traj=True, case_manifest="cases.json"), training=False)
+            validate_config(dict(c, dump_traj=1, case_manifest="cases.json"), training=False)
         with self.assertRaisesRegex(ValueError, "task 范围"):
-            validate_config(dict(c, dump_traj=True, case_manifest="cases.json",
+            validate_config(dict(c, dump_traj=1, case_manifest="cases.json",
                                  start_task=2, end_task=6, eval_batch=1), training=False)
 
     def test_resume_rejects_changed_data_selection(self):
