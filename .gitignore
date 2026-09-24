@@ -6,6 +6,8 @@ results/*
 results/tables/*
 !results/tables/*.csv
 !results/tables/*.json
+# 固定案例诊断表的 Markdown 版（scripts/diagnose_cases.py 生成），可直接贴进实验记录
+!results/tables/*.md
 !results/figures/
 results/figures/*
 !results/figures/*.png
