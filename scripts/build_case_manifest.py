@@ -81,7 +81,7 @@ def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--episodes", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
-    p.add_argument("--tasks", type=int, nargs="+", default=[2, 4, 5])
+    p.add_argument("--tasks", type=int, nargs="+", default=[2, 3, 4])
     p.add_argument("--arm", default="G3")
     args = p.parse_args()
     if args.output.exists():

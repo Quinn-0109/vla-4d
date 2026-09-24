@@ -13,8 +13,8 @@
   "selection": {
     "tasks": [
       2,
-      4,
-      5
+      3,
+      4
     ],
     "rule": "lowest episode id in each (task_id, g3_success) stratum",
     "chosen_before_new_inference": true
@@ -33,6 +33,18 @@
       "stratum": "failure"
     },
     {
+      "task_id": 3,
+      "episode": 0,
+      "g3_success": 1,
+      "stratum": "success"
+    },
+    {
+      "task_id": 3,
+      "episode": 1,
+      "g3_success": 0,
+      "stratum": "failure"
+    },
+    {
       "task_id": 4,
       "episode": 13,
       "g3_success": 1,
@@ -43,19 +55,7 @@
       "episode": 0,
       "g3_success": 0,
       "stratum": "failure"
-    },
-    {
-      "task_id": 5,
-      "episode": 0,
-      "g3_success": 1,
-      "stratum": "success"
-    },
-    {
-      "task_id": 5,
-      "episode": 1,
-      "g3_success": 0,
-      "stratum": "failure"
     }
   ],
-  "created_at": "2026-09-22T07:37:08.949929+00:00"
+  "created_at": "2026-09-24T09:17:17.985963+00:00"
 }
