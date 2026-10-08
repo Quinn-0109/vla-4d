@@ -733,7 +733,19 @@ def main(cfg: Config) -> None:
                           alloc_callback=capture_alloc if dump is not None else None)
                 acts = gen_actions(ids, px)
                 if dump is not None and not captured:
-                    raise RuntimeError("已请求 alloc_stats，但模型前向没有产生分配记录")
+                    if cfg.arm != "G0":
+                        raise RuntimeError("已请求 alloc_stats，但模型前向没有产生分配记录")
+                    # G0 不经过池化，来源关系是恒等映射：每个视觉 token
+                    # 都来自当前单帧并保留独立 slot。
+                    for r, i in enumerate(live):
+                        stats = summarize_assignment(
+                            range(cfg.budget), [True],
+                            [source_rows[r][-1]], cfg.budget)
+                        stats.update({"arm": cfg.arm, "task_id": int(task_id),
+                                      "episode": int(eps[i]),
+                                      "env_step": int(t - cfg.num_steps_wait)})
+                        dump.write_alloc(stats)
+                    captured = True
                 if dbuf:
                     alloc = state.alloc if state.collect_alloc else None
                     if alloc is not None and len(alloc) != len(live):
@@ -754,9 +766,10 @@ def main(cfg: Config) -> None:
                     #    （错了会抛），但不打印就等于没人能从日志里复核 ——
                     #    训练脚本 2026-09 加了这一项，评测脚本当时漏了。
                     #    错配臂与它的同池化伙伴在日志里其余部分完全一样。
+                    expected_pe_axes = 0 if cfg.arm == "G0" else wcfg.pe_axes
                     say(f"# ✓ 接线正常（arm={cfg.arm}，rotary_emb "
                         f"{state.rope_calls} 次，PE {state.pe_axes_seen} 轴）"
-                        f"  —— 应为 {wcfg.pe_axes} 轴")
+                        f"  —— 应为 {expected_pe_axes} 轴")
                     checked = True
 
                 # ⭐ 批量 vs 逐条：**比动作 token，不比 logits**。批量 matmul 的

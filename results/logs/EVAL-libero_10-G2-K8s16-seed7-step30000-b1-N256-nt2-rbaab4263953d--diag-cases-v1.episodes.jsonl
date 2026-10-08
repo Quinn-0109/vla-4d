@@ -1,0 +1,6 @@
+{"arm": "G2", "task_id": 2, "episode": 0, "success": 0}
+{"arm": "G2", "task_id": 2, "episode": 1, "success": 1}
+{"arm": "G2", "task_id": 3, "episode": 0, "success": 0}
+{"arm": "G2", "task_id": 3, "episode": 1, "success": 1}
+{"arm": "G2", "task_id": 4, "episode": 0, "success": 1}
+{"arm": "G2", "task_id": 4, "episode": 13, "success": 0}
