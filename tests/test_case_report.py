@@ -33,7 +33,7 @@ class CaseReportTests(unittest.TestCase):
         self.assertEqual(check_runs(self.runs()), [])
 
     def test_purity_separates_dilution_from_allocation(self):
-        """满历史时 G2 与 G3 给最新帧的份额相同（32 token），区别只在稀释：
+        """合成数据里满历史时 G2 与 G3 给最新帧的份额相同（32 token），区别只在稀释：
         G2 纯度 1.0，G3 每个含最新帧的 token 里它只占 1/4。全槽平均权重把两者算成一样，
         这正是表里以纯度为主的原因。"""
         rows = {(r["arm"], r["real_frames"]): r for r in history_table(self.runs())
@@ -87,6 +87,16 @@ class CaseReportTests(unittest.TestCase):
         self.assertFalse(ep0["matches_reference"])
         paths = write_report([run], [], [], self.root / "out")
         self.assertIn("不一致", paths["markdown"].read_text(encoding="utf-8"))
+
+    def test_reference_label_only_checked_for_reference_arm(self):
+        """manifest 标签是 G3 的正式结果。G2 与它不同只说明 G2 与 G3 不同，
+        不是 G2 的“本次与正式不一致”——2026-10-08 的诊断表曾把这两件事混为一谈。"""
+        g2 = load_run(make_case_dir(self.root, "G2", frames=False,
+                                    outcomes={(2, 0): (30, 0), (2, 1): (30, 1)}))
+        eps = episode_table([g2])
+        self.assertTrue(all(e["matches_reference"] is None for e in eps))
+        md = write_report([g2], [], [], self.root / "out")["markdown"].read_text(encoding="utf-8")
+        self.assertNotIn("不一致（记录", md)
 
     def test_partial_dirs_reported_not_read(self):
         make_case_dir(self.root, "G3", frames=False)

@@ -6,6 +6,9 @@
 1. **验收**（`docs/09` C2）：每个目录恰好包含 manifest 的那几局、元数据齐全、
    引用的关键帧存在、数值全部有限、动作步连续；各方法用的是同一份 manifest。
    参考标签（正式 b8）与本次观察（b1）不一致时**记录，不报错**。
+   ⚠️ manifest 的标签是**参考方法（`source.arm`，即 G3）**自己的正式结果。只有参考方法
+   的“本次 vs 正式”才是一致性检查；其他方法与这个标签不同，只说明它们与 G3 结果不同，
+   不是“与自己的正式结果不一致”（G0/G2 本来就没有逐局正式记录）。
 2. **汇总**（`docs/09` D1）：逐局表、按有效帧数分组的表、按帧距离的贡献剖面。
 
 纯标准库，不依赖 torch / numpy / 仿真器，可在任何机器上离线运行。
@@ -22,8 +25,9 @@
   （各帧份额之和 = 实际使用的 token 数；`latest_share = latest_slots × latest_purity`）。
   这是一个**定义上的选择**，随结论一同报告。
 - 全槽平均权重 `latest_weight`：最新帧比例在**全部**已用 token 上的平均（导出里的原字段）。
-  ⚠️ 它把“分到的 token 少”和“被旧帧稀释”混在一起：帧独立池化里最新帧独占 32 个 token、
-  纯度 1.0，全槽平均却只有 0.125，与跨帧池化里被三帧稀释的情形数值相同。
+  ⚠️ 它把“分到的 token 少”和“被旧帧稀释”混在一起。实测满历史时：G2 最新帧独占 25 个
+  token、纯度 1.0，全槽平均 25/200 = 0.125；G3 最新帧在 121 个 token 里、纯度 0.25，
+  全槽平均 30.25/242 = 0.125——两者数值相同，机制完全不同。
   所以表里以纯度与所在 token 数为主，这一列只保留在 CSV 里。
 - 最新帧独占 token `latest_exclusive`：只由最新帧构成的 token 数。
 - 跨帧混合比例 `mixed_fraction`：含两个及以上真实帧的 token 占实际使用 token 的比例。
@@ -77,6 +81,12 @@ def load_run(path: Path) -> dict:
     doc["arm"] = cfg_arm if cfg_arm else (next(iter(arms)) if len(arms) == 1 else None)
     doc["row_arms"] = arms
     return doc
+
+
+def reference_arm(run: dict) -> str:
+    """manifest 标签属于哪个方法（默认 G3）。"""
+    manifest = (run["meta"].get("diagnostic_dump") or {}).get("manifest") or {}
+    return (manifest.get("source") or {}).get("arm") or "G3"
 
 
 def check_run(run: dict) -> list[str]:
@@ -206,6 +216,7 @@ def episode_table(runs: list[dict]) -> list[dict]:
             al = alloc[key]
             observed = int(rows[-1]["success"])
             reference = int(rows[-1].get("g3_reference_success", -1))
+            is_ref = run["arm"] == reference_arm(run)
             out.append({
                 "arm": run["arm"],
                 "task_id": key[0],
@@ -213,7 +224,8 @@ def episode_table(runs: list[dict]) -> list[dict]:
                 "stratum": rows[-1].get("stratum"),
                 "g3_reference_success": reference,
                 "observed_success": observed,
-                "matches_reference": observed == reference,
+                # 只有参考方法自己才谈得上“本次与正式是否一致”；其他方法留空
+                "matches_reference": (observed == reference) if is_ref else None,
                 "steps": len(rows),
                 **_alloc_cols(al),
                 "step_span_max": max((a["max_step_span"] for a in al), default=None),
@@ -292,14 +304,15 @@ def render_markdown(runs, problems, partial, episodes, history, profile) -> str:
         lines.append(f"- 存在未完成的 `.partial` 目录（未读取）：{', '.join(p.name for p in partial)}")
     lines += [f"- 问题：{p}" for p in problems] or ["- 全部通过：每个目录恰好包含 manifest 的各局，"
                                                    "元数据、关键帧与数值检查无误。"]
-    mismatch = [e for e in episodes if not e["matches_reference"]]
+    mismatch = [e for e in episodes if e["matches_reference"] is False]
+    ref_arms = sorted({reference_arm(r) for r in runs})
     if mismatch:
-        lines.append("- 本次观察与正式 b8 参考标签不一致（记录，不替换案例）：" + "；".join(
-            f"{e['arm']} task {e['task_id']} ep {e['episode']} 参考 {e['g3_reference_success']} → "
+        lines.append(f"- {'/'.join(ref_arms)} 本次 b1 观察与其正式 b8 结果不一致（记录，不替换案例）：" + "；".join(
+            f"{e['arm']} task {e['task_id']} ep {e['episode']} 正式 {e['g3_reference_success']} → "
             f"本次 {e['observed_success']}" for e in mismatch))
     lines += ["", "## 逐局", "", _md_table(episodes, [
         ("arm", "方法"), ("task_id", "task"), ("episode", "ep"), ("stratum", "分层"),
-        ("g3_reference_success", "参考"), ("observed_success", "本次"), ("steps", "步数"),
+        ("g3_reference_success", "G3 正式"), ("observed_success", "本次"), ("steps", "步数"),
         ("latest_slots_mean", "最新帧所在"), ("latest_purity_mean", "最新帧纯度"),
         ("latest_share_mean", "最新帧份额"), ("latest_exclusive_mean", "最新帧独占"),
         ("mixed_fraction_mean", "跨帧混合"), ("step_span_mean", "平均跨度"), ("step_span_max", "最大跨度"),
@@ -323,7 +336,9 @@ def render_markdown(runs, problems, partial, episodes, history, profile) -> str:
               "- 跨帧混合：含两个及以上真实帧的 token 占实际使用 token 的比例。",
               "- 跨度：一个 token 内最早与最晚来源帧的环境步差。",
               "- 动作变化：相邻两步原始动作前 6 维的 L2 差的平均；夹爪翻转：执行动作第 7 维的符号变化次数。",
-              "- 分层与参考：manifest 按正式 b8 的 G3 成败分层；本次为 b1 观察，二者可能不同。", ""]
+              "- 分层与“G3 正式”：manifest 按 G3 正式 b8 的成败分层，这一列对所有方法都是 G3 的结果。"
+              "只有 G3 的“本次”与它比较才是一致性检查；G0/G2 没有逐局正式记录，"
+              "它们的“本次”与这一列不同只说明与 G3 结果不同。", ""]
     return "\n".join(lines)
 
 

@@ -131,10 +131,11 @@ def render_panel(view: EpisodeView, step_index: int, fonts: dict) -> Image.Image
 
     # ---- 标题
     outcome = "SUCCESS" if view.success else "FAIL"
+    # manifest 的标签是 G3 的正式结果，对所有方法都按“这一局 G3 正式如何”标注
     ref = {1: "SUCCESS", 0: "FAIL"}.get(view.reference, "n/a")
     d.text((10, 6), view.arm, fill=INK, font=f_b)
     d.text((58, 9), f"step {step:>3d} / {len(view) - 1}   final: {outcome}   "
-                    f"(formal b8 reference: {ref})   recorded rollout, offline playback",
+                    f"(G3 formal b8 on this case: {ref})   recorded rollout, offline playback",
            fill=MUTED, font=f_s)
     if ended or (row["success"] and idx == len(view) - 1):
         tag = f"DONE: {outcome} at step {view.steps[-1]['env_step']}"

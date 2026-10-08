@@ -68,7 +68,7 @@ def main() -> int:
         print(f"视频: {video}")
     for v in views:
         print(f"  {v.arm}: {len(v)} 步，本次 {'成功' if v.success else '失败'}，"
-              f"正式 b8 参考 {'成功' if v.reference else '失败'}")
+              f"（这一局 G3 正式 b8：{'成功' if v.reference else '失败'}）")
     return 0
 
 
