@@ -106,7 +106,7 @@ def prepare_training(cfg, run_dir: Path, repo: Path, resume: Path | None) -> dic
 
 def validate_config(cfg, training: bool) -> None:
     c = config_dict(cfg)
-    if c["arm"] not in ("G0", "G2", "G3", "M2", "M3", "G4"):
+    if c["arm"] not in ("G0", "G2", "G3", "M2", "M3", "G4", "G3Q"):
         raise ValueError("arm 不支持；G1 的定义尚未确定，不能启动")
     for k in ("K", "stride", "budget", "n_t"):
         if type(c[k]) is not int or c[k] <= 0:

@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from analysis.diagnostic_dump import load_case_manifest  # noqa: E402
 from common.runs import list_adapters, resolve_adapter  # noqa: E402
 
-ARMS = ("G0", "G2", "G3")
+ARMS = ("G0", "G2", "G3", "G3Q")
 DEFAULT_MANIFEST = ROOT / "results/cases/g3_fixed_diagnostic_cases.json"
 DEFAULT_CHECKPOINTS = ROOT / "results/cases/diagnostic_checkpoints.json"
 

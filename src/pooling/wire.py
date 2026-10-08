@@ -10,6 +10,8 @@
     G4  K=8，跨帧池化，池化坐标 (t,x,y,z)，PE 也是 (t,x,y,z)  ← 一致，本方案
     M2  K=8，跨帧池化，池化坐标 (t,x,y,z)，PE 却用 (t,h,w)    ← 错配臂
     M3  K=8，跨帧池化，池化坐标 (t,h,w)，PE 却用 (t,x,y,z)    ← 错配臂（M2 的镜像）
+    G3Q K=8，最新帧单独池化到 N÷真实帧数，其余历史帧按 G3 共享剩余预算，PE (t,h,w)
+        ← 2026-10 受限改版：相对 G3 只改“最新帧是否被旧帧稀释”这一件事（docs/10）
 
 **三个**挂载点（transformers 4.40.1，见 `_patch_rope` 的版本约定）：
 
@@ -48,12 +50,12 @@ if __name__ == "__main__" and __package__ in (None, ""):
     from pathlib import Path as _Path
     _sys.path.insert(0, str(_Path(__file__).resolve().parents[1]))
 
-from pooling.coord_pool import (GRID, N_T_DEFAULT, coord_bin_pool, grid_coords,
+from pooling.coord_pool import (GRID, N_T_DEFAULT, PoolOut, coord_bin_pool, grid_coords,
                                 grid_extent, metric_coords, metric_extent)
 from pooling.rope4d import assemble, build_rope, channel_plan, normalize, seq_centroid
 
 N_PATCH = GRID * GRID          # 256
-ARMS = ("G0", "G1", "G2", "G3", "G4", "M2", "M3")
+ARMS = ("G0", "G1", "G2", "G3", "G4", "M2", "M3", "G3Q")
 
 
 @dataclass
@@ -76,6 +78,8 @@ class WireConfig:
             raise ValueError(f"arm 必须是 {ARMS} 之一，收到 {self.arm!r}")
         if self.arm == "G0" and self.K != 1:
             raise ValueError("G0 是单帧基线，K 必须为 1")
+        if self.arm == "G3Q" and self.enforce_n:
+            raise ValueError("G3Q 的两段预算按真实帧数动态划分，不与 enforce_n 同用")
         if self.needs_depth and self.bbox is None:
             raise ValueError(
                 f"{self.arm} 用度量坐标，必须给 bbox（scripts/dump_camera.py 的产物）。"
@@ -83,7 +87,7 @@ class WireConfig:
 
     @property
     def pools(self) -> bool:
-        return self.arm in ("G2", "G3", "G4", "M2", "M3")
+        return self.arm in ("G2", "G3", "G4", "M2", "M3", "G3Q")
 
     @property
     def metric(self) -> bool:
@@ -205,6 +209,78 @@ def _patch_vision(model, k: int, state: Optional["_State"] = None) -> None:
     model.vision_backbone.forward = wrapped
 
 
+def current_quota(real_frames: int, budget: int) -> int:
+    """G3Q 给最新帧的预算：与 G2 给每帧的份额相同，即 budget ÷ 真实帧数。"""
+    if real_frames <= 0:
+        raise ValueError("至少要有一个真实帧")
+    return budget // real_frames
+
+
+def _pool_current_quota(emb: torch.Tensor, coord: torch.Tensor, valid: Optional[torch.Tensor],
+                        cfg: WireConfig, lo: torch.Tensor, hi: torch.Tensor) -> PoolOut:
+    """
+    G3Q：**最新真实帧单独池化**，其余历史帧按 G3 的方式共享剩余预算。
+
+    相对 G3 只改一件事——最新帧不再与旧帧混进同一个 token：
+
+    - 最新帧：用 G2 的帧独立分组，在它自己的 256 个 patch 上池化到
+      `budget // 真实帧数` 个槽。满历史时是 32 个预算、实际 5×5=25 个 token，
+      与 G2 给每一帧的完全相同（tests 逐位对拍）。
+    - 历史帧：最新帧之外的真实帧，用 G3 的跨帧联合池化（同一个 n_t 与 partition）
+      共享剩余的 `budget - quota` 个槽。
+    - 输出：历史 token 在前、最新帧 token 在后，各自内部保持 `coord_bin_pool` 的
+      (t̄, h̄, w̄) 字典序，所以整体仍按 t̄ 升序，与 G3 的排列约定一致；空槽统一在末尾。
+
+    这样 G3Q 与 G3 的对照只回答“最新帧被稀释是不是主因”，与 G2 的对照只回答
+    “历史帧的跨帧混合有没有代价”。两种结局都有信息量。
+    """
+    b, t, _ = emb.shape
+    k, n, dev = cfg.K, cfg.budget, emb.device
+    if valid is None:
+        valid = torch.ones(b, t, dtype=torch.bool, device=dev)
+    frame_of = torch.arange(t, device=dev) // N_PATCH
+    real = valid.view(b, k, N_PATCH)[:, :, 0]
+    parts = []
+    for i in range(b):
+        r = int(real[i].sum())
+        latest = int(real[i].nonzero(as_tuple=True)[0].max())
+        quota = current_quota(r, n)
+        cur_valid = (valid[i] & (frame_of == latest)).unsqueeze(0)
+        hist_valid = (valid[i] & (frame_of != latest)).unsqueeze(0)
+        cur = coord_bin_pool(emb[i:i + 1], coord[i:i + 1], quota, lo, hi,
+                             group_axes=(0,), n_group=(k,), valid=cur_valid,
+                             partition=cfg.partition)
+        hist = coord_bin_pool(emb[i:i + 1], coord[i:i + 1], n - quota, lo, hi,
+                              n_t=cfg.n_t, valid=hist_valid, partition=cfg.partition)
+        parts.append(_concat_pools(hist, cur, n))
+    return PoolOut(*(torch.cat([getattr(p_, f) for p_ in parts], dim=0)
+                     for f in ("feat", "coord", "mask", "size", "assign", "n_used")))
+
+
+def _concat_pools(first: PoolOut, second: PoolOut, n: int) -> PoolOut:
+    """把两段单样本池化结果拼成一个 n 槽的输出：已用槽依次在前，空槽在末尾。"""
+    ka, kb = int(first.n_used[0]), int(second.n_used[0])
+    if ka + kb > n:
+        raise RuntimeError(f"两段池化共用 {ka + kb} 槽，超过预算 {n}")
+
+    def cat(fa, fb, fill):
+        out = fill.new_zeros((1, n) + tuple(fill.shape[2:]))
+        out[0, :ka] = fa[0, :ka]
+        out[0, ka:ka + kb] = fb[0, :kb]
+        return out
+    feat = cat(first.feat, second.feat, first.feat)
+    coord = cat(first.coord, second.coord, first.coord)
+    size = cat(first.size, second.size, first.size)
+    mask = torch.zeros(1, n, dtype=torch.bool, device=first.mask.device)
+    mask[0, :ka + kb] = True
+    a, b_ = first.assign, second.assign
+    if bool(((a >= 0) & (b_ >= 0)).any()):
+        raise RuntimeError("同一个 patch 被两段池化同时分配")
+    assign = torch.where(a >= 0, a, torch.where(b_ >= 0, b_ + ka, torch.full_like(a, -1)))
+    n_used = torch.tensor([ka + kb], device=first.n_used.device, dtype=first.n_used.dtype)
+    return PoolOut(feat, coord, mask, size, assign, n_used)
+
+
 def _pool_and_coords(emb: torch.Tensor, cfg: WireConfig, bt: _Batch,
                      sink: Optional[dict] = None):
     """
@@ -248,9 +324,12 @@ def _pool_and_coords(emb: torch.Tensor, cfg: WireConfig, bt: _Batch,
     pc = pc_metric if cfg.metric else gc
     lo, hi = cfg.pool_extent(dev)
 
-    kw = dict(group_axes=(0,), n_group=(k,)) if cfg.arm == "G2" else dict(n_t=cfg.n_t)
-    out = coord_bin_pool(emb, pc, cfg.budget, lo, hi,
-                         enforce_n=cfg.enforce_n, valid=valid, partition=cfg.partition, **kw)
+    if cfg.arm == "G3Q":
+        out = _pool_current_quota(emb, pc, valid, cfg, lo, hi)
+    else:
+        kw = dict(group_axes=(0,), n_group=(k,)) if cfg.arm == "G2" else dict(n_t=cfg.n_t)
+        out = coord_bin_pool(emb, pc, cfg.budget, lo, hi,
+                             enforce_n=cfg.enforce_n, valid=valid, partition=cfg.partition, **kw)
     if bt.alloc_callback is not None:
         bt.alloc_callback(out.assign, bt.frame_pad_mask)
 
@@ -668,7 +747,7 @@ def _selftest() -> None:
     #      M3 曾经拿池化侧（3 轴网格）的量程去归一化 4 轴度量质心，当场维度不匹配；
     #      它的镜像（M2 拿 4 轴量程压 3 轴坐标）却会广播成功、静静地算错。
     #      所以这里逐臂对拍，并且**真的调一次 normalize**，不只比形状。
-    for arm in ("G0", "G1", "G2", "G3", "G4", "M2", "M3"):
+    for arm in ("G0", "G1", "G2", "G3", "G4", "M2", "M3", "G3Q"):
         kk = 1 if arm == "G0" else K
         _probe = WireConfig(arm=arm, K=kk, bbox=bbox)
         cfg_a = WireConfig(arm=arm, K=kk,
@@ -680,7 +759,7 @@ def _selftest() -> None:
             arm, c_a.shape, lo_a.numel(), cfg_a.pe_axes)
         q = normalize(c_a.float(), lo_a, hi_a, cfg_a.K)
         assert q.shape == c_a.shape and torch.isfinite(q).all(), arm
-    print("✅ 3d/9 七臂逐一对拍：PE 坐标轴数 == pe_extent 轴数 == pe_axes，"
+    print("✅ 3d/9 八臂逐一对拍（含 G3Q）：PE 坐标轴数 == pe_extent 轴数 == pe_axes，"
           "且 normalize 真跑得通")
 
     pad = torch.ones(B, K, dtype=torch.bool)
